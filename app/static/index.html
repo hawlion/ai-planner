@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AAWO | AI 업무 플래너</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=SUIT:wght@400;500;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="mesh"></div>
+    <main class="container">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">AI Autonomous Work Orchestrator</p>
+          <h1>AAWO 업무 오케스트레이터</h1>
+          <p class="subtitle">Plan → Time-block → Approval → Learning 루프를 실행 가능한 앱으로 구현했습니다.</p>
+        </div>
+        <div class="profile-box">
+          <h2>사용자 설정</h2>
+          <div class="profile-row">
+            <label for="autonomy">자율성</label>
+            <select id="autonomy">
+              <option value="L0">L0</option>
+              <option value="L1">L1</option>
+              <option value="L2" selected>L2</option>
+              <option value="L3">L3</option>
+              <option value="L4">L4</option>
+            </select>
+          </div>
+          <div class="profile-row">
+            <label for="timezone">TimeZone</label>
+            <input id="timezone" type="text" value="Asia/Seoul" />
+          </div>
+          <button id="save-profile" class="btn btn-primary">설정 저장</button>
+        </div>
+      </header>
+
+      <section class="grid">
+        <article class="card" id="briefing-card">
+          <div class="card-title-wrap">
+            <h3>오늘의 브리핑</h3>
+            <button id="refresh-briefing" class="btn btn-ghost">새로고침</button>
+          </div>
+          <div id="briefing"></div>
+        </article>
+
+        <article class="card">
+          <h3>할일 빠른 추가</h3>
+          <form id="task-form" class="stack">
+            <input id="task-title" required placeholder="예: 분기 보고서 작성" />
+            <div class="split">
+              <select id="task-priority">
+                <option value="medium">중간</option>
+                <option value="high">높음</option>
+                <option value="critical">긴급</option>
+                <option value="low">낮음</option>
+              </select>
+              <input id="task-due" type="datetime-local" />
+            </div>
+            <input id="task-effort" type="number" value="60" min="15" step="15" />
+            <button type="submit" class="btn btn-primary">할일 생성</button>
+          </form>
+        </article>
+
+        <article class="card span-2">
+          <div class="card-title-wrap">
+            <h3>Tasks</h3>
+            <button id="refresh-tasks" class="btn btn-ghost">갱신</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>제목</th>
+                  <th>우선순위</th>
+                  <th>상태</th>
+                  <th>마감</th>
+                  <th>소요(분)</th>
+                </tr>
+              </thead>
+              <tbody id="tasks-table"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="card span-2">
+          <div class="card-title-wrap">
+            <h3>Calendar Blocks</h3>
+            <button id="refresh-calendar" class="btn btn-ghost">갱신</button>
+          </div>
+          <div id="calendar-list" class="list"></div>
+        </article>
+
+        <article class="card span-2">
+          <h3>Meeting Ingest</h3>
+          <form id="meeting-form" class="stack">
+            <input id="meeting-title" placeholder="회의 제목" />
+            <textarea id="meeting-summary" rows="2" placeholder="회의 요약"></textarea>
+            <textarea
+              id="meeting-transcript"
+              rows="8"
+              placeholder="한 줄에 하나씩 입력하세요. 예) 철수: 금요일까지 보고서 초안 작성해 주세요"
+            ></textarea>
+            <button type="submit" class="btn btn-primary">회의록 처리 시작</button>
+          </form>
+          <div id="meeting-status" class="muted"></div>
+          <div id="meeting-candidates" class="list"></div>
+        </article>
+
+        <article class="card">
+          <h3>Approval Queue</h3>
+          <button id="refresh-approvals" class="btn btn-ghost">갱신</button>
+          <div id="approvals" class="list"></div>
+        </article>
+
+        <article class="card">
+          <h3>Scheduling Proposals</h3>
+          <form id="proposal-form" class="stack">
+            <input id="proposal-from" type="datetime-local" required />
+            <input id="proposal-to" type="datetime-local" required />
+            <button type="submit" class="btn btn-primary">제안 생성</button>
+          </form>
+          <div id="proposals" class="list"></div>
+        </article>
+
+        <article class="card">
+          <h3>NLI Command</h3>
+          <form id="nli-form" class="stack">
+            <textarea id="nli-text" rows="3" placeholder="예: 내일 오전에 고객 미팅 정리 작업 추가해줘"></textarea>
+            <button type="submit" class="btn btn-primary">해석 실행</button>
+          </form>
+          <pre id="nli-result" class="code-box"></pre>
+        </article>
+
+        <article class="card">
+          <h3>Graph Sync 상태</h3>
+          <button id="ping-sync" class="btn btn-ghost">Graph Ping</button>
+          <pre id="sync-status" class="code-box"></pre>
+        </article>
+      </section>
+    </main>
+
+    <script src="/static/app.js" type="module"></script>
+  </body>
+</html>

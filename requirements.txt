@@ -1,0 +1,7 @@
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+sqlalchemy==2.0.43
+pydantic==2.11.7
+python-dateutil==2.9.0.post0
+dateparser==1.2.2
+httpx==0.28.1
