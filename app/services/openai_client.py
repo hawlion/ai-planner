@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import datetime
 from typing import Literal
 
@@ -145,6 +146,9 @@ def _chat_json(
 
     temp = settings.openai_temperature if temperature is None else float(temperature)
     last_error: Exception | None = None
+    started_at = time.monotonic()
+    # Cap total wait so model fallback does not multiply user-facing latency.
+    max_total_wait = max(8.0, float(settings.openai_timeout_seconds) + 1.0)
 
     for model in models:
         content = ""
@@ -173,6 +177,15 @@ def _chat_json(
                 model,
                 exc,
             )
+
+            elapsed = time.monotonic() - started_at
+            if elapsed >= max_total_wait:
+                logger.warning(
+                    "OpenAI fallback skipped due to total timeout budget reached: purpose=%s elapsed=%.2fs",
+                    purpose,
+                    elapsed,
+                )
+                break
 
     raise OpenAIIntegrationError(
         f"OpenAI API request failed for all models={models}: {last_error}"

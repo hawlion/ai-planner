@@ -337,7 +337,24 @@ function renderWeekGrid() {
       })
       .join("");
 
-    return `<div class="day-column" data-day-column="${dayStart.toISOString()}" style="height:${gridHeight}px">${eventsHtml}</div>`;
+    let timeIndicatorHtml = "";
+    if (isSameDay(dayStart, new Date())) {
+      const now = new Date();
+      const currentMinutes = (now.getHours() - HOUR_START) * 60 + now.getMinutes();
+      if (currentMinutes >= 0 && currentMinutes < (HOUR_END - HOUR_START) * 60) {
+        const top = (currentMinutes / 60) * HOUR_HEIGHT;
+        timeIndicatorHtml = `
+          <div class="current-time-indicator" style="top:${top}px;">
+            <div class="current-time-ball"></div>
+          </div>
+        `;
+      }
+    }
+
+    return `<div class="day-column" data-day-column="${dayStart.toISOString()}" style="height:${gridHeight}px">
+      ${eventsHtml}
+      ${timeIndicatorHtml}
+    </div>`;
   });
 
   container.innerHTML = dayColumns.join("");
