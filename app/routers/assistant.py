@@ -573,6 +573,9 @@ def _needs_clarification_for_action(
     if intent == "unknown":
         return _clarification_question(message, None)
 
+    if intent == "register_meeting_note" and not _looks_like_meeting_note(message):
+        return "회의록 등록 요청인지 다른 작업 요청인지 불명확합니다. 예: '회의록: ...' 또는 '중복 태스크 정리'."
+
     if intent == "reschedule_after_hour":
         cutoff = _extract_cutoff_hour(action.get("cutoff_hour"), message)
         if cutoff is None:
@@ -1271,7 +1274,7 @@ def _resolve_pending_approval_by_chat(
     return ("승인되었습니다.", [AssistantActionOut(type="approval_approved", detail={"approval_id": approval.id})], ["approvals"])
 
 
-def _fallback_classify(text: str) -> dict:
+def _fallback_classify(text: str, *, allow_openai_nli: bool = True) -> dict:
     lowered = text.lower()
     if _looks_like_meeting_note(text):
         return {"intent": "register_meeting_note", "meeting_note": text}
@@ -1295,8 +1298,7 @@ def _fallback_classify(text: str) -> dict:
         return {"intent": "update_priority", "title": text, "priority": priority}
     if "완료" in text or "done" in lowered:
         return {"intent": "complete_task", "title": text}
-
-    if is_openai_available():
+    if allow_openai_nli and is_openai_available():
         try:
             parsed = parse_nli_openai(text, base_dt=datetime.utcnow())
             return {
@@ -1366,7 +1368,21 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
 
     planned_actions: list[dict] = []
     plan_note: str | None = None
-    if is_openai_available():
+
+    quick_rule = _fallback_classify(message, allow_openai_nli=False)
+    quick_intent = str(quick_rule.get("intent") or "unknown")
+    if quick_intent in {
+        "register_meeting_note",
+        "create_task",
+        "reschedule_after_hour",
+        "delete_duplicate_tasks",
+        "update_due",
+        "update_priority",
+        "complete_task",
+        "reschedule_request",
+    }:
+        planned_actions = [quick_rule]
+    elif is_openai_available():
         try:
             plan = parse_assistant_plan_openai(
                 message,
@@ -1381,7 +1397,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
             plan_note = None
 
     if not planned_actions:
-        planned_actions = [_fallback_classify(message)]
+        planned_actions = [_fallback_classify(message, allow_openai_nli=False)]
 
     has_meeting_intent = any(item.get("intent") == "register_meeting_note" for item in planned_actions)
     if has_meeting_intent:
