@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
@@ -20,8 +21,10 @@ from app.schemas import (
 from app.services.actions import approve_candidate, reject_candidate
 from app.services.core import ensure_profile
 from app.services.meeting_extractor import extract_action_items
+from app.services.openai_client import OpenAIIntegrationError, extract_action_items_openai, is_openai_available
 
 router = APIRouter(tags=["meetings"])
+logger = logging.getLogger(__name__)
 
 
 CONFIDENCE_THRESHOLD = 0.75
@@ -36,7 +39,16 @@ def _process_meeting(meeting_db_id: str) -> None:
 
         try:
             base_time = meeting.ended_at or datetime.utcnow()
-            drafts = extract_action_items(meeting.transcript, meeting.summary, base_dt=base_time)
+            extraction_mode = "rule"
+            if is_openai_available():
+                try:
+                    drafts = extract_action_items_openai(meeting.transcript, meeting.summary, base_dt=base_time)
+                    extraction_mode = "openai"
+                except OpenAIIntegrationError as exc:
+                    logger.warning("OpenAI extraction failed, falling back to rule-based extractor: %s", exc)
+                    drafts = extract_action_items(meeting.transcript, meeting.summary, base_dt=base_time)
+            else:
+                drafts = extract_action_items(meeting.transcript, meeting.summary, base_dt=base_time)
 
             for draft in drafts:
                 candidate = ActionItemCandidate(
@@ -46,7 +58,7 @@ def _process_meeting(meeting_db_id: str) -> None:
                     due=draft.due,
                     effort_minutes=draft.effort_minutes,
                     confidence=draft.confidence,
-                    rationale=draft.rationale,
+                    rationale=f"[{extraction_mode}] {draft.rationale}",
                     status="pending",
                 )
                 db.add(candidate)

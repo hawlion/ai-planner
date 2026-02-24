@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, or_, select
@@ -22,6 +22,18 @@ class Interval:
     @property
     def minutes(self) -> int:
         return int((self.end - self.start).total_seconds() // 60)
+
+
+def _coerce_timezone(dt: datetime, tz: ZoneInfo) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=tz)
+    return dt.astimezone(tz)
+
+
+def _as_naive_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def _parse_hhmm(value: str) -> time:
@@ -107,7 +119,19 @@ def _fetch_busy_intervals(db: Session, horizon_start: datetime, horizon_end: dat
         )
     )
     rows = db.execute(stmt).scalars().all()
-    return [Interval(start=row.start, end=row.end) for row in rows]
+    ref_tz = horizon_start.tzinfo
+
+    intervals: list[Interval] = []
+    for row in rows:
+        start = row.start
+        end = row.end
+        if ref_tz and start.tzinfo is None:
+            start = start.replace(tzinfo=ref_tz)
+        if ref_tz and end.tzinfo is None:
+            end = end.replace(tzinfo=ref_tz)
+        intervals.append(Interval(start=start, end=end))
+
+    return intervals
 
 
 def _free_intervals(
@@ -118,6 +142,8 @@ def _free_intervals(
     timezone: str,
 ) -> list[Interval]:
     tz = ZoneInfo(timezone)
+    horizon_start = _coerce_timezone(horizon_start, tz)
+    horizon_end = _coerce_timezone(horizon_end, tz)
     start_day = horizon_start.astimezone(tz).date()
     end_day = horizon_end.astimezone(tz).date()
 
@@ -132,11 +158,16 @@ def _free_intervals(
 
 
 def _task_order(strategy: str, tasks: list[Task]) -> list[Task]:
+    def due_key(task: Task) -> float:
+        if task.due is None:
+            return float("inf")
+        return _as_naive_utc(task.due).timestamp()
+
     if strategy == "urgent":
-        return sorted(tasks, key=lambda t: (t.due or datetime.max.replace(tzinfo=t.due.tzinfo if t.due else None), -PRIORITY_SCORE[t.priority]))
+        return sorted(tasks, key=lambda t: (due_key(t), -PRIORITY_SCORE[t.priority]))
     if strategy == "focus":
-        return sorted(tasks, key=lambda t: (-max(t.effort_minutes, 30), -PRIORITY_SCORE[t.priority], t.due or datetime.max))
-    return sorted(tasks, key=lambda t: (-PRIORITY_SCORE[t.priority], t.due or datetime.max))
+        return sorted(tasks, key=lambda t: (-max(t.effort_minutes, 30), -PRIORITY_SCORE[t.priority], due_key(t)))
+    return sorted(tasks, key=lambda t: (-PRIORITY_SCORE[t.priority], due_key(t)))
 
 
 def _deep_windows(profile: UserProfile) -> list[tuple[str, time, time, float]]:
@@ -160,8 +191,8 @@ def _interval_focus_score(interval: Interval, windows: list[tuple[str, time, tim
     if not windows:
         return 0.0
 
-    local_start = interval.start.astimezone(tz)
-    local_end = interval.end.astimezone(tz)
+    local_start = _coerce_timezone(interval.start, tz).astimezone(tz)
+    local_end = _coerce_timezone(interval.end, tz).astimezone(tz)
     day_key = DAY_KEYS[local_start.weekday()]
 
     score = 0.0
@@ -185,6 +216,7 @@ def _pick_interval(
 ) -> int | None:
     best_idx = None
     best_score = None
+    due_norm = _as_naive_utc(due) if due else None
 
     for idx, interval in enumerate(intervals):
         if interval.minutes < required_minutes:
@@ -194,8 +226,9 @@ def _pick_interval(
             score = interval.start.timestamp()
         elif strategy == "urgent":
             lateness_penalty = 0.0
-            if due and interval.end > due:
-                lateness_penalty = (interval.end - due).total_seconds() / 60 * 5.0
+            interval_end_norm = _as_naive_utc(interval.end)
+            if due_norm and interval_end_norm > due_norm:
+                lateness_penalty = (interval_end_norm - due_norm).total_seconds() / 60 * 5.0
             score = interval.start.timestamp() + lateness_penalty
         else:
             focus_bonus = _interval_focus_score(interval, deep_windows, tz)
@@ -281,8 +314,11 @@ def _score(changes: list[dict], tasks_by_id: dict[str, Task]) -> dict:
 
         task_id = block.get("task_id")
         task = tasks_by_id.get(task_id)
-        if task and task.due and end > task.due:
-            lateness += int((end - task.due).total_seconds() // 60)
+        if task and task.due:
+            due = _as_naive_utc(task.due)
+            end_norm = _as_naive_utc(end)
+            if end_norm > due:
+                lateness += int((end_norm - due).total_seconds() // 60)
 
     return {
         "objective_value": round(max(0, 1000 - lateness - len(changes) * 10 + deep_work * 0.5), 2),

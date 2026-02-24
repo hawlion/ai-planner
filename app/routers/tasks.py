@@ -72,10 +72,11 @@ def patch_task(task_id: str, payload: TaskPatch, db: Session = Depends(get_db)) 
     return TaskOut.model_validate(row)
 
 
-@router.delete("/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_task(task_id: str, db: Session = Depends(get_db)) -> None:
+@router.delete("/{task_id}")
+def delete_task(task_id: str, db: Session = Depends(get_db)) -> dict:
     row = db.get(Task, task_id)
     if row is None:
-        return
+        return {"deleted": False, "task_id": task_id}
     db.delete(row)
     db.commit()
+    return {"deleted": True, "task_id": task_id}

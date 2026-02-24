@@ -5,3 +5,4 @@ pydantic==2.11.7
 python-dateutil==2.9.0.post0
 dateparser==1.2.2
 httpx==0.28.1
+openai>=1.0.0

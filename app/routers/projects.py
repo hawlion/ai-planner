@@ -51,10 +51,11 @@ def patch_project(project_id: str, payload: ProjectPatch, db: Session = Depends(
     return ProjectOut.model_validate(row)
 
 
-@router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_project(project_id: str, db: Session = Depends(get_db)) -> None:
+@router.delete("/{project_id}")
+def delete_project(project_id: str, db: Session = Depends(get_db)) -> dict:
     row = db.get(Project, project_id)
     if row is None:
-        return
+        return {"deleted": False, "project_id": project_id}
     db.delete(row)
     db.commit()
+    return {"deleted": True, "project_id": project_id}

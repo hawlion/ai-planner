@@ -83,10 +83,11 @@ def patch_block(block_id: str, payload: CalendarBlockPatch, db: Session = Depend
     return CalendarBlockOut.model_validate(row)
 
 
-@router.delete("/{block_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_block(block_id: str, db: Session = Depends(get_db)) -> None:
+@router.delete("/{block_id}")
+def delete_block(block_id: str, db: Session = Depends(get_db)) -> dict:
     row = db.get(CalendarBlock, block_id)
     if row is None:
-        return
+        return {"deleted": False, "block_id": block_id}
     db.delete(row)
     db.commit()
+    return {"deleted": True, "block_id": block_id}

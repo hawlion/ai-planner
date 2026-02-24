@@ -25,6 +25,9 @@ cd "/Users/1110025/AI Planner"
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+# 환경변수 설정(.env 사용 가능)
+cp .env.example .env
+# .env 파일에 OPENAI_API_KEY를 입력
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -48,3 +51,5 @@ uvicorn app.main:app --reload --port 8000
 ## 참고
 - Microsoft Graph 실제 연동은 스텁으로 구현되어 있으며, `app/services/graph_connector.py`를 실제 SDK 호출로 교체하면 됩니다.
 - 현재 DB는 로컬 `aawo.db` 파일을 사용합니다.
+- `OPENAI_API_KEY`가 설정되면 회의 Action Item 추출과 NLI 의도 파싱에 OpenAI API를 우선 사용합니다.
+- 키가 없거나 OpenAI 호출이 실패하면 기존 규칙 기반 파서로 자동 폴백합니다.
