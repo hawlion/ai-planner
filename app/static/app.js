@@ -40,6 +40,13 @@ function notify(message, isError = false) {
   statusEl.style.color = isError ? "#b42318" : "#5b6376";
 }
 
+function setGraphMessage(message, isError = false) {
+  const el = $("graph-message");
+  if (!el) return;
+  el.textContent = message || "";
+  el.style.color = isError ? "#b42318" : "#5b6376";
+}
+
 async function loadProfile() {
   const profile = await api("/profile");
   $("autonomy").value = profile.autonomy_level;
@@ -345,11 +352,14 @@ async function runNLI(event) {
 async function loadSyncStatus() {
   const status = await api("/graph/status");
   $("sync-status").textContent = JSON.stringify(status, null, 2);
-  $("graph-message").textContent = status.connected
-    ? `연결됨: ${status.username || "Microsoft 계정"}`
-    : status.configured
-      ? "연결되지 않음"
-      : `설정 누락: ${(status.missing_settings || []).join(", ")}`;
+  setGraphMessage(
+    status.connected
+      ? `연결됨: ${status.username || "Microsoft 계정"}`
+      : status.configured
+        ? "연결되지 않음"
+        : `설정 누락: ${(status.missing_settings || []).join(", ")}`,
+    !status.connected && !status.configured,
+  );
 }
 
 async function pingSync() {
@@ -361,22 +371,29 @@ async function connectGraph() {
   const result = await api("/graph/auth/url");
   if (!result.configured) {
     const missing = (result.missing_settings || []).join(", ");
-    throw new Error(`Microsoft Graph 설정이 필요합니다: ${missing}`);
+    const msg = `Microsoft Graph 설정이 필요합니다: ${missing}`;
+    setGraphMessage(msg, true);
+    throw new Error(msg);
   }
   if (!result.auth_url) {
-    throw new Error("인증 URL을 생성하지 못했습니다.");
+    const msg = "인증 URL을 생성하지 못했습니다.";
+    setGraphMessage(msg, true);
+    throw new Error(msg);
   }
+  setGraphMessage("Microsoft 로그인 페이지로 이동합니다...");
   window.location.href = result.auth_url;
 }
 
 async function disconnectGraph() {
   await api("/graph/disconnect", { method: "POST" });
+  setGraphMessage("Microsoft 연결이 해제되었습니다.");
   await loadSyncStatus();
 }
 
 async function importOutlookCalendar() {
   const result = await api("/graph/calendar/import", { method: "POST" });
   $("graph-import-result").textContent = `캘린더 반영: ${result.imported}/${result.events}`;
+  setGraphMessage("Outlook 캘린더 동기화가 완료되었습니다.");
   await loadCalendar();
 }
 
@@ -407,6 +424,7 @@ async function importTodoList() {
 
   const result = await api(`/graph/todo/lists/${listId}/import`, { method: "POST" });
   $("graph-import-result").textContent = `To Do 반영: ${result.imported}/${result.tasks}`;
+  setGraphMessage("Microsoft To Do 동기화가 완료되었습니다.");
   await loadTasks();
 }
 
