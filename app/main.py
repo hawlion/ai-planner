@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.db import Base, engine
-from app.routers import approvals, briefing, calendar, graph, health, meetings, nli, profile, projects, scheduling, sync, tasks
+from app.routers import assistant, approvals, briefing, calendar, graph, health, meetings, nli, profile, projects, scheduling, sync, tasks
 from app.services.core import ensure_profile
 from app.db import SessionLocal
 
@@ -29,6 +29,7 @@ app.include_router(profile.router, prefix=api_prefix)
 app.include_router(projects.router, prefix=api_prefix)
 app.include_router(tasks.router, prefix=api_prefix)
 app.include_router(calendar.router, prefix=api_prefix)
+app.include_router(assistant.router, prefix=api_prefix)
 app.include_router(meetings.router, prefix=api_prefix)
 app.include_router(approvals.router, prefix=api_prefix)
 app.include_router(scheduling.router, prefix=api_prefix)

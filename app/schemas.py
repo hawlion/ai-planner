@@ -343,3 +343,18 @@ class GraphTodoTaskCreate(BaseModel):
     title: str = Field(min_length=1, max_length=250)
     due: datetime | None = None
     body: str | None = None
+
+
+class AssistantChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=4000)
+
+
+class AssistantActionOut(BaseModel):
+    type: str
+    detail: dict[str, Any] = Field(default_factory=dict)
+
+
+class AssistantChatResponse(BaseModel):
+    reply: str
+    actions: list[AssistantActionOut] = Field(default_factory=list)
+    refresh: list[str] = Field(default_factory=list)

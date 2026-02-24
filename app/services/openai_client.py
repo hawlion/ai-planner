@@ -47,6 +47,23 @@ class NLIOutput(BaseModel):
     note: str | None = ""
 
 
+class AssistantActionOutput(BaseModel):
+    intent: Literal[
+        "create_task",
+        "reschedule_request",
+        "complete_task",
+        "update_priority",
+        "register_meeting_note",
+        "unknown",
+    ]
+    title: str | None = None
+    due: str | None = None
+    effort_minutes: int | None = Field(default=None, ge=15, le=8 * 60)
+    priority: Literal["low", "medium", "high", "critical"] | None = None
+    meeting_note: str | None = None
+    note: str | None = ""
+
+
 
 def is_openai_available() -> bool:
     return bool(settings.openai_api_key and OpenAI is not None)
@@ -192,5 +209,32 @@ def parse_nli_openai(text: str, base_dt: datetime) -> NLIOutput:
         parsed = NLIOutput.model_validate(payload)
     except ValidationError as exc:
         raise OpenAIIntegrationError(f"OpenAI NLI schema validation failed: {exc}") from exc
+
+    return parsed
+
+
+def parse_assistant_action_openai(text: str, base_dt: datetime) -> AssistantActionOutput:
+    system_prompt = (
+        "You are an assistant action parser for a work planner."
+        " Return strict JSON only with fields: "
+        "intent(create_task|reschedule_request|complete_task|update_priority|register_meeting_note|unknown), "
+        "title, due, effort_minutes, priority, meeting_note, note. "
+        "For meeting-note style text, use register_meeting_note and copy full note text into meeting_note."
+        " For task completion/priority update, title should be the target task title or keyword."
+        " Use null for unknown values."
+        " due should be ISO-8601 datetime when possible."
+    )
+
+    user_prompt = (
+        f"timezone={settings.timezone}\n"
+        f"base_datetime={base_dt.isoformat()}\n"
+        f"user_message={text}"
+    )
+
+    payload = _chat_json(system_prompt, user_prompt)
+    try:
+        parsed = AssistantActionOutput.model_validate(payload)
+    except ValidationError as exc:
+        raise OpenAIIntegrationError(f"OpenAI assistant action schema validation failed: {exc}") from exc
 
     return parsed

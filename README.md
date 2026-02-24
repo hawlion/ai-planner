@@ -3,6 +3,7 @@
 요구사항 정의서 기반으로 구현한 실행 가능한 웹 앱입니다.
 
 ## 포함된 핵심 기능
+- Outlook 스타일 단일 화면 UI: 주간 캘린더 뷰 + 일정 리스트 + To-do 패널 + AI 채팅창
 - 온보딩/프로필: 타임존, 자율성 레벨(L0~L4) 설정
 - Task 관리: 생성/조회/수정/삭제
 - Calendar block 관리: 생성/조회/수정/삭제 + 충돌 방지
@@ -14,6 +15,7 @@
 - NLI command: 자연어 기반 간단한 작업 생성/의도 파싱
 - Microsoft Graph OAuth: Outlook Calendar / Microsoft To Do 실연동
 - Outlook 캘린더 양방향 반영: 가져오기(import) + 로컬 블록 내보내기(export)
+- AI Assistant Chat: 회의록 등록/할일 조정/일정 재배치를 대화로 실행
 
 ## 기술 스택
 - Backend: FastAPI + SQLAlchemy + SQLite
@@ -44,6 +46,7 @@ uvicorn app.main:app --reload --port 8000
 
 ## 주요 API
 - `GET/PATCH /api/profile`
+- `POST /api/assistant/chat`
 - `GET/POST /api/tasks`
 - `GET/POST /api/calendar/blocks`
 - `POST /api/meetings` (202 Accepted)

@@ -1,5 +1,15 @@
 const API = "/api";
 
+const state = {
+  profile: null,
+  graph: null,
+  tasks: [],
+  localBlocks: [],
+  remoteEvents: [],
+  weekStart: startOfWeek(new Date()),
+  selectedDate: startOfDay(new Date()),
+};
+
 const $ = (id) => document.getElementById(id);
 
 function escapeHtml(value) {
@@ -11,10 +21,58 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
-function fmtDate(value) {
+function startOfDay(date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+function startOfWeek(date) {
+  const day = date.getDay(); // 0 = Sun, 1 = Mon
+  const diff = day === 0 ? -6 : 1 - day;
+  const monday = new Date(date);
+  monday.setDate(date.getDate() + diff);
+  return startOfDay(monday);
+}
+
+function addDays(date, days) {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
+function isSameDay(a, b) {
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
+}
+
+function toDateTimeInputValue(date) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function fmtDate(date) {
+  return date.toLocaleDateString("ko-KR", { month: "short", day: "numeric", weekday: "short" });
+}
+
+function fmtDateTime(value) {
   if (!value) return "-";
-  const d = new Date(value);
-  return `${d.toLocaleDateString()} ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+  const date = value instanceof Date ? value : new Date(value);
+  return date.toLocaleString("ko-KR", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
+function fmtTimeRange(start, end) {
+  const s = start.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
+  const e = end.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
+  return `${s} - ${e}`;
+}
+
+function notify(message, isError = false) {
+  const el = $("status-message");
+  if (!el) return;
+  el.textContent = message;
+  el.style.color = isError ? "#be2234" : "#516080";
 }
 
 async function api(path, options = {}) {
@@ -34,74 +92,264 @@ async function api(path, options = {}) {
   return body;
 }
 
-function notify(message, isError = false) {
-  const statusEl = $("meeting-status");
-  statusEl.textContent = message;
-  statusEl.style.color = isError ? "#b42318" : "#5b6376";
-}
-
-function setGraphMessage(message, isError = false) {
-  const el = $("graph-message");
-  if (!el) return;
-  el.textContent = message || "";
-  el.style.color = isError ? "#b42318" : "#5b6376";
-}
-
 async function loadProfile() {
-  const profile = await api("/profile");
-  $("autonomy").value = profile.autonomy_level;
-  $("timezone").value = profile.timezone;
+  state.profile = await api("/profile");
+  $("autonomy").value = state.profile.autonomy_level;
+  $("timezone").value = state.profile.timezone;
 }
 
 async function saveProfile() {
-  const autonomy = $("autonomy").value;
-  const timezone = $("timezone").value;
   await api("/profile", {
     method: "PATCH",
-    body: JSON.stringify({ autonomy_level: autonomy, timezone }),
+    body: JSON.stringify({
+      autonomy_level: $("autonomy").value,
+      timezone: $("timezone").value.trim(),
+    }),
   });
   await loadProfile();
-  notify("프로필 설정이 저장되었습니다.");
+  notify("프로필 설정을 저장했습니다.");
 }
 
-async function loadBriefing() {
-  const briefing = await api("/briefings/daily");
-  const top = briefing.top_tasks
-    .map(
-      (item) =>
-        `<div class="list-item"><strong>${escapeHtml(item.title)}</strong><div>${escapeHtml(item.reason)}</div><div class="muted">추천: ${
-          item.recommended_block ? `${fmtDate(item.recommended_block.start)} ~ ${fmtDate(item.recommended_block.end)}` : "없음"
-        }</div></div>`,
-    )
-    .join("");
+async function loadGraphStatus() {
+  state.graph = await api("/graph/status");
+  renderGraphStatus();
+}
 
-  const risks = briefing.risks.length
-    ? briefing.risks.map((r) => `<span class="badge warn">${escapeHtml(r)}</span>`).join(" ")
-    : "<span class=\"badge\">리스크 없음</span>";
+function renderGraphStatus() {
+  const label = $("graph-status-label");
+  const note = $("graph-status-note");
+  if (!state.graph) {
+    label.textContent = "Graph 상태 확인 중";
+    label.className = "status-pill";
+    note.textContent = "";
+    return;
+  }
 
-  $("briefing").innerHTML = `
-    <div class="row">${risks}</div>
-    <div class="muted">집중 ${briefing.snapshot.focus_minutes}분 · 여유 ${briefing.snapshot.free_minutes}분</div>
-    <div class="list" style="margin-top:8px;">${top}</div>
-  `;
+  if (state.graph.connected) {
+    label.textContent = "Graph 연결됨";
+    label.className = "status-pill connected";
+    note.textContent = state.graph.username ? state.graph.username : "Microsoft 계정 연결";
+    return;
+  }
+
+  if (!state.graph.configured) {
+    label.textContent = "Graph 설정 누락";
+    label.className = "status-pill warn";
+    note.textContent = `누락: ${(state.graph.missing_settings || []).join(", ")}`;
+    return;
+  }
+
+  label.textContent = "Graph 미연결";
+  label.className = "status-pill";
+  note.textContent = "Outlook 연결 버튼을 눌러 로그인하세요.";
 }
 
 async function loadTasks() {
-  const tasks = await api("/tasks");
-  const rows = tasks
-    .map(
-      (task) => `
-        <tr>
-          <td>${escapeHtml(task.title)}</td>
-          <td>${escapeHtml(task.priority)}</td>
-          <td>${escapeHtml(task.status)}</td>
-          <td>${fmtDate(task.due)}</td>
-          <td>${task.effort_minutes}</td>
-        </tr>
-      `,
-    )
+  state.tasks = await api("/tasks");
+}
+
+function parseGraphDateTime(value) {
+  if (!value) return null;
+  if (typeof value === "string") return new Date(value);
+  if (value.dateTime) return new Date(value.dateTime);
+  return null;
+}
+
+function normalizeLocalBlocks(blocks) {
+  return blocks.map((block) => {
+    const kind = block.source === "external" ? "outlook" : block.outlook_event_id ? "mixed" : "local";
+    return {
+      id: `local-${block.id}`,
+      title: block.title || "일정",
+      start: new Date(block.start),
+      end: new Date(block.end),
+      kind,
+      source: block.source,
+      outlookId: block.outlook_event_id || null,
+      raw: block,
+    };
+  });
+}
+
+function normalizeRemoteEvents(events) {
+  return events.map((event) => ({
+    id: `outlook-${event.id}`,
+    title: event.subject || "Outlook Event",
+    start: parseGraphDateTime(event.start),
+    end: parseGraphDateTime(event.end),
+    kind: "outlook",
+    source: "outlook",
+    outlookId: event.id,
+    raw: event,
+  }));
+}
+
+function mergedEvents() {
+  const local = normalizeLocalBlocks(state.localBlocks);
+  const knownOutlookIds = new Set(local.map((item) => item.outlookId).filter(Boolean));
+  const remote = normalizeRemoteEvents(state.remoteEvents).filter((item) => !knownOutlookIds.has(item.outlookId));
+
+  return [...local, ...remote]
+    .filter((item) => item.start && item.end)
+    .sort((a, b) => a.start.getTime() - b.start.getTime());
+}
+
+async function loadCalendarData() {
+  const start = state.weekStart;
+  const end = addDays(state.weekStart, 7);
+  const qs = `start=${encodeURIComponent(start.toISOString())}&end=${encodeURIComponent(end.toISOString())}`;
+
+  const localPromise = api(`/calendar/blocks?${qs}`);
+  const remotePromise = state.graph?.connected ? api(`/graph/calendar/events?${qs}`) : Promise.resolve([]);
+  const [local, remote] = await Promise.all([localPromise, remotePromise]);
+
+  state.localBlocks = local;
+  state.remoteEvents = remote;
+}
+
+function renderWeekRange() {
+  const start = state.weekStart;
+  const end = addDays(state.weekStart, 6);
+  $("week-range").textContent = `${fmtDate(start)} - ${fmtDate(end)}`;
+}
+
+function renderCalendar() {
+  renderWeekRange();
+  const events = mergedEvents();
+  const container = $("calendar-grid");
+
+  const cells = Array.from({ length: 7 }, (_, idx) => {
+    const day = addDays(state.weekStart, idx);
+    const dayEvents = events.filter((event) => isSameDay(event.start, day));
+    const activeClass = isSameDay(state.selectedDate, day) ? "active" : "";
+
+    const chips = dayEvents.length
+      ? dayEvents
+          .slice(0, 4)
+          .map(
+            (event) =>
+              `<div class="event-chip ${event.kind}">${escapeHtml(
+                `${event.start.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })} ${event.title}`,
+              )}</div>`,
+          )
+          .join("")
+      : `<div class="muted">일정 없음</div>`;
+
+    return `
+      <div class="day-cell ${activeClass}" data-day="${day.toISOString()}">
+        <div class="day-head">
+          <span>${day.toLocaleDateString("ko-KR", { weekday: "short" })}</span>
+          <span class="date-num">${day.getDate()}</span>
+        </div>
+        <div class="day-events">${chips}</div>
+      </div>
+    `;
+  });
+
+  container.innerHTML = cells.join("");
+  container.querySelectorAll("[data-day]").forEach((cell) => {
+    cell.addEventListener("click", () => {
+      state.selectedDate = startOfDay(new Date(cell.dataset.day));
+      renderCalendar();
+      renderAgenda();
+    });
+  });
+}
+
+function renderAgenda() {
+  const events = mergedEvents().filter((event) => isSameDay(event.start, state.selectedDate));
+  $("agenda-date").textContent = fmtDate(state.selectedDate);
+
+  if (!events.length) {
+    $("agenda-list").innerHTML = `<div class="agenda-item"><div class="agenda-meta">선택한 날짜에 일정이 없습니다.</div></div>`;
+    return;
+  }
+
+  $("agenda-list").innerHTML = events
+    .map((event) => {
+      const sourceTag =
+        event.kind === "outlook" ? `<span class="tag outlook">Outlook</span>` : `<span class="tag">Local</span>`;
+      const syncTag = event.kind === "mixed" ? `<span class="tag">Synced</span>` : "";
+      return `
+        <div class="agenda-item">
+          <div class="agenda-title">${escapeHtml(event.title)}</div>
+          <div class="agenda-meta">${fmtTimeRange(event.start, event.end)}</div>
+          <div class="meta-row">${sourceTag}${syncTag}</div>
+        </div>
+      `;
+    })
     .join("");
-  $("tasks-table").innerHTML = rows || `<tr><td colspan="5">작업이 없습니다.</td></tr>`;
+}
+
+function renderTasks() {
+  const ordered = [...state.tasks].sort((a, b) => {
+    const aDone = a.status === "done" ? 1 : 0;
+    const bDone = b.status === "done" ? 1 : 0;
+    if (aDone !== bDone) return aDone - bDone;
+    const aDue = a.due ? new Date(a.due).getTime() : Number.MAX_SAFE_INTEGER;
+    const bDue = b.due ? new Date(b.due).getTime() : Number.MAX_SAFE_INTEGER;
+    return aDue - bDue;
+  });
+
+  if (!ordered.length) {
+    $("todo-list").innerHTML = `<div class="todo-item"><div class="todo-meta">등록된 할일이 없습니다.</div></div>`;
+    return;
+  }
+
+  $("todo-list").innerHTML = ordered
+    .map((task) => {
+      const doneClass = task.status === "done" ? "done" : "";
+      const dueText = task.due ? fmtDateTime(task.due) : "마감 미정";
+      const statusTag = task.status === "done" ? `<span class="tag done">done</span>` : `<span class="tag">${task.status}</span>`;
+
+      return `
+        <div class="todo-item ${doneClass}">
+          <div class="todo-title">${escapeHtml(task.title)}</div>
+          <div class="todo-meta">마감 ${escapeHtml(dueText)} · 우선순위 ${escapeHtml(task.priority)}</div>
+          <div class="meta-row">
+            ${statusTag}
+            <button class="btn btn-ghost btn-mini" data-task-done="${task.id}">완료</button>
+            <button class="btn btn-ghost btn-mini" data-task-progress="${task.id}">진행중</button>
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+
+  document.querySelectorAll("[data-task-done]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        await api(`/tasks/${button.dataset.taskDone}`, {
+          method: "PATCH",
+          body: JSON.stringify({ status: "done" }),
+        });
+        await refreshTasksOnly();
+        notify("할일 상태를 완료로 변경했습니다.");
+      } catch (error) {
+        notify(error.message, true);
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-task-progress]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        await api(`/tasks/${button.dataset.taskProgress}`, {
+          method: "PATCH",
+          body: JSON.stringify({ status: "in_progress" }),
+        });
+        await refreshTasksOnly();
+        notify("할일 상태를 진행중으로 변경했습니다.");
+      } catch (error) {
+        notify(error.message, true);
+      }
+    });
+  });
+}
+
+async function refreshTasksOnly() {
+  await loadTasks();
+  renderTasks();
 }
 
 async function createTask(event) {
@@ -110,349 +358,222 @@ async function createTask(event) {
   if (!title) return;
 
   const dueInput = $("task-due").value;
-  const payload = {
-    title,
-    priority: $("task-priority").value,
-    effort_minutes: Number($("task-effort").value || 60),
-    due: dueInput ? new Date(dueInput).toISOString() : null,
-  };
+  await api("/tasks", {
+    method: "POST",
+    body: JSON.stringify({
+      title,
+      priority: $("task-priority").value,
+      effort_minutes: Number($("task-effort").value || 60),
+      due: dueInput ? new Date(dueInput).toISOString() : null,
+      source: "manual",
+    }),
+  });
 
-  await api("/tasks", { method: "POST", body: JSON.stringify(payload) });
   $("task-form").reset();
   $("task-effort").value = "60";
-  await Promise.all([loadTasks(), loadBriefing()]);
-}
-
-async function loadCalendar() {
-  const now = new Date();
-  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const end = new Date(start.getTime() + 1000 * 60 * 60 * 24 * 3);
-  const blocks = await api(`/calendar/blocks?start=${encodeURIComponent(start.toISOString())}&end=${encodeURIComponent(end.toISOString())}`);
-
-  $("calendar-list").innerHTML = blocks.length
-    ? blocks
-        .map(
-          (block) => `<div class="list-item">
-      <strong>${escapeHtml(block.title)}</strong>
-      <div class="row"><span class="badge">${escapeHtml(block.type)}</span>${
-        block.locked ? '<span class="badge warn">locked</span>' : ""
-      }</div>
-      <div class="muted">${fmtDate(block.start)} ~ ${fmtDate(block.end)}</div>
-    </div>`,
-        )
-        .join("")
-    : `<div class="muted">현재 캘린더 블록이 없습니다.</div>`;
-}
-
-function parseTranscript(raw) {
-  return raw
-    .split("\n")
-    .map((line, index) => {
-      const trimmed = line.trim();
-      if (!trimmed) return null;
-      const [speaker, ...rest] = trimmed.includes(":") ? trimmed.split(":") : ["참석자", trimmed];
-      return {
-        ts_ms: index * 20000,
-        speaker: speaker.trim() || "참석자",
-        text: rest.join(":").trim() || trimmed,
-      };
-    })
-    .filter(Boolean);
-}
-
-async function ingestMeeting(event) {
-  event.preventDefault();
-  const transcript = parseTranscript($("meeting-transcript").value);
-  if (!transcript.length) {
-    notify("회의록은 최소 1줄 이상 필요합니다.", true);
-    return;
-  }
-
-  const payload = {
-    title: $("meeting-title").value.trim() || null,
-    summary: $("meeting-summary").value.trim() || null,
-    transcript,
-  };
-
-  const res = await api("/meetings", { method: "POST", body: JSON.stringify(payload) });
-  notify(`회의 처리 시작: ${res.meeting_id}`);
-  await pollMeeting(res.meeting_id);
-}
-
-async function pollMeeting(meetingId) {
-  const maxTry = 20;
-  for (let i = 0; i < maxTry; i += 1) {
-    const meeting = await api(`/meetings/${meetingId}`);
-    notify(`회의 상태: ${meeting.extraction_status}`);
-    if (meeting.extraction_status !== "pending") {
-      await loadCandidates(meetingId);
-      await loadApprovals();
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 1200));
-  }
-  notify("회의 추출 시간이 길어지고 있습니다. 잠시 후 다시 시도하세요.", true);
-}
-
-async function loadCandidates(meetingId) {
-  const candidates = await api(`/meetings/${meetingId}/action-items`);
-  const html = candidates.length
-    ? candidates
-        .map(
-          (c) => `<div class="list-item">
-      <strong>${escapeHtml(c.title)}</strong>
-      <div class="row">
-        <span class="badge">confidence ${c.confidence.toFixed(2)}</span>
-        <span class="badge">effort ${c.effort_minutes}m</span>
-        ${c.due ? `<span class="badge">due ${escapeHtml(fmtDate(c.due))}</span>` : ""}
-      </div>
-      <div class="muted">${escapeHtml(c.rationale || "")}</div>
-      <div class="row" style="margin-top:8px;">
-        <button class="btn btn-primary" data-approve="${c.id}">승인</button>
-        <button class="btn btn-danger" data-reject="${c.id}">거절</button>
-      </div>
-    </div>`,
-        )
-        .join("")
-    : `<div class="muted">추출된 액션 아이템이 없습니다.</div>`;
-
-  $("meeting-candidates").innerHTML = html;
-
-  document.querySelectorAll("[data-approve]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      await api(`/action-items/${btn.dataset.approve}/approve`, {
-        method: "POST",
-        body: JSON.stringify({ create_time_block: true }),
-      });
-      notify("액션 아이템을 승인했습니다.");
-      await Promise.all([loadTasks(), loadCalendar(), loadApprovals(), loadBriefing()]);
-    });
-  });
-
-  document.querySelectorAll("[data-reject]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      await api(`/action-items/${btn.dataset.reject}/reject`, { method: "POST" });
-      notify("액션 아이템을 거절했습니다.");
-      await loadApprovals();
-    });
-  });
-}
-
-async function loadApprovals() {
-  const approvals = await api("/approvals?status=pending");
-  $("approvals").innerHTML = approvals.length
-    ? approvals
-        .map(
-          (a) => `<div class="list-item">
-        <strong>${escapeHtml(a.type)}</strong>
-        <div class="muted">${escapeHtml(JSON.stringify(a.payload))}</div>
-        <div class="row" style="margin-top:8px;">
-          <button class="btn btn-primary" data-approve-id="${a.id}">승인</button>
-          <button class="btn btn-danger" data-reject-id="${a.id}">거절</button>
-        </div>
-      </div>`,
-        )
-        .join("")
-    : `<div class="muted">대기 중 승인 요청이 없습니다.</div>`;
-
-  document.querySelectorAll("[data-approve-id]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      await api(`/approvals/${btn.dataset.approveId}/resolve`, {
-        method: "POST",
-        body: JSON.stringify({ decision: "approve" }),
-      });
-      await Promise.all([loadApprovals(), loadTasks(), loadCalendar(), loadBriefing()]);
-    });
-  });
-
-  document.querySelectorAll("[data-reject-id]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      await api(`/approvals/${btn.dataset.rejectId}/resolve`, {
-        method: "POST",
-        body: JSON.stringify({ decision: "reject" }),
-      });
-      await loadApprovals();
-    });
-  });
-}
-
-async function createProposals(event) {
-  event.preventDefault();
-  const fromValue = $("proposal-from").value;
-  const toValue = $("proposal-to").value;
-  if (!fromValue || !toValue) return;
-
-  const payload = {
-    horizon: {
-      from: new Date(fromValue).toISOString(),
-      to: new Date(toValue).toISOString(),
-    },
-    constraints: {
-      slot_minutes: 30,
-      split_allowed: false,
-      max_proposals: 3,
-    },
-  };
-
-  const proposals = await api("/scheduling/proposals", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-
-  renderProposals(proposals);
-}
-
-function renderProposals(proposals) {
-  $("proposals").innerHTML = proposals.length
-    ? proposals
-        .map(
-          (p) => `<div class="list-item">
-      <strong>${escapeHtml(p.summary)}</strong>
-      <div class="row">
-        <span class="badge">changes ${p.score.changes_count}</span>
-        <span class="badge">late ${p.score.lateness_minutes}m</span>
-        <span class="badge">deep ${p.score.deep_work_minutes}m</span>
-      </div>
-      <div class="muted">${escapeHtml((p.explanation.tradeoffs || []).join(" / "))}</div>
-      <button class="btn btn-primary" style="margin-top:8px;" data-apply-proposal="${p.id}">이 제안 적용</button>
-    </div>`,
-        )
-        .join("")
-    : `<div class="muted">생성된 제안이 없습니다.</div>`;
-
-  document.querySelectorAll("[data-apply-proposal]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const result = await api(`/scheduling/proposals/${btn.dataset.applyProposal}/apply`, {
-        method: "POST",
-        body: JSON.stringify({ approved: false }),
-      });
-      if (result.approval_required) {
-        notify(`승인 필요: approval ${result.approval_id}`);
-        await loadApprovals();
-      } else {
-        notify("스케줄 제안을 적용했습니다.");
-        await Promise.all([loadCalendar(), loadBriefing()]);
-      }
-    });
-  });
-}
-
-async function runNLI(event) {
-  event.preventDefault();
-  const text = $("nli-text").value.trim();
-  if (!text) return;
-  const result = await api("/nli/command", {
-    method: "POST",
-    body: JSON.stringify({ text }),
-  });
-  $("nli-result").textContent = JSON.stringify(result, null, 2);
-  await Promise.all([loadTasks(), loadBriefing()]);
-}
-
-async function loadSyncStatus() {
-  const status = await api("/graph/status");
-  $("sync-status").textContent = JSON.stringify(status, null, 2);
-  setGraphMessage(
-    status.connected
-      ? `연결됨: ${status.username || "Microsoft 계정"}`
-      : status.configured
-        ? "연결되지 않음"
-        : `설정 누락: ${(status.missing_settings || []).join(", ")}`,
-    !status.connected && !status.configured,
-  );
-}
-
-async function pingSync() {
-  const result = await api("/graph/ping", { method: "POST" });
-  $("sync-status").textContent = JSON.stringify(result, null, 2);
+  await refreshTasksOnly();
+  notify("새 할일을 추가했습니다.");
 }
 
 async function connectGraph() {
   const result = await api("/graph/auth/url");
-  if (!result.configured) {
-    const missing = (result.missing_settings || []).join(", ");
-    const msg = `Microsoft Graph 설정이 필요합니다: ${missing}`;
-    setGraphMessage(msg, true);
+  if (!result.configured || !result.auth_url) {
+    const msg = `Graph 설정 누락: ${(result.missing_settings || []).join(", ")}`;
     throw new Error(msg);
   }
-  if (!result.auth_url) {
-    const msg = "인증 URL을 생성하지 못했습니다.";
-    setGraphMessage(msg, true);
-    throw new Error(msg);
-  }
-  setGraphMessage("Microsoft 로그인 페이지로 이동합니다...");
   window.location.href = result.auth_url;
 }
 
 async function disconnectGraph() {
   await api("/graph/disconnect", { method: "POST" });
-  setGraphMessage("Microsoft 연결이 해제되었습니다.");
-  await loadSyncStatus();
+  await loadGraphStatus();
+  state.remoteEvents = [];
+  renderCalendar();
+  renderAgenda();
+  notify("Outlook 연결을 해제했습니다.");
 }
 
-async function importOutlookCalendar() {
-  const result = await api("/graph/calendar/import", { method: "POST" });
-  $("graph-import-result").textContent = `캘린더 반영: ${result.imported}/${result.events}`;
-  setGraphMessage("Outlook 캘린더 동기화가 완료되었습니다.");
-  await loadCalendar();
+async function syncBidirectional(silent = false) {
+  if (!state.graph?.connected) {
+    throw new Error("Outlook 연결 후 동기화할 수 있습니다.");
+  }
+
+  const exportResult = await api("/graph/calendar/export", { method: "POST" });
+  const importResult = await api("/graph/calendar/import", { method: "POST" });
+  await refreshAll();
+
+  if (!silent) {
+    notify(
+      `양방향 동기화 완료 · 내보내기 ${exportResult.synced}건(생성 ${exportResult.created}, 업데이트 ${exportResult.updated}) / 가져오기 ${importResult.imported}건`,
+    );
+  }
 }
 
-async function exportOutlookCalendar() {
-  const result = await api("/graph/calendar/export", { method: "POST" });
-  $("graph-import-result").textContent =
-    `Outlook 내보내기: ${result.synced}건 (생성 ${result.created}, 업데이트 ${result.updated}, 제외 ${result.skipped})`;
-  setGraphMessage("로컬 캘린더를 Outlook에 반영했습니다.");
-  await loadSyncStatus();
-}
+async function syncTodoFromGraph() {
+  if (!state.graph?.connected) {
+    throw new Error("Outlook 연결 후 To Do를 가져올 수 있습니다.");
+  }
 
-async function loadTodoLists() {
   const lists = await api("/graph/todo/lists");
-  const select = $("todo-list-select");
-  select.innerHTML = "";
-
   if (!lists.length) {
-    select.innerHTML = `<option value="">목록 없음</option>`;
-    return;
+    throw new Error("가져올 To Do 목록이 없습니다.");
   }
 
-  lists.forEach((list) => {
-    const option = document.createElement("option");
-    option.value = list.id;
-    option.textContent = list.displayName || list.wellknownListName || list.id;
-    select.appendChild(option);
-  });
-}
-
-async function importTodoList() {
-  const select = $("todo-list-select");
-  const listId = select.value;
-  if (!listId) {
-    throw new Error("가져올 To Do 목록을 먼저 선택하세요.");
-  }
-
+  const listId = lists[0].id;
   const result = await api(`/graph/todo/lists/${listId}/import`, { method: "POST" });
-  $("graph-import-result").textContent = `To Do 반영: ${result.imported}/${result.tasks}`;
-  setGraphMessage("Microsoft To Do 동기화가 완료되었습니다.");
-  await loadTasks();
+  await refreshTasksOnly();
+  notify(`To Do 가져오기 완료: ${result.imported}/${result.tasks}`);
 }
 
-function setProposalDefaults() {
-  const now = new Date();
-  const start = new Date(now.getTime() + 30 * 60 * 1000);
-  const end = new Date(now.getTime() + 48 * 60 * 60 * 1000);
+function addChatMessage(role, text) {
+  const log = $("chat-log");
+  const item = document.createElement("div");
+  item.className = `chat-msg ${role}`;
+  item.innerHTML = escapeHtml(text).replaceAll("\n", "<br />");
+  log.appendChild(item);
+  log.scrollTop = log.scrollHeight;
+}
 
-  const toInput = (d) => {
-    const pad = (n) => String(n).padStart(2, "0");
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-  };
+async function sendChat(event) {
+  event.preventDefault();
+  const input = $("chat-input");
+  const message = input.value.trim();
+  if (!message) return;
 
-  $("proposal-from").value = toInput(start);
-  $("proposal-to").value = toInput(end);
+  addChatMessage("user", message);
+  input.value = "";
+
+  try {
+    const result = await api("/assistant/chat", {
+      method: "POST",
+      body: JSON.stringify({ message }),
+    });
+
+    const actionSummary = (result.actions || []).map((a) => a.type).join(", ");
+    addChatMessage("assistant", actionSummary ? `${result.reply}\n\n작업: ${actionSummary}` : result.reply);
+
+    await refreshAll();
+  } catch (error) {
+    addChatMessage("assistant", `오류: ${error.message}`);
+    notify(error.message, true);
+  }
+}
+
+async function refreshCalendarAndAgenda() {
+  await loadCalendarData();
+  renderCalendar();
+  renderAgenda();
+}
+
+async function refreshAll() {
+  await loadGraphStatus();
+  await Promise.all([loadTasks(), loadCalendarData()]);
+  renderCalendar();
+  renderAgenda();
+  renderTasks();
+}
+
+function bindEvents() {
+  $("save-profile").addEventListener("click", async () => {
+    try {
+      await saveProfile();
+    } catch (error) {
+      notify(error.message, true);
+    }
+  });
+
+  $("graph-connect").addEventListener("click", async () => {
+    try {
+      await connectGraph();
+    } catch (error) {
+      notify(error.message, true);
+    }
+  });
+
+  $("graph-disconnect").addEventListener("click", async () => {
+    try {
+      await disconnectGraph();
+    } catch (error) {
+      notify(error.message, true);
+    }
+  });
+
+  $("sync-bidirectional").addEventListener("click", async () => {
+    try {
+      await syncBidirectional(false);
+    } catch (error) {
+      notify(error.message, true);
+    }
+  });
+
+  $("sync-todo").addEventListener("click", async () => {
+    try {
+      await syncTodoFromGraph();
+    } catch (error) {
+      notify(error.message, true);
+    }
+  });
+
+  $("refresh-all").addEventListener("click", async () => {
+    try {
+      await refreshAll();
+      notify("화면 데이터를 새로고침했습니다.");
+    } catch (error) {
+      notify(error.message, true);
+    }
+  });
+
+  $("task-form").addEventListener("submit", async (event) => {
+    try {
+      await createTask(event);
+    } catch (error) {
+      notify(error.message, true);
+    }
+  });
+
+  $("week-prev").addEventListener("click", async () => {
+    state.weekStart = addDays(state.weekStart, -7);
+    state.selectedDate = addDays(state.selectedDate, -7);
+    await refreshCalendarAndAgenda();
+  });
+
+  $("week-next").addEventListener("click", async () => {
+    state.weekStart = addDays(state.weekStart, 7);
+    state.selectedDate = addDays(state.selectedDate, 7);
+    await refreshCalendarAndAgenda();
+  });
+
+  $("week-today").addEventListener("click", async () => {
+    state.weekStart = startOfWeek(new Date());
+    state.selectedDate = startOfDay(new Date());
+    await refreshCalendarAndAgenda();
+  });
+
+  $("chat-form").addEventListener("submit", sendChat);
+  $("chat-input").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      $("chat-form").requestSubmit();
+    }
+  });
+
+  document.querySelectorAll(".prompt-chip").forEach((button) => {
+    button.addEventListener("click", () => {
+      $("chat-input").value = button.dataset.prompt || "";
+      $("chat-input").focus();
+    });
+  });
 }
 
 async function bootstrap() {
   try {
-    setProposalDefaults();
+    bindEvents();
+
+    const now = new Date();
+    const due = addDays(now, 1);
+    due.setHours(10, 0, 0, 0);
+    $("task-due").value = toDateTimeInputValue(due);
+
     const params = new URLSearchParams(window.location.search);
     if (params.get("graph") === "connected") {
       notify("Microsoft Graph 연결이 완료되었습니다.");
@@ -463,74 +584,13 @@ async function bootstrap() {
       history.replaceState({}, "", "/");
     }
 
-    $("save-profile").addEventListener("click", async () => {
-      try {
-        await saveProfile();
-      } catch (error) {
-        notify(error.message, true);
-      }
-    });
+    await loadProfile();
+    await refreshAll();
 
-    $("refresh-briefing").addEventListener("click", () => loadBriefing());
-    $("refresh-tasks").addEventListener("click", () => loadTasks());
-    $("refresh-calendar").addEventListener("click", () => loadCalendar());
-    $("refresh-approvals").addEventListener("click", () => loadApprovals());
-    $("task-form").addEventListener("submit", createTask);
-    $("meeting-form").addEventListener("submit", ingestMeeting);
-    $("proposal-form").addEventListener("submit", createProposals);
-    $("nli-form").addEventListener("submit", runNLI);
-    $("ping-sync").addEventListener("click", async () => {
-      try {
-        await pingSync();
-      } catch (error) {
-        notify(error.message, true);
-      }
-    });
-    $("graph-connect").addEventListener("click", async () => {
-      try {
-        await connectGraph();
-      } catch (error) {
-        notify(error.message, true);
-      }
-    });
-    $("graph-disconnect").addEventListener("click", async () => {
-      try {
-        await disconnectGraph();
-      } catch (error) {
-        notify(error.message, true);
-      }
-    });
-    $("import-calendar").addEventListener("click", async () => {
-      try {
-        await importOutlookCalendar();
-      } catch (error) {
-        notify(error.message, true);
-      }
-    });
-    $("export-calendar").addEventListener("click", async () => {
-      try {
-        await exportOutlookCalendar();
-      } catch (error) {
-        notify(error.message, true);
-      }
-    });
-    $("load-todo-lists").addEventListener("click", async () => {
-      try {
-        await loadTodoLists();
-      } catch (error) {
-        notify(error.message, true);
-      }
-    });
-    $("import-todo").addEventListener("click", async () => {
-      try {
-        await importTodoList();
-      } catch (error) {
-        notify(error.message, true);
-      }
-    });
-
-    await Promise.all([loadProfile(), loadBriefing(), loadTasks(), loadCalendar(), loadApprovals(), loadSyncStatus()]);
-    await loadTodoLists().catch(() => {});
+    addChatMessage(
+      "assistant",
+      "AI Assistant 준비 완료. 회의록 등록, 일정 재배치, 할일 완료/우선순위 변경 요청을 바로 처리할 수 있습니다.",
+    );
   } catch (error) {
     notify(error.message, true);
   }
