@@ -51,7 +51,6 @@ body {
   font-family: "Pretendard", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   color: var(--ink);
   background: var(--bg);
-  overflow: hidden;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -60,16 +59,15 @@ body {
   font-family: "SUIT", sans-serif;
   color: var(--ink);
   background: var(--bg);
-  overflow: hidden;
 }
 
 .calendar-shell {
   width: 100%;
-  height: 100%;
-  padding: 16px 24px;
+  min-height: 100vh;
+  padding: 12px 20px;
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);
-  gap: 16px;
+  gap: 12px;
 }
 
 .app-header {
@@ -78,11 +76,12 @@ body {
   background: var(--panel);
   box-shadow: none;
   /* Flat */
-  padding: 12px 20px;
+  padding: 4px 12px;
+  /* Super compact */
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 8px;
 }
 
 .app-header:hover {
@@ -93,34 +92,33 @@ body {
 .header-right {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 6px;
   min-width: 0;
 }
 
 .app-brand {
-  font-size: 20px;
+  font-size: 16px;
   font-weight: 700;
   color: var(--ink);
-  /* Flat black text for brand instead of gradient */
   letter-spacing: -0.01em;
-  padding-right: 12px;
+  padding-right: 8px;
 }
 
 .nav-group {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 2px;
   /* Tighter for compact SaaS feel */
   background: var(--bg);
-  padding: 4px;
+  padding: 2px;
   border-radius: var(--radius-sm);
   border: 1px solid var(--line);
 }
 
 .range-title {
-  margin: 0 0 0 16px;
-  font-size: 18px;
-  font-weight: 500;
+  margin: 0 0 0 8px;
+  font-size: 15px;
+  font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -133,7 +131,7 @@ body {
 }
 
 .compact-field label {
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 500;
   color: var(--ink-soft);
   white-space: nowrap;
@@ -144,8 +142,8 @@ textarea,
 select {
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
-  padding: 10px 12px;
-  font-size: 14px;
+  padding: 4px 8px;
+  font-size: 12px;
   font-family: inherit;
   color: var(--ink);
   background: var(--panel-solid);
@@ -175,8 +173,8 @@ select:focus {
   border: 1px solid var(--line);
   background: var(--bg);
   color: var(--ink-soft);
-  padding: 4px 10px;
-  font-size: 12px;
+  padding: 2px 8px;
+  font-size: 11px;
   font-weight: 500;
   white-space: nowrap;
 }
@@ -201,8 +199,7 @@ select:focus {
 .workspace-grid {
   min-height: 0;
   display: grid;
-  grid-template-columns: 260px minmax(0, 1fr) 280px;
-  /* Thinner sidebars for dashboard feel */
+  grid-template-columns: 260px minmax(0, 1fr);
   gap: 16px;
 }
 
@@ -213,11 +210,12 @@ select:focus {
 }
 
 .sidebar-left {
-  grid-template-rows: auto auto minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-rows: auto auto auto minmax(0, 1fr) minmax(0, 1fr);
 }
 
 .sidebar-right {
-  grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+  display: none;
+  /* Removed entirely, chat is now floating */
 }
 
 .panel {
@@ -225,9 +223,10 @@ select:focus {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--panel);
-  box-shadow: var(--shadow);
-  /* Minimal flat shadow */
-  padding: 16px;
+  box-shadow: none;
+  /* Flat SaaS */
+  padding: 10px;
+  /* Aggressively reduced */
   display: flex;
   flex-direction: column;
 }
@@ -236,12 +235,12 @@ select:focus {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 12px;
+  gap: 6px;
+  margin-bottom: 8px;
 }
 
 .panel-title-row strong {
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--ink);
 }
@@ -268,8 +267,8 @@ select:focus {
   border: 1px solid transparent;
   background: var(--bg);
   border-radius: var(--radius-sm);
-  height: 32px;
-  font-size: 13px;
+  height: 24px;
+  font-size: 11px;
   font-weight: 500;
   cursor: pointer;
   transition: all 0.2s ease;
@@ -341,6 +340,76 @@ select:focus {
   font-size: 14px;
   margin-bottom: 6px;
   color: var(--ink);
+}
+
+.today-panel {
+  gap: 8px;
+}
+
+.today-snapshot {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.snapshot-item {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 8px;
+  background: var(--brand-soft);
+  display: grid;
+  gap: 2px;
+}
+
+.snapshot-item span {
+  font-size: 11px;
+  color: var(--ink-soft);
+}
+
+.snapshot-item strong {
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.today-block {
+  display: grid;
+  gap: 6px;
+}
+
+.today-block-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ink-soft);
+}
+
+.today-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.today-list {
+  max-height: 120px;
+}
+
+.briefing-item {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 8px;
+  background: var(--panel-solid);
+}
+
+.briefing-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+  margin-bottom: 4px;
+}
+
+.briefing-item.risk {
+  background: #fff7ed;
+  border-color: #fed7aa;
+  color: #9a3412;
 }
 
 .todo-meta,
@@ -503,23 +572,50 @@ select:focus {
 
 .calendar-event {
   position: absolute;
+  left: 4px;
+  right: 4px;
+  padding: 4px 6px;
   border-radius: var(--radius-sm);
-  padding: 6px 8px;
-  color: var(--ink);
-  /* Switch to dark text by default */
-  font-size: 12px;
+  font-size: 11px;
+  line-height: 1.2;
   overflow: hidden;
-  box-shadow: none;
-  /* Flat */
-  border-left: 3px solid rgba(0, 0, 0, 0.1);
-  /* Subtle definition */
-  transition: transform 0.2s ease, box-shadow 0.2s ease;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  z-index: 2;
+  border-left: 3px solid transparent;
 }
 
 .calendar-event:hover {
-  transform: scale(1.02);
+  transform: translateY(-1px);
   z-index: 10;
   box-shadow: var(--shadow-hover);
+}
+
+.event-delete {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 16px;
+  height: 16px;
+  background: rgba(0, 0, 0, 0.4);
+  color: white;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+  border: none;
+  cursor: pointer;
+}
+
+.event-delete:hover {
+  background: rgba(0, 0, 0, 0.8);
+}
+
+.calendar-event:hover .event-delete {
+  opacity: 1;
 }
 
 .calendar-event.local {
@@ -597,6 +693,47 @@ select:focus {
   border-bottom-left-radius: 4px;
 }
 
+.chat-text {
+  white-space: normal;
+}
+
+.chat-action-list {
+  margin-top: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.chat-approval-card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  padding: 8px;
+  display: grid;
+  gap: 4px;
+}
+
+.chat-approval-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.chat-approval-summary {
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+.chat-approval-id {
+  font-size: 11px;
+  color: #8892a8;
+}
+
+.chat-approval-actions {
+  margin-top: 4px;
+  display: flex;
+  gap: 6px;
+}
+
 .chat-prompts {
   display: flex;
   flex-wrap: wrap;
@@ -637,8 +774,10 @@ select:focus {
 .btn {
   border: 0;
   border-radius: var(--radius-sm);
-  padding: 10px 16px;
-  font-size: 14px;
+  padding: 6px 12px;
+  /* Reduced from 10px 16px */
+  font-size: 13px;
+  /* Reduced from 14px */
   font-weight: 600;
   cursor: pointer;
   transition: all 0.2s ease;
@@ -678,13 +817,15 @@ select:focus {
 }
 
 .btn-mini {
-  padding: 6px 10px;
-  font-size: 12px;
+  padding: 4px 8px;
+  /* Reduced from 6px 10px */
+  font-size: 11px;
+  /* Reduced from 12px */
 }
 
 @media (max-width: 1440px) {
   .workspace-grid {
-    grid-template-columns: 260px minmax(0, 1fr) 320px;
+    grid-template-columns: 220px minmax(0, 1fr);
   }
 
   .compact-field select {
@@ -755,4 +896,193 @@ select:focus {
   background: var(--brand);
   border-radius: 50%;
   box-shadow: 0 0 6px rgba(79, 70, 229, 0.6);
+}
+
+/* Floating AI Chat UI */
+.chat-fab {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  border-radius: 999px;
+  padding: 14px 24px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  z-index: 100;
+  font-size: 15px;
+  transition: transform 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+.chat-fab:hover {
+  transform: translateY(-2px) scale(1.05);
+}
+
+.floating-chat {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  width: 400px;
+  height: 600px;
+  max-width: calc(100vw - 48px);
+  max-height: calc(100vh - 48px);
+  z-index: 1000;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.15);
+  border: 1px solid var(--line-strong);
+  display: flex !important;
+  transition: opacity 0.3s ease, transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+.floating-chat.hidden {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(20px) scale(0.95);
+}
+
+.floating-chat.show {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0) scale(1);
+}
+
+.floating-chat .chat-panel {
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+/* ── Event Edit Modal ─────────────────────────── */
+.event-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: opacity 0.2s ease;
+}
+
+.event-modal-overlay.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.event-modal {
+  background: var(--panel);
+  border-radius: 12px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15);
+  width: 420px;
+  max-width: 92vw;
+  animation: modal-in 0.25s ease;
+}
+
+@keyframes modal-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.96);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.event-modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 20px 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.event-modal-header h3 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.event-modal-body {
+  padding: 16px 20px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.event-modal-body .form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.event-modal-body .form-group label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--ink-soft);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.event-modal-body .form-group input {
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-size: 0.875rem;
+  color: var(--ink);
+  background: var(--panel);
+  transition: border-color 0.15s;
+}
+
+.event-modal-body .form-group input:focus {
+  outline: none;
+  border-color: var(--brand);
+  box-shadow: 0 0 0 2px rgba(17, 24, 39, 0.08);
+}
+
+.event-modal-body .form-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.event-modal-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.modal-actions-right {
+  display: flex;
+  gap: 8px;
+}
+
+.btn-danger {
+  background: var(--danger);
+  color: var(--danger-txt);
+  border: none;
+  padding: 6px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.btn-danger:hover {
+  background: #FCA5A5;
+}
+
+/* Clickable events */
+.calendar-event {
+  cursor: pointer;
+}
+
+.agenda-item {
+  cursor: pointer;
+}
+
+/* Outlook events are read-only */
+.calendar-event.outlook {
+  cursor: default;
 }

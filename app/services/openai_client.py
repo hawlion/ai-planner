@@ -39,7 +39,20 @@ class ActionItemsEnvelope(BaseModel):
 
 
 class NLIOutput(BaseModel):
-    intent: Literal["create_task", "reschedule_request", "unknown"]
+    intent: Literal[
+        "create_task",
+        "create_event",
+        "update_task",
+        "delete_task",
+        "move_event",
+        "reschedule_request",
+        "delete_event",
+        "update_event",
+        "list_tasks",
+        "list_events",
+        "find_free_time",
+        "unknown",
+    ]
     title: str | None = None
     due: str | None = None
     effort_minutes: int | None = Field(default=None, ge=15, le=8 * 60)
@@ -51,10 +64,20 @@ class NLIOutput(BaseModel):
 class AssistantActionOutput(BaseModel):
     intent: Literal[
         "create_task",
+        "create_event",
+        "update_task",
+        "delete_task",
+        "start_task",
         "reschedule_request",
         "complete_task",
         "update_priority",
+        "list_tasks",
+        "list_events",
+        "find_free_time",
+        "move_event",
         "register_meeting_note",
+        "delete_event",
+        "update_event",
         "unknown",
     ]
     title: str | None = None
@@ -68,13 +91,23 @@ class AssistantActionOutput(BaseModel):
 class AssistantPlanAction(BaseModel):
     intent: Literal[
         "create_task",
+        "create_event",
+        "update_task",
+        "delete_task",
+        "start_task",
         "reschedule_request",
         "reschedule_after_hour",
         "complete_task",
         "update_priority",
         "update_due",
+        "list_tasks",
+        "list_events",
+        "find_free_time",
+        "move_event",
         "delete_duplicate_tasks",
         "register_meeting_note",
+        "delete_event",
+        "update_event",
         "unknown",
     ]
     title: str | None = None
@@ -83,8 +116,16 @@ class AssistantPlanAction(BaseModel):
     cutoff_hour: int | None = Field(default=None, ge=0, le=23)
     effort_minutes: int | None = Field(default=None, ge=15, le=8 * 60)
     priority: Literal["low", "medium", "high", "critical"] | None = None
+    status: Literal["todo", "in_progress", "done", "blocked", "canceled"] | None = None
     meeting_note: str | None = None
     reschedule_hint: str | None = None
+    new_title: str | None = None
+    start: str | None = None
+    end: str | None = None
+    duration_minutes: int | None = Field(default=None, ge=15, le=8 * 60)
+    description: str | None = None
+    target_date: str | None = None
+    limit: int | None = Field(default=None, ge=1, le=20)
 
 
 class AssistantPlanOutput(BaseModel):
@@ -153,15 +194,16 @@ def _chat_json(
     for model in models:
         content = ""
         try:
-            response = client.chat.completions.create(
-                model=model,
-                temperature=temp,
-                response_format={"type": "json_object"},
-                messages=[
+            request_args = {
+                "model": model,
+                "temperature": temp,
+                "response_format": {"type": "json_object"},
+                "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-            )
+            }
+            response = client.chat.completions.create(**request_args)
             content = response.choices[0].message.content or "{}"
             if isinstance(content, list):
                 content = "".join(
@@ -170,6 +212,28 @@ def _chat_json(
                 )
             return json.loads(content)
         except Exception as exc:  # noqa: BLE001
+            # Some models (e.g. gpt-5-mini) only allow default temperature.
+            text = str(exc)
+            if "temperature" in text and ("Unsupported value" in text or "does not support" in text):
+                try:
+                    retry_args = {
+                        "model": model,
+                        "response_format": {"type": "json_object"},
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                    }
+                    response = client.chat.completions.create(**retry_args)
+                    content = response.choices[0].message.content or "{}"
+                    if isinstance(content, list):
+                        content = "".join(
+                            part.get("text", "") if isinstance(part, dict) else str(part)
+                            for part in content
+                        )
+                    return json.loads(content)
+                except Exception as retry_exc:  # noqa: BLE001
+                    exc = retry_exc
             last_error = exc
             logger.warning(
                 "OpenAI request failed for purpose=%s model=%s: %s",
@@ -277,7 +341,11 @@ def parse_nli_openai(text: str, base_dt: datetime) -> NLIOutput:
     system_prompt = (
         "You parse Korean/English planning commands into intent JSON."
         " Return strict JSON only with fields:"
-        ' intent(create_task|reschedule_request|unknown), title, due, effort_minutes, priority, time_hint, note. '
+        " intent(create_task|create_event|update_task|delete_task|move_event|reschedule_request|"
+        "delete_event|update_event|list_tasks|list_events|find_free_time|unknown),"
+        " title, due, effort_minutes, priority, time_hint, note. "
+        " If user asks to add a schedule/meeting/calendar entry, use create_event."
+        " Use create_task only for to-do/task requests."
         "Use null for unknown values."
         " due should be ISO-8601 datetime when possible."
     )
@@ -301,10 +369,12 @@ def parse_assistant_action_openai(text: str, base_dt: datetime) -> AssistantActi
     system_prompt = (
         "You are an assistant action parser for a work planner."
         " Return strict JSON only with fields: "
-        "intent(create_task|reschedule_request|complete_task|update_priority|register_meeting_note|unknown), "
+        "intent(create_task|create_event|update_task|delete_task|start_task|reschedule_request|complete_task|"
+        "update_priority|list_tasks|list_events|find_free_time|move_event|register_meeting_note|unknown), "
         "title, due, effort_minutes, priority, meeting_note, note. "
         "For meeting-note style text, use register_meeting_note and copy full note text into meeting_note."
         " For task completion/priority update, title should be the target task title or keyword."
+        " For schedule/meeting add requests, use create_event."
         " Use null for unknown values."
         " due should be ISO-8601 datetime when possible."
     )
@@ -334,6 +404,8 @@ def parse_assistant_plan_openai(
     base_dt: datetime,
     task_context: list[dict],
     history: list[dict] | None = None,
+    calendar_context: list[dict] | None = None,
+    pending_approvals: list[dict] | None = None,
 ) -> AssistantPlanOutput:
     context_lines: list[str] = []
     for item in task_context[:40]:
@@ -354,18 +426,52 @@ def parse_assistant_plan_openai(
             continue
         history_lines.append(f"{role}: {text_value}")
 
+    event_lines: list[str] = []
+    for item in (calendar_context or [])[:40]:
+        event_lines.append(
+            "- title={title} | start={start} | end={end} | source={source}".format(
+                title=item.get("title") or "",
+                start=item.get("start") or "",
+                end=item.get("end") or "",
+                source=item.get("source") or "",
+            )
+        )
+
+    approval_lines: list[str] = []
+    for item in (pending_approvals or [])[:20]:
+        approval_lines.append(
+            "- id={id} | type={type} | summary={summary}".format(
+                id=item.get("id") or "",
+                type=item.get("type") or "",
+                summary=item.get("summary") or "",
+            )
+        )
+
     system_prompt = (
         "You are an action planner for a Korean/English work assistant."
         " Return strict JSON only with shape:"
         ' {"actions":[{"intent":string,"title":string|null,"task_keyword":string|null,"due":string|null,'
-        '"cutoff_hour":int|null,"effort_minutes":int|null,"priority":string|null,'
-        '"meeting_note":string|null,"reschedule_hint":string|null}],'
+        '"cutoff_hour":int|null,"effort_minutes":int|null,"priority":string|null,"status":string|null,'
+        '"meeting_note":string|null,"reschedule_hint":string|null,"new_title":string|null,'
+        '"start":string|null,"end":string|null,"duration_minutes":int|null,'
+        '"description":string|null,"target_date":string|null,"limit":int|null}],'
         '"note":string|null}.'
         " Supported intent values are:"
-        " create_task, reschedule_request, reschedule_after_hour, complete_task, update_priority,"
-        " update_due, delete_duplicate_tasks, register_meeting_note, unknown."
+        " create_task, create_event, update_task, delete_task, start_task, reschedule_request, reschedule_after_hour,"
+        " complete_task, update_priority, update_due, list_tasks, list_events, find_free_time, move_event,"
+        " delete_duplicate_tasks, register_meeting_note, delete_event, update_event, unknown."
         " Parse multiple requests in one message into multiple actions in order."
+        " CRITICAL: if user asks to add schedule/meeting/calendar event (일정/미팅/회의/캘린더 + 추가/등록/잡아줘),"
+        " you MUST output create_event, not create_task."
+        " Use create_task only when user explicitly asks for to-do/task/할일."
+        " For update_task, put changed fields into priority/status/due/description/effort_minutes/new_title."
+        " For move_event, set task_keyword to existing event title and set start (and optionally end or duration_minutes)."
+        " For list_events/list_tasks/find_free_time, use target_date/limit/duration_minutes when inferable."
         " For complete/update actions, choose task_keyword from existing task titles and make it specific."
+        " For delete_event or update_event, choose task_keyword from existing event titles when possible."
+        " For update_event, set new_title when user asks to rename the event."
+        " If user message is approval intent and contains approval id, still return unknown and ask a Korean clarification"
+        " question in note only when target approval cannot be inferred."
         " Never use a generic one-word keyword like '작업', '고객', '미팅'."
         " For requests like 'after 6pm' or '오후 6시 이후', use reschedule_after_hour and set cutoff_hour."
         " For duplicate cleanup requests, use delete_duplicate_tasks."
@@ -374,6 +480,7 @@ def parse_assistant_plan_openai(
         " If message is meeting notes/transcript, use register_meeting_note with full note in meeting_note."
         " For meeting-note messages, do not generate extra create_task actions."
         " Resolve references like '그거/방금 거/that one' using recent conversation when possible."
+        " Prefer executable actions over unknown when evidence exists in contexts."
         " Keep actions concise and executable."
     )
 
@@ -382,6 +489,8 @@ def parse_assistant_plan_openai(
         f"base_datetime={base_dt.isoformat()}\n"
         f"recent_conversation:\n{'\n'.join(history_lines) if history_lines else '(none)'}\n"
         f"existing_tasks:\n{'\n'.join(context_lines)}\n"
+        f"existing_events:\n{'\n'.join(event_lines) if event_lines else '(none)'}\n"
+        f"pending_approvals:\n{'\n'.join(approval_lines) if approval_lines else '(none)'}\n"
         f"user_message={text}"
     )
 

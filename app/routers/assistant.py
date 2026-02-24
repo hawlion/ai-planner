@@ -105,6 +105,8 @@ def _is_affirmative(text: str) -> bool:
         return False
     if lowered in YES_TOKENS:
         return True
+    if lowered.startswith("승인") or lowered.startswith("approve"):
+        return True
     return any(token in lowered for token in ["승인해", "진행해", "yes", "approve", "go ahead"])
 
 
@@ -233,14 +235,14 @@ def _parse_due(value: str | None, fallback_text: str) -> datetime | None:
 
         return None
 
-    hint_due = parse_korean_hint(fallback_text)
-    if hint_due is not None:
-        return hint_due
-
     if value and value.strip():
         parsed_value = parse_general(value)
         if parsed_value is not None:
             return parsed_value
+
+    hint_due = parse_korean_hint(fallback_text)
+    if hint_due is not None:
+        return hint_due
 
     return parse_general(fallback_text)
 
@@ -384,6 +386,63 @@ def _task_context(db: Session) -> list[dict]:
         }
         for row in rows
     ]
+
+
+def _calendar_context(db: Session) -> list[dict]:
+    now = datetime.utcnow() - timedelta(days=1)
+    rows = db.execute(
+        select(CalendarBlock)
+        .where(CalendarBlock.end >= now)
+        .order_by(CalendarBlock.start.asc())
+        .limit(60)
+    ).scalars().all()
+    return [
+        {
+            "id": row.id,
+            "title": row.title,
+            "start": row.start.isoformat() if row.start else None,
+            "end": row.end.isoformat() if row.end else None,
+            "source": row.source,
+            "task_id": row.task_id,
+        }
+        for row in rows
+    ]
+
+
+def _pending_approval_context(db: Session) -> list[dict]:
+    rows = db.execute(
+        select(ApprovalRequest)
+        .where(ApprovalRequest.status == "pending")
+        .order_by(ApprovalRequest.created_at.desc())
+        .limit(20)
+    ).scalars().all()
+    items: list[dict] = []
+    for row in rows:
+        payload = row.payload or {}
+        summary = (
+            str(payload.get("summary") or "").strip()
+            or str(payload.get("reason") or "").strip()
+            or str(row.reason or "").strip()
+            or row.type
+        )
+        items.append({"id": row.id, "type": row.type, "summary": summary})
+    return items
+
+
+def _plan_actions_with_llm(
+    db: Session,
+    message: str,
+    history_context: list[dict],
+) -> tuple[list[dict], str | None]:
+    plan = parse_assistant_plan_openai(
+        message,
+        base_dt=datetime.now(UTC),
+        task_context=_task_context(db),
+        history=history_context,
+        calendar_context=_calendar_context(db),
+        pending_approvals=_pending_approval_context(db),
+    )
+    return [item.model_dump() for item in plan.actions], plan.note
 
 
 def _latest_pending_approval(
@@ -613,6 +672,38 @@ def _needs_clarification_for_action(
     if intent == "register_meeting_note" and not _looks_like_meeting_note(message):
         return "회의록 등록 요청인지 다른 작업 요청인지 불명확합니다. 예: '회의록: ...' 또는 '중복 태스크 정리'."
 
+    if intent == "create_event":
+        due = _parse_due(action.get("start") or action.get("due"), message)
+        if due is None:
+            return "일정 시간을 알려주세요. 예: '이번주 목요일 오후 3시 미팅 일정 추가'."
+        return None
+
+    if intent in {"delete_task", "start_task", "update_task"}:
+        base_keyword = action.get("task_keyword") or action.get("title")
+        keyword = _extract_task_keyword(str(base_keyword or "")) or _extract_task_keyword(message)
+        if not keyword:
+            return "대상 할일 제목을 알려주세요."
+        found = _find_task(
+            db,
+            keyword,
+            statuses=("todo", "in_progress", "blocked", "done", "canceled"),
+            allow_latest_fallback=False,
+        )
+        if not found:
+            return f"'{keyword}' 할일을 찾지 못했습니다. 정확한 제목으로 다시 알려주세요."
+
+    if intent in {"list_tasks", "list_events", "find_free_time"}:
+        return None
+
+    if intent == "move_event":
+        base_keyword = action.get("task_keyword") or action.get("title")
+        keyword = _extract_task_keyword(str(base_keyword or "")) or _extract_task_keyword(message)
+        if not keyword:
+            return "이동할 일정 제목을 알려주세요."
+        new_start = _parse_due(action.get("start") or action.get("due"), message)
+        if new_start is None:
+            return "어느 시간으로 이동할지 알려주세요. 예: '목요일 4시로 이동'."
+
     if intent == "reschedule_after_hour":
         cutoff = _extract_cutoff_hour(action.get("cutoff_hour"), message)
         if cutoff is None:
@@ -649,6 +740,21 @@ def _needs_clarification_for_action(
         )
         if not found:
             return f"'{keyword}' 작업을 찾지 못했습니다. 정확한 제목으로 다시 알려주세요."
+
+    if intent == "delete_event":
+        base_keyword = action.get("task_keyword") or action.get("title")
+        keyword = _extract_task_keyword(str(base_keyword or "")) or _extract_task_keyword(message)
+        if not keyword:
+            return "삭제할 일정을 지정해 주세요. 예: '주간회의 일정 삭제'."
+
+    if intent == "update_event":
+        base_keyword = action.get("task_keyword") or action.get("title")
+        keyword = _extract_task_keyword(str(base_keyword or "")) or _extract_task_keyword(message)
+        if not keyword:
+            return "수정할 일정 제목을 알려주세요. 예: '고객미팅 일정을 주간회의로 변경'."
+        new_title = str(action.get("new_title") or "").strip()
+        if not new_title:
+            return "일정 이름을 무엇으로 바꿀지 알려주세요. 예: '주간회의로 변경'."
 
     if intent == "reschedule_request":
         lowered = message.lower()
@@ -691,6 +797,7 @@ def _register_meeting_and_apply(db: Session, note_text: str) -> tuple[str, list[
     auto_tasks = 0
     approvals = 0
     created_blocks = []
+    approval_actions: list[AssistantActionOut] = []
 
     for draft in drafts:
         candidate = ActionItemCandidate(
@@ -708,14 +815,24 @@ def _register_meeting_and_apply(db: Session, note_text: str) -> tuple[str, list[
 
         must_approve = draft.confidence < CONFIDENCE_THRESHOLD or draft.effort_minutes >= LARGE_EFFORT_MINUTES
         if must_approve:
-            db.add(
-                ApprovalRequest(
-                    type="action_item",
-                    status="pending",
-                    payload={
-                        "candidate_id": candidate.id,
-                        "meeting_id": meeting.meeting_id,
-                        "reason": "low_confidence_or_large_effort",
+            approval = ApprovalRequest(
+                type="action_item",
+                status="pending",
+                payload={
+                    "candidate_id": candidate.id,
+                    "meeting_id": meeting.meeting_id,
+                    "reason": "low_confidence_or_large_effort",
+                },
+            )
+            db.add(approval)
+            db.flush()
+            approval_actions.append(
+                AssistantActionOut(
+                    type="approval_requested",
+                    detail={
+                        "approval_id": approval.id,
+                        "type": "action_item",
+                        "summary": f"액션아이템 승인: {candidate.title}",
                     },
                 )
             )
@@ -762,6 +879,7 @@ def _register_meeting_and_apply(db: Session, note_text: str) -> tuple[str, list[
                 type="action_items_processed",
                 detail={"detected": len(drafts), "auto_tasks": auto_tasks, "approval_pending": approvals},
             ),
+            *approval_actions,
         ],
         ["calendar", "tasks", "approvals"],
     )
@@ -784,6 +902,83 @@ def _create_task_from_message(
         f"할일을 생성했습니다: {task.title}",
         [AssistantActionOut(type="task_created", detail={"task_id": task.id, "title": task.title})],
         ["tasks"],
+    )
+
+
+def _create_event_from_message(
+    db: Session,
+    title: str,
+    start: datetime | None,
+    duration_minutes: int = 60,
+) -> tuple[str, list[AssistantActionOut], list[str]]:
+    if start is None:
+        return ("일정 시간을 이해하지 못했습니다. 예: '목요일 오후 3시 미팅 일정 추가'.", [], [])
+
+    event_title = title.strip() or "새 일정"
+    duration = max(15, min(8 * 60, int(duration_minutes or 60)))
+    end = start + timedelta(minutes=duration)
+
+    conflict = db.execute(
+        select(CalendarBlock)
+        .where(
+            and_(
+                CalendarBlock.start < end,
+                CalendarBlock.end > start,
+            )
+        )
+        .order_by(CalendarBlock.start.asc())
+    ).scalars().first()
+    if conflict:
+        return (
+            (
+                f"요청 시간에 기존 일정 '{conflict.title}'과 겹칩니다. "
+                "다른 시간으로 다시 요청해 주세요."
+            ),
+            [],
+            ["calendar"],
+        )
+
+    block = CalendarBlock(
+        type="other",
+        title=event_title,
+        start=start,
+        end=end,
+        locked=False,
+        source="aawo",
+    )
+    db.add(block)
+    db.flush()
+
+    synced = 0
+    if is_graph_connected(db):
+        try:
+            result = sync_blocks_to_outlook(db, [block])
+            synced = int(result.get("synced", 0))
+        except (GraphAuthError, GraphApiError):
+            synced = 0
+
+    db.commit()
+    db.refresh(block)
+
+    reply = f"일정을 생성했습니다: {block.title} ({start.strftime('%Y-%m-%d %H:%M')} - {end.strftime('%H:%M')})"
+    if synced:
+        reply += f" · Outlook 동기화 {synced}건"
+
+    return (
+        reply,
+        [
+            AssistantActionOut(
+                type="event_created",
+                detail={
+                    "block_id": block.id,
+                    "title": block.title,
+                    "start": block.start.isoformat(),
+                    "end": block.end.isoformat(),
+                    "outlook_synced": bool(synced),
+                },
+            )
+        ],
+        ["calendar"],
     )
 
 
@@ -916,6 +1111,278 @@ def _update_due(db: Session, keyword: str | None, due: datetime | None) -> tuple
         f"마감일을 변경했습니다: {task.title} -> {due.strftime('%Y-%m-%d %H:%M')}",
         [AssistantActionOut(type="task_due_updated", detail={"task_id": task.id, "due": due.isoformat()})],
         ["tasks"],
+    )
+
+
+def _update_task_from_message(
+    db: Session,
+    keyword: str | None,
+    *,
+    new_title: str | None = None,
+    due: datetime | None = None,
+    priority: str | None = None,
+    status: str | None = None,
+    effort_minutes: int | None = None,
+    description: str | None = None,
+) -> tuple[str, list[AssistantActionOut], list[str]]:
+    task = _find_task(
+        db,
+        keyword,
+        statuses=("todo", "in_progress", "blocked", "done", "canceled"),
+        allow_latest_fallback=False,
+    )
+    if not task:
+        return ("수정할 할일을 찾지 못했습니다. 정확한 작업 제목을 알려주세요.", [], [])
+
+    changed: list[str] = []
+    if new_title and new_title.strip() and new_title.strip() != task.title:
+        task.title = new_title.strip()
+        changed.append("제목")
+    if due is not None:
+        task.due = due
+        changed.append("마감")
+    if priority:
+        mapped = PRIORITY_MAP.get(priority.strip().lower()) or PRIORITY_MAP.get(priority.strip())
+        if mapped:
+            task.priority = mapped
+            changed.append("우선순위")
+    if status and status in {"todo", "in_progress", "done", "blocked", "canceled"}:
+        task.status = status
+        changed.append("상태")
+    if isinstance(effort_minutes, int):
+        task.effort_minutes = max(15, min(8 * 60, effort_minutes))
+        changed.append("소요시간")
+    if description is not None:
+        task.description = description
+        changed.append("설명")
+
+    if not changed:
+        return ("변경할 필드를 이해하지 못했습니다. 제목/마감/우선순위/상태 중 하나를 지정해 주세요.", [], [])
+
+    task.version += 1
+    db.commit()
+
+    return (
+        f"할일을 수정했습니다: {task.title} ({', '.join(changed)})",
+        [AssistantActionOut(type="task_updated", detail={"task_id": task.id, "changed": changed})],
+        ["tasks"],
+    )
+
+
+def _delete_task_from_message(db: Session, keyword: str | None) -> tuple[str, list[AssistantActionOut], list[str]]:
+    task = _find_task(
+        db,
+        keyword,
+        statuses=("todo", "in_progress", "blocked", "done", "canceled"),
+        allow_latest_fallback=False,
+    )
+    if not task:
+        return ("삭제할 할일을 찾지 못했습니다.", [], [])
+
+    blocks = db.execute(select(CalendarBlock).where(CalendarBlock.task_id == task.id)).scalars().all()
+    for block in blocks:
+        block.task_id = None
+        block.version += 1
+
+    deleted_id = task.id
+    deleted_title = task.title
+    db.delete(task)
+    db.commit()
+
+    return (
+        f"할일을 삭제했습니다: {deleted_title}",
+        [AssistantActionOut(type="task_deleted", detail={"task_id": deleted_id, "title": deleted_title})],
+        ["tasks", "calendar"],
+    )
+
+
+def _start_task_from_message(db: Session, keyword: str | None) -> tuple[str, list[AssistantActionOut], list[str]]:
+    task = _find_task(
+        db,
+        keyword,
+        statuses=("todo", "in_progress", "blocked"),
+        allow_latest_fallback=False,
+    )
+    if not task:
+        return ("시작할 할일을 찾지 못했습니다.", [], [])
+    if task.status == "in_progress":
+        return (
+            f"이미 진행중입니다: {task.title}",
+            [AssistantActionOut(type="task_already_in_progress", detail={"task_id": task.id, "title": task.title})],
+            ["tasks"],
+        )
+
+    task.status = "in_progress"
+    task.version += 1
+    db.commit()
+    return (
+        f"진행중으로 변경했습니다: {task.title}",
+        [AssistantActionOut(type="task_started", detail={"task_id": task.id, "title": task.title})],
+        ["tasks"],
+    )
+
+
+def _list_tasks_from_message(db: Session, limit: int | None = None) -> tuple[str, list[AssistantActionOut], list[str]]:
+    size = max(1, min(20, int(limit or 7)))
+    rows = db.execute(select(Task).order_by(Task.updated_at.desc()).limit(size)).scalars().all()
+    if not rows:
+        return ("현재 등록된 할일이 없습니다.", [], ["tasks"])
+
+    lines = ["최근 할일입니다:"]
+    for idx, row in enumerate(rows, start=1):
+        due_text = row.due.strftime("%m-%d %H:%M") if row.due else "마감없음"
+        lines.append(f"{idx}. {row.title} · {row.status} · {row.priority} · {due_text}")
+    return (
+        "\n".join(lines),
+        [AssistantActionOut(type="tasks_listed", detail={"count": len(rows)})],
+        ["tasks"],
+    )
+
+
+def _list_events_from_message(
+    db: Session,
+    target_date: str | None,
+    message: str,
+    limit: int | None = None,
+) -> tuple[str, list[AssistantActionOut], list[str]]:
+    base = _parse_due(target_date, message) if (target_date or message) else None
+    date_base = base or datetime.utcnow()
+    start = date_base.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1)
+    size = max(1, min(20, int(limit or 10)))
+
+    rows = db.execute(
+        select(CalendarBlock)
+        .where(CalendarBlock.start < end, CalendarBlock.end > start)
+        .order_by(CalendarBlock.start.asc())
+        .limit(size)
+    ).scalars().all()
+    if not rows:
+        return ("해당 날짜에 등록된 일정이 없습니다.", [], ["calendar"])
+
+    lines = [f"{start.strftime('%Y-%m-%d')} 일정입니다:"]
+    for idx, row in enumerate(rows, start=1):
+        lines.append(f"{idx}. {row.title} ({row.start.strftime('%H:%M')}-{row.end.strftime('%H:%M')})")
+
+    return (
+        "\n".join(lines),
+        [AssistantActionOut(type="events_listed", detail={"count": len(rows), "date": start.date().isoformat()})],
+        ["calendar"],
+    )
+
+
+def _find_free_time_from_message(
+    db: Session,
+    target_date: str | None,
+    message: str,
+    duration_minutes: int | None = None,
+) -> tuple[str, list[AssistantActionOut], list[str]]:
+    base = _parse_due(target_date, message) if (target_date or message) else None
+    date_base = base or datetime.utcnow()
+    day_start = date_base.replace(hour=9, minute=0, second=0, microsecond=0)
+    day_end = date_base.replace(hour=18, minute=0, second=0, microsecond=0)
+    need = timedelta(minutes=max(15, min(8 * 60, int(duration_minutes or 60))))
+
+    rows = db.execute(
+        select(CalendarBlock)
+        .where(CalendarBlock.start < day_end, CalendarBlock.end > day_start)
+        .order_by(CalendarBlock.start.asc())
+    ).scalars().all()
+
+    cursor = day_start
+    slots: list[tuple[datetime, datetime]] = []
+    for row in rows:
+        if row.start - cursor >= need:
+            slots.append((cursor, row.start))
+        if row.end > cursor:
+            cursor = row.end
+    if day_end - cursor >= need:
+        slots.append((cursor, day_end))
+
+    if not slots:
+        return ("요청한 길이의 빈 시간이 없습니다.", [], ["calendar"])
+
+    top = slots[:3]
+    lines = [f"{day_start.strftime('%Y-%m-%d')} 기준 추천 빈 시간:"]
+    for idx, (s, e) in enumerate(top, start=1):
+        lines.append(f"{idx}. {s.strftime('%H:%M')} - {e.strftime('%H:%M')}")
+
+    return (
+        "\n".join(lines),
+        [AssistantActionOut(type="free_time_found", detail={"count": len(top), "date": day_start.date().isoformat()})],
+        ["calendar"],
+    )
+
+
+def _find_event_by_keyword(db: Session, keyword: str | None) -> CalendarBlock | None:
+    if not keyword:
+        return None
+    kw = keyword.strip().lower()
+    blocks = db.execute(select(CalendarBlock).order_by(CalendarBlock.start.asc())).scalars().all()
+    for row in blocks:
+        if row.title and kw == row.title.lower():
+            return row
+    for row in blocks:
+        if row.title and kw in row.title.lower():
+            return row
+    return None
+
+
+def _move_event_from_message(
+    db: Session,
+    keyword: str | None,
+    new_start: datetime | None,
+    new_end: datetime | None = None,
+    duration_minutes: int | None = None,
+) -> tuple[str, list[AssistantActionOut], list[str]]:
+    if new_start is None:
+        return ("이동할 새 시간을 알려주세요. 예: '목요일 4시로 이동'.", [], [])
+
+    target = _find_event_by_keyword(db, keyword)
+    if not target:
+        return ("이동할 일정을 찾지 못했습니다.", [], [])
+    if target.source == "external":
+        return ("Outlook 원본 일정은 앱에서 직접 이동할 수 없습니다.", [], [])
+
+    duration = (
+        (new_end - new_start)
+        if new_end and new_end > new_start
+        else timedelta(minutes=max(15, min(8 * 60, int(duration_minutes or ((target.end - target.start).total_seconds() // 60 or 60)))))
+    )
+    end = new_start + duration
+
+    conflict = db.execute(
+        select(CalendarBlock)
+        .where(
+            CalendarBlock.id != target.id,
+            CalendarBlock.start < end,
+            CalendarBlock.end > new_start,
+        )
+    ).scalars().first()
+    if conflict:
+        return (f"'{conflict.title}' 일정과 겹쳐 이동할 수 없습니다.", [], ["calendar"])
+
+    target.start = new_start
+    target.end = end
+    target.version += 1
+    db.commit()
+    db.refresh(target)
+
+    synced = 0
+    if is_graph_connected(db):
+        try:
+            result = sync_blocks_to_outlook(db, [target])
+            synced = int(result.get("synced", 0))
+        except (GraphAuthError, GraphApiError):
+            synced = 0
+
+    reply = f"일정을 이동했습니다: {target.title} ({new_start.strftime('%m-%d %H:%M')} - {end.strftime('%H:%M')})"
+    if synced:
+        reply += f" · Outlook 동기화 {synced}건"
+    return (
+        reply,
+        [AssistantActionOut(type="event_moved", detail={"block_id": target.id, "title": target.title})],
+        ["calendar"],
     )
 
 
@@ -1115,6 +1582,84 @@ def _delete_duplicate_tasks(db: Session) -> tuple[str, list[AssistantActionOut],
     )
 
 
+def _delete_event(db: Session, keyword: str | None) -> tuple[str, list[AssistantActionOut], list[str]]:
+    if not keyword:
+        return ("삭제할 일정을 지정해주세요.", [], [])
+
+    kw = keyword.strip().lower()
+    
+    # Very basic search for CalendarBlock by title matching
+    blocks = db.execute(select(CalendarBlock).order_by(CalendarBlock.start.asc())).scalars().all()
+    target = None
+    
+    # Try exact match first
+    for b in blocks:
+        if b.title and kw == b.title.lower():
+            target = b
+            break
+            
+    # Try partial match if no exact
+    if not target:
+        for b in blocks:
+            if b.title and kw in b.title.lower():
+                target = b
+                break
+
+    if not target:
+        return (f"'{keyword}'에 해당하는 일정을 찾지 못했습니다.", [], [])
+
+    db.delete(target)
+    db.commit()
+
+    return (
+        f"일정 '{target.title}'을(를) 삭제했습니다.",
+        [
+            AssistantActionOut(
+                type="event_deleted",
+                detail={"deleted_id": target.id, "title": target.title},
+            )
+        ],
+        ["calendar"],
+    )
+
+def _update_event(db: Session, keyword: str | None, new_title: str | None) -> tuple[str, list[AssistantActionOut], list[str]]:
+    if not keyword:
+        return ("변경할 일정을 지정해주세요.", [], [])
+    
+    # We will just parse the 'new title' from the remainder of the sentence. 
+    # For now NLI isn't extracting a separate `new_title` field for events so we infer from text.
+    kw = keyword.strip().lower()
+
+    blocks = db.execute(select(CalendarBlock).order_by(CalendarBlock.start.asc())).scalars().all()
+    target = None
+
+    for b in blocks:
+        if b.title and kw in b.title.lower():
+            target = b
+            break
+
+    if not target:
+        return (f"'{keyword}'에 해당하는 일정을 찾지 못했습니다.", [], [])
+
+    if not new_title:
+         return (f"일정 '{target.title}'을 어떻게 수정할지 알려주세요.", [], [])
+
+    old_title = target.title
+    target.title = new_title.strip()
+    target.version += 1
+    db.commit()
+
+    return (
+        f"일정 이름을 '{old_title}'에서 '{target.title}'(으)로 변경했습니다.",
+        [
+            AssistantActionOut(
+                type="event_updated",
+                detail={"updated_id": target.id, "new_title": target.title},
+            )
+        ],
+        ["calendar"],
+    )
+
 def _run_one_action(
     db: Session,
     parsed: dict,
@@ -1133,6 +1678,69 @@ def _run_one_action(
         effort = int(parsed.get("effort_minutes") or 60)
         priority = str(parsed.get("priority") or "medium")
         return _create_task_from_message(db, title, due, effort, priority)
+
+    if intent == "create_event":
+        title = (parsed.get("title") or "새 일정").strip()
+        start = _parse_due(parsed.get("start") or parsed.get("due"), message)
+        duration = int(parsed.get("duration_minutes") or parsed.get("effort_minutes") or 60)
+        return _create_event_from_message(db, title, start, duration)
+
+    if intent == "update_task":
+        base_keyword = parsed.get("task_keyword") or parsed.get("title")
+        keyword = _extract_task_keyword(str(base_keyword or "")) or _extract_task_keyword(message)
+        due = _parse_due(parsed.get("due"), message) if parsed.get("due") else None
+        return _update_task_from_message(
+            db,
+            keyword,
+            new_title=parsed.get("new_title"),
+            due=due,
+            priority=parsed.get("priority"),
+            status=parsed.get("status"),
+            effort_minutes=parsed.get("effort_minutes"),
+            description=parsed.get("description"),
+        )
+
+    if intent == "delete_task":
+        base_keyword = parsed.get("task_keyword") or parsed.get("title")
+        keyword = _extract_task_keyword(str(base_keyword or "")) or _extract_task_keyword(message)
+        return _delete_task_from_message(db, keyword)
+
+    if intent == "start_task":
+        base_keyword = parsed.get("task_keyword") or parsed.get("title")
+        keyword = _extract_task_keyword(str(base_keyword or "")) or _extract_task_keyword(message)
+        return _start_task_from_message(db, keyword)
+
+    if intent == "list_tasks":
+        return _list_tasks_from_message(db, limit=parsed.get("limit"))
+
+    if intent == "list_events":
+        return _list_events_from_message(
+            db,
+            target_date=parsed.get("target_date") or parsed.get("due"),
+            message=message,
+            limit=parsed.get("limit"),
+        )
+
+    if intent == "find_free_time":
+        return _find_free_time_from_message(
+            db,
+            target_date=parsed.get("target_date") or parsed.get("due"),
+            message=message,
+            duration_minutes=parsed.get("duration_minutes") or parsed.get("effort_minutes"),
+        )
+
+    if intent == "move_event":
+        base_keyword = parsed.get("task_keyword") or parsed.get("title")
+        keyword = _extract_task_keyword(str(base_keyword or "")) or _extract_task_keyword(message)
+        new_start = _parse_due(parsed.get("start") or parsed.get("due"), message)
+        new_end = _parse_due(parsed.get("end"), message) if parsed.get("end") else None
+        return _move_event_from_message(
+            db,
+            keyword,
+            new_start,
+            new_end,
+            duration_minutes=parsed.get("duration_minutes") or parsed.get("effort_minutes"),
+        )
 
     if intent == "reschedule_after_hour":
         cutoff_hour = _extract_cutoff_hour(parsed.get("cutoff_hour"), message)
@@ -1215,10 +1823,43 @@ def _run_one_action(
         )
         if _has_reference_phrase(message) and history_keyword:
             keyword = history_keyword
+        if _has_reference_phrase(message) and history_keyword:
+            keyword = history_keyword
         elif not keyword or _is_generic_keyword(keyword):
             keyword = history_keyword
         due = _parse_due(parsed.get("due"), message)
         return _update_due(db, keyword, due)
+
+    if intent == "delete_event":
+        base_keyword = parsed.get("task_keyword") or parsed.get("title")
+        keyword = _extract_task_keyword(str(base_keyword or "")) or _extract_task_keyword(message)
+        if not keyword:
+            return ("어떤 일정을 삭제할지 알려주세요.", [], [])
+        return _delete_event(db, keyword)
+
+    if intent == "update_event":
+        # we parse out the current title and the new title from the request.
+        # Example prompt: "미팅 일정을 주간회의로 바꿔줘" -> target="미팅", new_title="주간회의"
+        base_keyword = parsed.get("task_keyword") or parsed.get("title")
+        new_title = str(parsed.get("new_title") or "").strip()
+        if not new_title:
+            new_title = (
+                message.replace(str(base_keyword or ""), "")
+                .replace("바꿔줘", "")
+                .replace("수정", "")
+                .replace("변경", "")
+                .replace("일정", "")
+                .replace("으로", "")
+                .replace("를", "")
+                .replace("을", "")
+                .replace("로", "")
+                .strip()
+            )
+
+        keyword = _extract_task_keyword(str(base_keyword or "")) or _extract_task_keyword(message)
+        if not keyword:
+            return ("어떤 일정을 수정할지 알려주세요.", [], [])
+        return _update_event(db, keyword, new_title)
 
     return ("요청 의도를 처리하지 못했습니다.", [], [])
 
@@ -1245,10 +1886,12 @@ def _resolve_pending_approval_by_chat(
 
     if approval.type == CHAT_CONFIRM_TYPE:
         action = approval.payload.get("action") or {}
+        source_message = str(approval.payload.get("source_message") or "").strip()
+        combined_message = f"{source_message}\n{message}".strip() if source_message else message
         reply, actions, refresh = _run_one_action(
             db,
             action,
-            message=approval.payload.get("source_message") or message,
+            message=combined_message,
             history_context=history_context,
             require_confirmation=False,
         )
@@ -1333,8 +1976,32 @@ def _fallback_classify(text: str, *, allow_openai_nli: bool = True) -> dict:
                 priority = token
                 break
         return {"intent": "update_priority", "title": text, "priority": priority}
-    if "완료" in text or "done" in lowered:
+    if any(token in text for token in ["시작", "착수"]) or "start task" in lowered:
+        return {"intent": "start_task", "title": text}
+    if any(token in text for token in ["완료"]) or "done" in lowered:
         return {"intent": "complete_task", "title": text}
+    if any(token in text for token in ["삭제", "지워", "remove", "delete"]) and any(
+        token in text for token in ["할일", "태스크", "task", "todo", "to-do", "업무"]
+    ):
+        return {"intent": "delete_task", "title": text}
+    if any(token in text for token in ["수정", "바꿔", "변경", "update", "modify"]) and any(
+        token in text for token in ["할일", "태스크", "task", "todo", "to-do", "업무"]
+    ):
+        return {"intent": "update_task", "title": text}
+    if any(token in text for token in ["삭제", "지워", "delete", "remove"]) and ("일정" in text or "미팅" in text or "회의" in text):
+        return {"intent": "delete_event", "title": text}
+    if any(token in text for token in ["수정", "바꿔", "변경", "update", "modify"]) and ("일정" in text or "미팅" in text or "회의" in text):
+        return {"intent": "update_event", "title": text}
+    if any(token in text for token in ["이동", "옮겨"]) and ("일정" in text or "미팅" in text or "회의" in text):
+        return {"intent": "move_event", "title": text, "start": text}
+    if any(token in text for token in ["빈시간", "빈 시간", "free time", "available slot", "가용시간", "가능한 시간"]):
+        return {"intent": "find_free_time", "target_date": text, "duration_minutes": 60}
+    if any(token in text for token in ["일정 보여", "일정 알려", "스케줄 보여", "agenda", "calendar"]) and any(
+        token in text for token in ["오늘", "내일", "이번주", "다음주", "목록", "list", "보여", "알려"]
+    ):
+        return {"intent": "list_events", "target_date": text, "limit": 10}
+    if any(token in text for token in ["할일 보여", "할 일 보여", "태스크 보여", "task list", "todo list", "목록"]):
+        return {"intent": "list_tasks", "limit": 10}
     if allow_openai_nli and is_openai_available():
         try:
             parsed = parse_nli_openai(text, base_dt=datetime.utcnow())
@@ -1344,11 +2011,21 @@ def _fallback_classify(text: str, *, allow_openai_nli: bool = True) -> dict:
                 "due": parsed.due,
                 "effort_minutes": parsed.effort_minutes,
                 "priority": parsed.priority,
+                "target_date": parsed.time_hint,
                 "time_hint": parsed.time_hint,
             }
         except OpenAIIntegrationError:
             pass
 
+    if (
+        any(token in text for token in ["일정", "미팅", "회의", "캘린더"])
+        and any(token in text for token in ["추가", "등록", "생성", "만들", "잡아", "잡아줘"])
+    ) or "create event" in lowered:
+        return {"intent": "create_event", "title": text, "due": text, "effort_minutes": 60}
+    if any(keyword in text for keyword in ["할일", "태스크", "task", "todo", "to-do", "업무"]) and any(
+        keyword in text for keyword in ["추가", "만들", "등록", "create"]
+    ):
+        return {"intent": "create_task", "title": text, "effort_minutes": 60, "priority": "medium"}
     if any(keyword in text for keyword in ["추가", "만들", "등록"]) or "create task" in lowered:
         return {"intent": "create_task", "title": text, "effort_minutes": 60, "priority": "medium"}
     if any(keyword in text for keyword in ["일정", "재배치", "조정"]) or "reschedule" in lowered:
@@ -1364,10 +2041,28 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
         for turn in payload.history
         if turn.text.strip()
     ]
+    llm_available = is_openai_available()
+
+    if settings.assistant_llm_only and not llm_available:
+        return AssistantChatResponse(
+            reply="현재 LLM 연결을 사용할 수 없습니다. OPENAI 키/모델 설정을 확인해 주세요.",
+            actions=[AssistantActionOut(type="llm_unavailable", detail={})],
+            refresh=[],
+        )
+
     pending_clarification = _latest_pending_approval(db, types=(CHAT_CLARIFICATION_TYPE,))
     if pending_clarification:
-        incoming_rule = _fallback_classify(message, allow_openai_nli=False)
-        if str(incoming_rule.get("intent") or "unknown") != "unknown":
+        incoming_actions: list[dict] = []
+        if llm_available:
+            try:
+                incoming_actions, _ = _plan_actions_with_llm(db, message, history_context)
+            except OpenAIIntegrationError:
+                incoming_actions = []
+        else:
+            incoming_actions = [_fallback_classify(message, allow_openai_nli=False)]
+
+        has_new_command = any(str(item.get("intent") or "unknown") != "unknown" for item in incoming_actions)
+        if has_new_command:
             pending_clarification.status = "rejected"
             pending_clarification.resolved_at = datetime.utcnow()
             pending_clarification.reason = "clarification_superseded_by_new_command"
@@ -1418,44 +2113,41 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
     planned_actions: list[dict] = []
     plan_note: str | None = None
 
-    quick_rule = _fallback_classify(message, allow_openai_nli=False)
-    quick_intent = str(quick_rule.get("intent") or "unknown")
-    if quick_intent == "unknown" and _is_ambiguous_short_request(message):
-        question = _clarification_question(message, None)
-        clarification_req = _queue_chat_clarification(db, question, message)
-        return AssistantChatResponse(
-            reply=f"{question}\n답변해 주시면 이어서 처리합니다.",
-            actions=[AssistantActionOut(type="clarification_requested", detail={"clarification_id": clarification_req.id})],
-            refresh=["approvals"],
-        )
-
-    if quick_intent in {
-        "register_meeting_note",
-        "create_task",
-        "reschedule_after_hour",
-        "delete_duplicate_tasks",
-        "update_due",
-        "update_priority",
-        "complete_task",
-        "reschedule_request",
-    }:
-        planned_actions = [quick_rule]
-    elif is_openai_available():
+    if llm_available:
         try:
-            plan = parse_assistant_plan_openai(
-                message,
-                base_dt=datetime.now(UTC),
-                task_context=_task_context(db),
-                history=history_context,
-            )
-            planned_actions = [item.model_dump() for item in plan.actions]
-            plan_note = plan.note
-        except OpenAIIntegrationError:
+            planned_actions, plan_note = _plan_actions_with_llm(db, message, history_context)
+        except OpenAIIntegrationError as exc:
+            if settings.assistant_llm_only:
+                return AssistantChatResponse(
+                    reply="LLM 호출에 실패했습니다. 잠시 후 다시 시도해 주세요.",
+                    actions=[AssistantActionOut(type="llm_error", detail={"reason": str(exc)[:200]})],
+                    refresh=[],
+                )
             planned_actions = []
             plan_note = None
 
     if not planned_actions:
+        if settings.assistant_llm_only and llm_available:
+            question = _clarification_question(message, plan_note)
+            clarification_req = _queue_chat_clarification(db, question, message)
+            return AssistantChatResponse(
+                reply=f"{question}\n답변해 주시면 이어서 처리합니다.",
+                actions=[AssistantActionOut(type="clarification_requested", detail={"clarification_id": clarification_req.id})],
+                refresh=["approvals"],
+            )
         planned_actions = [_fallback_classify(message, allow_openai_nli=False)]
+
+    if settings.assistant_llm_only and llm_available:
+        executable_actions = [item for item in planned_actions if str(item.get("intent") or "unknown") != "unknown"]
+        if not executable_actions:
+            question = _clarification_question(message, plan_note)
+            clarification_req = _queue_chat_clarification(db, question, message)
+            return AssistantChatResponse(
+                reply=f"{question}\n답변해 주시면 이어서 처리합니다.",
+                actions=[AssistantActionOut(type="clarification_requested", detail={"clarification_id": clarification_req.id})],
+                refresh=["approvals"],
+            )
+        planned_actions = executable_actions
 
     has_meeting_intent = any(item.get("intent") == "register_meeting_note" for item in planned_actions)
     if has_meeting_intent:
@@ -1473,7 +2165,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
         unique_actions.append(item)
     planned_actions = unique_actions
 
-    if _looks_like_due_change(message):
+    if not (settings.assistant_llm_only and llm_available) and _looks_like_due_change(message):
         rewritten: list[dict] = []
         for item in planned_actions:
             if item.get("intent") == "reschedule_request":

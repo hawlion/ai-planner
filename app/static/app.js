@@ -7,6 +7,8 @@ const MIN_EVENT_HEIGHT = 18;
 const state = {
   profile: null,
   graph: null,
+  syncStatus: null,
+  dailyBriefing: null,
   tasks: [],
   approvals: [],
   chatHistory: [],
@@ -119,6 +121,23 @@ async function loadGraphStatus() {
   renderGraphStatus();
 }
 
+async function loadSyncStatus() {
+  state.syncStatus = await api("/sync/status");
+}
+
+function selectedDateParam() {
+  const date = state.selectedDate instanceof Date ? state.selectedDate : new Date();
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+async function loadDailyBriefing() {
+  const targetDate = selectedDateParam();
+  state.dailyBriefing = await api(`/briefings/daily?target_date=${encodeURIComponent(targetDate)}`);
+}
+
 function renderGraphStatus() {
   const label = $("graph-status-label");
   if (!label || !state.graph) return;
@@ -137,6 +156,64 @@ function renderGraphStatus() {
 
   label.className = "status-pill";
   label.textContent = "Graph 미연결";
+}
+
+function renderDailyBriefing() {
+  const briefing = state.dailyBriefing;
+  const sync = state.syncStatus;
+  const topList = $("today-briefing-top");
+  const risksList = $("today-briefing-risks");
+  const remindersList = $("today-briefing-reminders");
+  const snapshotBox = $("today-briefing-snapshot");
+
+  if (!briefing || !topList || !risksList || !remindersList || !snapshotBox) return;
+
+  const dateText = briefing.date ? new Date(briefing.date).toLocaleDateString("ko-KR", { month: "short", day: "numeric", weekday: "short" }) : fmtDate(new Date());
+  $("today-briefing-date").textContent = `${dateText} 기준`;
+
+  const lastSync = sync?.last_delta_sync_at ? fmtDateTime(sync.last_delta_sync_at) : "동기화 이력 없음";
+  const throttled = Number(sync?.throttling?.recent_429_count || 0);
+  const syncNote = throttled > 0 ? `동기화 지연 가능(429 ${throttled}회)` : "동기화 정상";
+  $("today-briefing-sync").textContent = `마지막 동기화: ${lastSync} · ${syncNote}`;
+
+  const meeting = Number(briefing.snapshot?.meeting_minutes || 0);
+  const focus = Number(briefing.snapshot?.focus_minutes || 0);
+  const free = Number(briefing.snapshot?.free_minutes || 0);
+  snapshotBox.innerHTML = `
+    <div class="snapshot-item"><span>회의</span><strong>${meeting}분</strong></div>
+    <div class="snapshot-item"><span>집중</span><strong>${focus}분</strong></div>
+    <div class="snapshot-item"><span>가용</span><strong>${free}분</strong></div>
+  `;
+
+  const topTasks = briefing.top_tasks || [];
+  if (!topTasks.length) {
+    topList.innerHTML = `<div class="briefing-item"><div class="todo-meta">추천 작업이 없습니다.</div></div>`;
+  } else {
+    topList.innerHTML = topTasks
+      .map((task) => {
+        const block = task.recommended_block
+          ? `${fmtTime(new Date(task.recommended_block.start))} - ${fmtTime(new Date(task.recommended_block.end))}`
+          : "추천 시간 없음";
+        return `
+          <div class="briefing-item">
+            <div class="briefing-title">${escapeHtml(task.title)}</div>
+            <div class="todo-meta">${escapeHtml(task.reason || "")}</div>
+            <div class="todo-meta">권장: ${escapeHtml(block)}</div>
+          </div>
+        `;
+      })
+      .join("");
+  }
+
+  const risks = briefing.risks || [];
+  risksList.innerHTML = risks.length
+    ? risks.map((risk) => `<div class="briefing-item risk">${escapeHtml(risk)}</div>`).join("")
+    : `<div class="briefing-item"><div class="todo-meta">특이 리스크 없음</div></div>`;
+
+  const reminders = briefing.reminders || [];
+  remindersList.innerHTML = reminders.length
+    ? reminders.map((item) => `<div class="briefing-item">${escapeHtml(item)}</div>`).join("")
+    : `<div class="briefing-item"><div class="todo-meta">리마인드 없음</div></div>`;
 }
 
 async function loadTasks() {
@@ -198,6 +275,76 @@ async function loadCalendarData() {
   const [local, remote] = await Promise.all([localPromise, remotePromise]);
   state.localBlocks = local;
   state.remoteEvents = remote;
+}
+
+async function deleteCalendarBlock(id, isOutlook) {
+  if (isOutlook) {
+    notify("Outlook 일정은 아직 직접 삭제할 수 없습니다.", true);
+    return;
+  }
+  try {
+    await api(`/calendar/blocks/${id.replace('local-', '')}`, { method: "DELETE" });
+    notify("일정이 삭제되었습니다.");
+    closeEventModal();
+    await refreshCalendarOnly();
+  } catch (error) {
+    notify(`삭제 실패: ${error.message}`, true);
+  }
+}
+
+function toLocalDatetimeValue(date) {
+  const d = new Date(date);
+  d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
+  return d.toISOString().slice(0, 16);
+}
+
+function openEventModal(eventId) {
+  const allEvents = mergedEvents();
+  const ev = allEvents.find(e => e.id === eventId);
+  if (!ev) return;
+  if (ev.kind === 'outlook') {
+    notify('Outlook 일정은 앱에서 직접 수정할 수 없습니다.', true);
+    return;
+  }
+  document.getElementById('edit-event-id').value = ev.id;
+  document.getElementById('edit-event-title').value = ev.title;
+  document.getElementById('edit-event-start').value = toLocalDatetimeValue(ev.start);
+  document.getElementById('edit-event-end').value = toLocalDatetimeValue(ev.end);
+  document.getElementById('event-modal-overlay').classList.remove('hidden');
+}
+
+function closeEventModal() {
+  document.getElementById('event-modal-overlay').classList.add('hidden');
+}
+
+async function saveEventChanges() {
+  const rawId = document.getElementById('edit-event-id').value;
+  const title = document.getElementById('edit-event-title').value.trim();
+  const start = document.getElementById('edit-event-start').value;
+  const end = document.getElementById('edit-event-end').value;
+  if (!title || !start || !end) { notify('모든 필드를 입력해주세요.', true); return; }
+  const startDt = new Date(start);
+  const endDt = new Date(end);
+  if (endDt <= startDt) { notify('종료 시간은 시작 시간 이후여야 합니다.', true); return; }
+  const blockId = rawId.replace('local-', '');
+  try {
+    await api(`/calendar/blocks/${blockId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, start: startDt.toISOString(), end: endDt.toISOString() }),
+    });
+    notify('일정이 수정되었습니다.');
+    closeEventModal();
+    await refreshCalendarOnly();
+  } catch (error) {
+    notify(`수정 실패: ${error.message}`, true);
+  }
+}
+
+function deleteFromModal() {
+  const rawId = document.getElementById('edit-event-id').value;
+  const isOutlook = rawId.startsWith('outlook-');
+  deleteCalendarBlock(rawId, isOutlook);
 }
 
 function renderHeaderRange() {
@@ -328,8 +475,10 @@ function renderWeekGrid() {
         const left = (event.lane / event.lanes) * 100;
         const width = 100 / event.lanes;
 
+        const isOutlook = event.kind === "outlook" || event.kind === "mixed";
         return `
-          <div class="calendar-event ${event.kind}" style="top:${top}px;height:${height}px;left:calc(${left}% + 2px);width:calc(${width}% - 4px);">
+          <div class="calendar-event ${event.kind}" style="top:${top}px;height:${height}px;left:calc(${left}% + 2px);width:calc(${width}% - 4px);" onclick="openEventModal('${event.id}')">
+            <button class="event-delete" onclick="event.stopPropagation(); deleteCalendarBlock('${event.id}', ${isOutlook})" title="일정 삭제">×</button>
             <div class="event-time">${fmtTime(event.start)}</div>
             <div class="event-title">${escapeHtml(event.title)}</div>
           </div>
@@ -386,9 +535,13 @@ function renderAgenda() {
     .map((event) => {
       const tags = [`<span class="tag">${event.kind === "outlook" ? "Outlook" : "Local"}</span>`];
       if (event.kind === "mixed") tags.push('<span class="tag outlook">Synced</span>');
+      const isOutlook = event.kind === "outlook" || event.kind === "mixed";
       return `
-        <div class="agenda-item">
-          <div class="agenda-title">${escapeHtml(event.title)}</div>
+        <div class="agenda-item" onclick="openEventModal('${event.id}')">
+          <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+            <div class="agenda-title">${escapeHtml(event.title)}</div>
+            <button class="event-delete" style="position: relative; opacity: 1; opacity: 0.7;" onclick="event.stopPropagation(); deleteCalendarBlock('${event.id}', ${isOutlook})" title="일정 삭제">×</button>
+          </div>
           <div class="agenda-meta">${fmtDateTime(event.start)} - ${fmtTime(event.end)}</div>
           <div class="meta-row">${tags.join("")}</div>
         </div>
@@ -444,41 +597,80 @@ function renderMiniMonth() {
       renderWeekGrid();
       renderAgenda();
       renderMiniMonth();
+      const chatLog = document.getElementById("chat-log");
+      const match = chatLog.innerHTML.match(/<div class="chat-msg assistant">([^<]*)<\/div>/g);
+      if (match) {
+        let lastMsg = match[match.length - 1].replace(/<[^>]+>/g, "");
+        if (lastMsg) speak(lastMsg);
+      }
     });
   });
 }
 
+function initChatToggle() {
+  const fab = document.getElementById("chat-fab");
+  const chatWindow = document.getElementById("floating-chat");
+  const closeBtn = document.getElementById("close-chat");
+
+  if (fab && chatWindow && closeBtn) {
+    fab.addEventListener("click", () => {
+      chatWindow.classList.remove("hidden");
+      fab.style.display = "none";
+      chatWindow.classList.add("show");
+    });
+
+    closeBtn.addEventListener("click", () => {
+      chatWindow.classList.add("hidden");
+      chatWindow.classList.remove("show");
+      fab.style.display = "flex";
+    });
+  }
+}
+
 function renderTasks() {
-  const sorted = [...state.tasks].sort((a, b) => {
-    const aDone = a.status === "done" ? 1 : 0;
-    const bDone = b.status === "done" ? 1 : 0;
-    if (aDone !== bDone) return aDone - bDone;
+  const activeTasks = state.tasks.filter(t => t.status !== "canceled" && t.status !== "done").sort((a, b) => {
     const aDue = a.due ? new Date(a.due).getTime() : Number.MAX_SAFE_INTEGER;
     const bDue = b.due ? new Date(b.due).getTime() : Number.MAX_SAFE_INTEGER;
     return aDue - bDue;
   });
 
-  if (!sorted.length) {
+  const doneTasks = state.tasks.filter(t => t.status === "done").sort((a, b) => {
+    const aDue = a.due ? new Date(a.due).getTime() : Number.MAX_SAFE_INTEGER;
+    const bDue = b.due ? new Date(b.due).getTime() : Number.MAX_SAFE_INTEGER;
+    return aDue - bDue;
+  });
+
+  if (!activeTasks.length && !doneTasks.length) {
     $("todo-list").innerHTML = `<div class="todo-item"><div class="todo-meta">할일이 없습니다.</div></div>`;
     return;
   }
 
-  $("todo-list").innerHTML = sorted
-    .map((task) => {
-      const done = task.status === "done";
-      return `
-        <div class="todo-item">
-          <div class="todo-title">${escapeHtml(task.title)}</div>
-          <div class="todo-meta">${task.due ? fmtDateTime(task.due) : "마감 없음"} · ${escapeHtml(task.priority)}</div>
-          <div class="meta-row">
-            <span class="tag ${done ? "done" : ""}">${escapeHtml(task.status)}</span>
-            <button class="btn btn-ghost btn-mini" type="button" data-task-progress="${task.id}">진행중</button>
-            <button class="btn btn-ghost btn-mini" type="button" data-task-done="${task.id}">완료</button>
-          </div>
+  const renderItem = (task) => `
+    <div class="todo-item">
+      <div class="todo-title">${escapeHtml(task.title)}</div>
+      <div class="todo-meta">${task.due ? fmtDateTime(task.due) : "마감 없음"} · ${escapeHtml(task.priority)}</div>
+      <div class="meta-row">
+        <span class="tag ${task.status === "done" ? "done" : ""}">${escapeHtml(task.status)}</span>
+        <button class="btn btn-ghost btn-mini" type="button" data-task-progress="${task.id}">진행중</button>
+        <button class="btn btn-ghost btn-mini" type="button" data-task-done="${task.id}">완료</button>
+      </div>
+    </div>
+  `;
+
+  let html = activeTasks.map(renderItem).join("");
+
+  if (doneTasks.length > 0) {
+    html += `
+      <details class="done-tasks-folder" style="margin-top: 12px; font-size: 13px;">
+        <summary style="cursor: pointer; color: var(--muted); font-weight: 500;">완료된 작업 (${doneTasks.length})</summary>
+        <div style="margin-top: 8px;">
+          ${doneTasks.map(renderItem).join("")}
         </div>
-      `;
-    })
-    .join("");
+      </details>
+    `;
+  }
+
+  $("todo-list").innerHTML = html;
 
   document.querySelectorAll("[data-task-progress]").forEach((button) => {
     button.addEventListener("click", async () => {
@@ -653,11 +845,108 @@ async function syncTodoFromGraph() {
   notify(`To Do 가져오기 완료: ${result.imported}/${result.tasks}`);
 }
 
-function addChatMessage(role, text, remember = true) {
+function approvalCardMeta(action) {
+  const detail = action?.detail || {};
+  const approvalId = detail.approval_id;
+  if (!approvalId) return null;
+  if (action.type !== "approval_requested" && action.type !== "reschedule_approval_requested") return null;
+
+  if (detail.type === "action_item") {
+    return {
+      approvalId,
+      title: "회의 액션아이템 승인",
+      summary: detail.summary || "회의에서 추출한 할일을 반영합니다.",
+    };
+  }
+  if (action.type === "reschedule_approval_requested" || detail.type === "reschedule") {
+    return {
+      approvalId,
+      title: "일정 재배치 승인",
+      summary: detail.summary || "재배치 제안을 일정에 반영합니다.",
+    };
+  }
+  return {
+    approvalId,
+    title: "AI 작업 승인",
+    summary: detail.summary || "요청 작업을 실행하기 전에 확인이 필요합니다.",
+  };
+}
+
+function buildAssistantActionCards(actions) {
+  return (actions || [])
+    .map((action) => {
+      const meta = approvalCardMeta(action);
+      if (!meta) return "";
+      return `
+        <div class="chat-approval-card">
+          <div class="chat-approval-title">${escapeHtml(meta.title)}</div>
+          <div class="chat-approval-summary">${escapeHtml(meta.summary)}</div>
+          <div class="chat-approval-id">ID: ${escapeHtml(meta.approvalId)}</div>
+          <div class="chat-approval-actions">
+            <button class="btn btn-primary btn-mini" type="button" data-chat-approve="${meta.approvalId}">승인</button>
+            <button class="btn btn-danger btn-mini" type="button" data-chat-reject="${meta.approvalId}">거절</button>
+          </div>
+        </div>
+      `;
+    })
+    .filter(Boolean)
+    .join("");
+}
+
+function bindAssistantActionCards(scope) {
+  scope.querySelectorAll("[data-chat-approve]").forEach((button) => {
+    if (button.dataset.bound === "1") return;
+    button.dataset.bound = "1";
+    button.addEventListener("click", async () => {
+      if (button.dataset.busy === "1") return;
+      button.dataset.busy = "1";
+      button.disabled = true;
+      try {
+        await submitChatMessage(`승인 ${button.dataset.chatApprove}`);
+      } finally {
+        button.dataset.busy = "0";
+        button.disabled = false;
+      }
+    });
+  });
+
+  scope.querySelectorAll("[data-chat-reject]").forEach((button) => {
+    if (button.dataset.bound === "1") return;
+    button.dataset.bound = "1";
+    button.addEventListener("click", async () => {
+      if (button.dataset.busy === "1") return;
+      button.dataset.busy = "1";
+      button.disabled = true;
+      try {
+        await submitChatMessage(`취소 ${button.dataset.chatReject}`);
+      } finally {
+        button.dataset.busy = "0";
+        button.disabled = false;
+      }
+    });
+  });
+}
+
+function addChatMessage(role, text, remember = true, actions = []) {
   const log = $("chat-log");
   const box = document.createElement("div");
   box.className = `chat-msg ${role}`;
-  box.innerHTML = escapeHtml(text).replaceAll("\n", "<br />");
+  const content = document.createElement("div");
+  content.className = "chat-text";
+  content.innerHTML = escapeHtml(text).replaceAll("\n", "<br />");
+  box.appendChild(content);
+
+  if (role === "assistant" && actions.length) {
+    const cardsHtml = buildAssistantActionCards(actions);
+    if (cardsHtml) {
+      const cards = document.createElement("div");
+      cards.className = "chat-action-list";
+      cards.innerHTML = cardsHtml;
+      box.appendChild(cards);
+      bindAssistantActionCards(cards);
+    }
+  }
+
   log.appendChild(box);
   log.scrollTop = log.scrollHeight;
 
@@ -668,23 +957,23 @@ function addChatMessage(role, text, remember = true) {
   }
 }
 
-async function sendChat(event) {
-  event.preventDefault();
-  const input = $("chat-input");
-  const message = input.value.trim();
-  if (!message) return;
+function composeAssistantReply(result) {
+  const actions = result.actions || [];
+  const actionSummary = actions.map((item) => item.type).join(", ");
+  return actionSummary ? `${result.reply}\n\n작업: ${actionSummary}` : result.reply;
+}
 
+async function submitChatMessage(message, { echoUser = true } = {}) {
+  if (!message) return;
   const history = state.chatHistory.slice(-12);
-  addChatMessage("user", message);
-  input.value = "";
+  if (echoUser) addChatMessage("user", message);
 
   try {
     const result = await api("/assistant/chat", {
       method: "POST",
       body: JSON.stringify({ message, history }),
     });
-    const actionSummary = (result.actions || []).map((item) => item.type).join(", ");
-    addChatMessage("assistant", actionSummary ? `${result.reply}\n\n작업: ${actionSummary}` : result.reply);
+    addChatMessage("assistant", composeAssistantReply(result), true, result.actions || []);
     await refreshAll();
   } catch (error) {
     addChatMessage("assistant", `오류: ${error.message}`);
@@ -692,18 +981,28 @@ async function sendChat(event) {
   }
 }
 
+async function sendChat(event) {
+  event.preventDefault();
+  const input = $("chat-input");
+  const message = input.value.trim();
+  if (!message) return;
+  input.value = "";
+  await submitChatMessage(message);
+}
+
 async function refreshCalendarOnly() {
-  await loadCalendarData();
+  await Promise.all([loadCalendarData(), loadDailyBriefing(), loadSyncStatus()]);
   renderHeaderRange();
   renderWeekHeader();
   renderWeekGrid();
   renderAgenda();
   renderMiniMonth();
+  renderDailyBriefing();
 }
 
 async function refreshAll() {
-  await loadGraphStatus();
-  await Promise.all([loadTasks(), loadApprovals(), loadCalendarData()]);
+  await Promise.all([loadGraphStatus(), loadSyncStatus()]);
+  await Promise.all([loadTasks(), loadApprovals(), loadCalendarData(), loadDailyBriefing()]);
   renderHeaderRange();
   renderWeekHeader();
   renderWeekGrid();
@@ -711,6 +1010,7 @@ async function refreshAll() {
   renderMiniMonth();
   renderTasks();
   renderApprovals();
+  renderDailyBriefing();
 }
 
 function scrollCalendarToNow() {
@@ -781,6 +1081,16 @@ function bindEvents() {
     }
   });
 
+  $("refresh-briefing").addEventListener("click", async () => {
+    try {
+      await Promise.all([loadDailyBriefing(), loadSyncStatus()]);
+      renderDailyBriefing();
+      notify("오늘 브리핑을 갱신했습니다.");
+    } catch (error) {
+      notify(error.message, true);
+    }
+  });
+
   $("nav-prev").addEventListener("click", async () => {
     state.weekStart = addDays(state.weekStart, -7);
     state.selectedDate = addDays(state.selectedDate, -7);
@@ -832,6 +1142,7 @@ function bindEvents() {
 async function bootstrap() {
   try {
     bindEvents();
+    initChatToggle();
     renderTimeLabels();
 
     const due = addDays(new Date(), 1);
@@ -861,5 +1172,11 @@ async function bootstrap() {
     notify(error.message, true);
   }
 }
+
+window.deleteCalendarBlock = deleteCalendarBlock;
+window.openEventModal = openEventModal;
+window.closeEventModal = closeEventModal;
+window.saveEventChanges = saveEventChanges;
+window.deleteFromModal = deleteFromModal;
 
 bootstrap();

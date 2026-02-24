@@ -17,6 +17,7 @@
 - Outlook 캘린더 양방향 반영: 가져오기(import) + 로컬 블록 내보내기(export)
 - AI Assistant Chat: 회의록 등록/할일 조정/일정 재배치를 대화로 실행
   - 예: `오후 6시 이후 일정들 모두 재배치해줘`, `현재 중복되는 태스크들 삭제해줘`
+  - 일정 추가 요청(예: `이번주 목요일 3시에 미팅 일정 추가`)은 Task가 아니라 Calendar 일정으로 생성
   - 승인형 작업은 채팅에서 `승인`/`취소`로 결정 가능 (별도 승인 화면 없이 대화형 처리)
   - 의도가 모호하면 AI가 채팅으로 추가 질문 후, 답변을 받아 이어서 실행
 
@@ -55,6 +56,10 @@ uvicorn app.main:app --reload --port 8000
   - `OPENAI_EXTRACTION_MODEL=gpt-5-mini`
   - `OPENAI_FALLBACK_MODEL=gpt-5-mini`
 - 고성능 모델 호출이 실패/미지원일 때는 자동으로 fallback 모델을 사용합니다.
+- `ASSISTANT_LLM_ONLY=true`(기본)면 Assistant Chat 의도 판단/행동 계획은 LLM만 사용합니다.
+- 권장 온도:
+  - `OPENAI_TEMPERATURE=0.2`
+  - `OPENAI_ASSISTANT_TEMPERATURE=0.1`
 
 ## 주요 API
 - `GET/PATCH /api/profile`
@@ -81,8 +86,8 @@ uvicorn app.main:app --reload --port 8000
 
 ## 참고
 - 현재 DB는 로컬 `aawo.db` 파일을 사용합니다.
-- `OPENAI_API_KEY`가 설정되면 회의 Action Item 추출과 NLI 의도 파싱에 OpenAI API를 우선 사용합니다.
+- `OPENAI_API_KEY`가 설정되면 회의 Action Item 추출과 Assistant/NLI 의도 파싱에 OpenAI API를 사용합니다.
 - Assistant Chat은 최근 대화 히스토리를 함께 전달해 문맥 기반 후속 명령(예: "그거 내일로 옮겨줘") 해석 정확도를 높였습니다.
-- 키가 없거나 OpenAI 호출이 실패하면 기존 규칙 기반 파서로 자동 폴백합니다.
+- `ASSISTANT_LLM_ONLY=true` 상태에서는 키가 없거나 OpenAI 호출 실패 시 Assistant Chat 실행을 중단하고 오류를 반환합니다.
 - Microsoft OAuth Redirect URI는 `http://localhost:8000/api/graph/auth/callback`로 Azure App Registration에 등록해야 합니다.
 - 필요 권한(scope): `User.Read`, `offline_access`, `Calendars.ReadWrite`, `Tasks.ReadWrite`
