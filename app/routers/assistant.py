@@ -250,8 +250,16 @@ def _looks_like_meeting_note(text: str) -> bool:
     if "회의록" in text or "meeting notes" in lowered or "회의 내용" in text:
         return True
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    speaker_like = sum(1 for line in lines if ":" in line and len(line.split(":", 1)[0]) <= 20)
-    return len(lines) >= 2 and speaker_like >= 1
+    speaker_like = 0
+    for line in lines:
+        if ":" not in line:
+            continue
+        speaker = line.split(":", 1)[0].strip().lower()
+        if speaker in {"추가정보", "additional", "context"}:
+            continue
+        if len(speaker) <= 20:
+            speaker_like += 1
+    return len(lines) >= 3 and speaker_like >= 2
 
 
 def _to_transcript(text: str) -> list[dict]:
@@ -432,6 +440,35 @@ def _clarification_question(message: str, plan_note: str | None = None) -> str:
     if "삭제" in message or "remove" in lowered or "delete" in lowered:
         return "무엇을 삭제할지 구체적으로 알려주세요. 예: '중복 태스크만 정리해줘'."
     return "의도를 정확히 파악하지 못했습니다. 작업 대상과 시간/조건을 한 문장으로 더 구체적으로 알려주세요."
+
+
+def _is_ambiguous_short_request(message: str) -> bool:
+    lowered = message.lower()
+    normalized_len = len(_normalize_text(message))
+    vague_verbs = ["정리", "처리", "해줘", "부탁", "fix", "do", "handle"]
+    concrete_tokens = [
+        "중복",
+        "우선순위",
+        "마감",
+        "일정",
+        "회의록",
+        "태스크",
+        "작업",
+        "재배치",
+        "삭제",
+        "추가",
+        "duplicate",
+        "priority",
+        "deadline",
+        "schedule",
+        "task",
+        "meeting",
+    ]
+    if normalized_len > 12:
+        return False
+    if not any(token in lowered for token in vague_verbs):
+        return False
+    return not any(token in lowered for token in concrete_tokens)
 
 
 def _extract_task_keyword(raw_text: str) -> str | None:
@@ -1347,7 +1384,10 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
         db.commit()
 
         if original_message:
-            message = f"{original_message}\n추가정보: {message}"
+            if _is_ambiguous_short_request(original_message):
+                message = message
+            else:
+                message = f"{original_message}\n{message}"
 
     approval_id = _extract_uuid(message)
     if _is_affirmative(message) or _is_negative(message):
@@ -1371,6 +1411,15 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
 
     quick_rule = _fallback_classify(message, allow_openai_nli=False)
     quick_intent = str(quick_rule.get("intent") or "unknown")
+    if quick_intent == "unknown" and _is_ambiguous_short_request(message):
+        question = _clarification_question(message, None)
+        clarification_req = _queue_chat_clarification(db, question, message)
+        return AssistantChatResponse(
+            reply=f"{question}\n답변해 주시면 이어서 처리합니다.",
+            actions=[AssistantActionOut(type="clarification_requested", detail={"clarification_id": clarification_req.id})],
+            refresh=["approvals"],
+        )
+
     if quick_intent in {
         "register_meeting_note",
         "create_task",

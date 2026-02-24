@@ -1,33 +1,38 @@
 :root {
   /* Core Colors */
-  --bg: #F8FAFC;
-  --panel: rgba(255, 255, 255, 0.85);
-  /* Glass effect base */
+  --bg: #F4F5F7;
+  --panel: #FFFFFF;
   --panel-solid: #FFFFFF;
-  --line: #E2E8F0;
-  --line-strong: #CBD5E1;
-  --ink: #0F172A;
-  --ink-soft: #475569;
+  --line: #E5E7EB;
+  --line-strong: #D1D5DB;
+  --ink: #111827;
+  --ink-soft: #6B7280;
 
   /* Brand Accents */
-  --brand: #4F46E5;
-  /* Indigo */
-  --brand-hover: #4338CA;
-  --brand-soft: #EEF2FF;
+  --brand: #111827;
+  --brand-hover: #374151;
+  --brand-soft: #F9FAFB;
 
-  /* Status Colors */
-  --green: #10B981;
-  --green-soft: #D1FAE5;
-  --danger: #EF4444;
-  --danger-soft: #FEE2E2;
-  --warn: #F59E0B;
-  --warn-soft: #FEF3C7;
+  /* Status Colors (Pastel Event Blocks) */
+  --green: #BBF7D0;
+  --green-soft: #DCFCE7;
+  --green-txt: #14532D;
+  --purple-bg: #E9D5FF;
+  --purple-txt: #581C87;
+  --blue-bg: #BFDBFE;
+  --blue-txt: #1E3A8A;
+  --warn: #FEF08A;
+  --warn-txt: #713F12;
+  --danger: #FECACA;
+  --danger-txt: #7F1D1D;
 
   /* UI Tokens */
-  --radius: 16px;
-  --radius-sm: 10px;
-  --shadow: 0 4px 20px rgba(15, 23, 42, 0.05);
-  --shadow-hover: 0 10px 25px rgba(15, 23, 42, 0.08);
+  --radius: 8px;
+  --radius-sm: 6px;
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+  /* Minimal shadow for depth separation only */
+  --shadow-hover: 0 4px 6px rgba(0, 0, 0, 0.05);
+  /* Very subtle hover shadow */
   --hour-height: 60px;
 }
 
@@ -61,25 +66,23 @@ body {
 .calendar-shell {
   width: 100%;
   height: 100%;
-  padding: 16px;
+  padding: 16px 24px;
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);
-  gap: 12px;
+  gap: 16px;
 }
 
 .app-header {
-  border: 1px solid rgba(255, 255, 255, 0.4);
+  border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--panel);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  box-shadow: var(--shadow);
-  padding: 12px 16px;
+  box-shadow: none;
+  /* Flat */
+  padding: 12px 20px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  transition: box-shadow 0.3s ease;
+  gap: 16px;
 }
 
 .app-header:hover {
@@ -96,26 +99,28 @@ body {
 
 .app-brand {
   font-size: 20px;
-  font-weight: 800;
-  background: linear-gradient(135deg, var(--brand), #7C3AED);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  letter-spacing: -0.02em;
+  font-weight: 700;
+  color: var(--ink);
+  /* Flat black text for brand instead of gradient */
+  letter-spacing: -0.01em;
   padding-right: 12px;
 }
 
 .nav-group {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
+  /* Tighter for compact SaaS feel */
   background: var(--bg);
   padding: 4px;
   border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
 }
 
 .range-title {
-  margin: 0 0 0 12px;
-  font-size: 20px;
+  margin: 0 0 0 16px;
+  font-size: 18px;
+  font-weight: 500;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -170,37 +175,34 @@ select:focus {
   border: 1px solid var(--line);
   background: var(--bg);
   color: var(--ink-soft);
-  padding: 6px 12px;
-  font-size: 13px;
-  font-weight: 600;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 500;
   white-space: nowrap;
-  transition: all 0.2s ease;
 }
 
 .status-pill.connected {
-  background: var(--green-soft);
-  border-color: #A7F3D0;
-  color: var(--green);
+  background: var(--green-bg);
+  border-color: #86EFAC;
+  color: var(--green-txt);
 }
 
 .status-pill.warn {
-  background: var(--warn-soft);
-  border-color: #FDE68A;
-  color: #B45309;
+  background: var(--warn-bg);
+  border-color: #FDE047;
+  color: var(--warn-txt);
 }
 
 .status-line {
-  min-height: 20px;
-  font-size: 14px;
-  color: var(--ink-soft);
-  padding-left: 4px;
-  font-weight: 500;
+  display: none;
+  /* Hide for cleaner look, notifications will be enough */
 }
 
 .workspace-grid {
   min-height: 0;
   display: grid;
-  grid-template-columns: 320px minmax(0, 1fr) 380px;
+  grid-template-columns: 260px minmax(0, 1fr) 280px;
+  /* Thinner sidebars for dashboard feel */
   gap: 16px;
 }
 
@@ -220,12 +222,11 @@ select:focus {
 
 .panel {
   min-height: 0;
-  border: 1px solid rgba(255, 255, 255, 0.4);
+  border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--panel);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
   box-shadow: var(--shadow);
+  /* Minimal flat shadow */
   padding: 16px;
   display: flex;
   flex-direction: column;
@@ -240,8 +241,9 @@ select:focus {
 }
 
 .panel-title-row strong {
-  font-size: 16px;
-  font-weight: 700;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
 }
 
 .mini-panel {
@@ -406,6 +408,11 @@ select:focus {
   text-align: center;
   cursor: pointer;
   transition: background 0.2s ease;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 2px;
 }
 
 .week-day-head:last-child {
@@ -413,36 +420,36 @@ select:focus {
 }
 
 .week-day-head:hover {
-  background: var(--brand-soft);
+  background: var(--bg);
 }
 
 .week-day-head .dow {
-  font-size: 13px;
+  font-size: 11px;
   font-weight: 500;
   color: var(--ink-soft);
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  margin-bottom: 4px;
+  margin-bottom: 0px;
 }
 
 .week-day-head .dom {
-  font-size: 24px;
-  font-weight: 700;
+  font-size: 18px;
+  /* Smaller, sharper font sizes matching reference */
+  font-weight: 600;
   line-height: 1;
   color: var(--ink);
 }
 
 .week-day-head.today .dom {
-  color: var(--brand);
+  color: #000;
 }
 
 .week-day-head.today .dow {
-  color: var(--brand);
-  font-weight: 700;
+  color: #000;
 }
 
 .week-day-head.selected {
-  background: var(--brand-soft);
+  background: var(--bg);
 }
 
 .time-grid-wrap {
@@ -717,6 +724,7 @@ select:focus {
     width: 130px;
   }
 }
+
 /* Current Time Indicator */
 .current-time-indicator {
   position: absolute;
