@@ -8,13 +8,14 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from msal import ConfidentialClientApplication, SerializableTokenCache
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import CalendarBlock, GraphConnection, SyncStatus, Task
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
+MSAL_RESERVED_SCOPES = {"openid", "profile", "offline_access"}
 
 
 class GraphConfigError(RuntimeError):
@@ -39,8 +40,13 @@ class GraphAuthResult:
 
 
 
-def graph_scopes() -> list[str]:
+def configured_scopes() -> list[str]:
     return [scope.strip() for scope in settings.ms_scopes.split() if scope.strip()]
+
+
+def graph_scopes() -> list[str]:
+    scopes = [scope for scope in configured_scopes() if scope.lower() not in MSAL_RESERVED_SCOPES]
+    return scopes or ["User.Read"]
 
 
 
@@ -357,7 +363,7 @@ def status_payload(db: Session) -> dict:
         "connected": row.connected,
         "username": row.username,
         "tenant_id": row.tenant_id,
-        "scopes": graph_scopes(),
+        "scopes": configured_scopes(),
         "missing_settings": _missing_settings(),
         "redirect_uri": settings.ms_redirect_uri,
     }
@@ -392,6 +398,89 @@ def list_calendar_events(db: Session, start: datetime, end: datetime) -> list[di
 
 def create_calendar_event(db: Session, payload: dict) -> dict:
     return graph_request(db, "POST", "/me/events", json_body=payload)
+
+
+def _block_event_payload(block: CalendarBlock) -> dict:
+    payload: dict = {
+        "subject": block.title or "AAWO Block",
+        "start": format_graph_datetime(block.start),
+        "end": format_graph_datetime(block.end),
+        "body": {
+            "contentType": "text",
+            "content": f"Synced from AI Planner block {block.id}",
+        },
+    }
+
+    if block.task_id:
+        payload["categories"] = ["AAWO"]
+    return payload
+
+
+def is_graph_connected(db: Session) -> bool:
+    row = ensure_graph_connection(db)
+    return bool(row.connected)
+
+
+def sync_blocks_to_outlook(db: Session, blocks: list[CalendarBlock]) -> dict:
+    created = 0
+    updated = 0
+    skipped = 0
+    synced = 0
+
+    for block in blocks:
+        if block.source == "external":
+            skipped += 1
+            continue
+
+        payload = _block_event_payload(block)
+
+        if block.outlook_event_id:
+            try:
+                graph_request(db, "PATCH", f"/me/events/{block.outlook_event_id}", json_body=payload)
+                updated += 1
+                synced += 1
+                continue
+            except GraphApiError as exc:
+                if exc.status_code != 404:
+                    raise
+                block.outlook_event_id = None
+
+        create_payload = {
+            **payload,
+            "transactionId": f"aawo-block-{block.id}",
+        }
+        event = create_calendar_event(db, create_payload)
+        event_id = event.get("id")
+        if event_id:
+            block.outlook_event_id = event_id
+            created += 1
+            synced += 1
+        else:
+            skipped += 1
+
+    db.commit()
+    return {
+        "blocks": len(blocks),
+        "synced": synced,
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+    }
+
+
+def export_calendar_to_outlook(db: Session, start: datetime, end: datetime) -> dict:
+    rows = db.execute(
+        select(CalendarBlock).where(
+            and_(
+                CalendarBlock.start < end,
+                CalendarBlock.end > start,
+                CalendarBlock.source != "external",
+            )
+        )
+    ).scalars().all()
+
+    result = sync_blocks_to_outlook(db, rows)
+    return {**result, "window_start": start.isoformat(), "window_end": end.isoformat()}
 
 
 

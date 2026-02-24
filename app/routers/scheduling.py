@@ -9,6 +9,7 @@ from app.db import get_db
 from app.models import ApprovalRequest, SchedulingProposal
 from app.schemas import ApplyProposalRequest, ScheduleProposalOut, SchedulingProposalRequest
 from app.services.core import ensure_profile
+from app.services.graph_service import GraphApiError, GraphAuthError, is_graph_connected, sync_blocks_to_outlook
 from app.services.scheduler import apply_proposal, generate_proposals
 
 router = APIRouter(prefix="/scheduling", tags=["scheduling"])
@@ -70,6 +71,14 @@ def apply_schedule_proposal(
         }
 
     created_blocks, updated_blocks = apply_proposal(db, proposal)
+    outlook_synced = False
+    if created_blocks and is_graph_connected(db):
+        try:
+            sync_result = sync_blocks_to_outlook(db, created_blocks)
+            outlook_synced = sync_result["synced"] > 0
+        except (GraphAuthError, GraphApiError):
+            outlook_synced = False
+
     return {
         "proposal_id": proposal.id,
         "applied": True,
@@ -94,5 +103,6 @@ def apply_schedule_proposal(
             for block in updated_blocks
         ],
         "approval_required": False,
+        "outlook_synced": outlook_synced,
         "applied_at": datetime.utcnow(),
     }

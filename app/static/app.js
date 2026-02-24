@@ -397,6 +397,14 @@ async function importOutlookCalendar() {
   await loadCalendar();
 }
 
+async function exportOutlookCalendar() {
+  const result = await api("/graph/calendar/export", { method: "POST" });
+  $("graph-import-result").textContent =
+    `Outlook 내보내기: ${result.synced}건 (생성 ${result.created}, 업데이트 ${result.updated}, 제외 ${result.skipped})`;
+  setGraphMessage("로컬 캘린더를 Outlook에 반영했습니다.");
+  await loadSyncStatus();
+}
+
 async function loadTodoLists() {
   const lists = await api("/graph/todo/lists");
   const select = $("todo-list-select");
@@ -495,6 +503,13 @@ async function bootstrap() {
     $("import-calendar").addEventListener("click", async () => {
       try {
         await importOutlookCalendar();
+      } catch (error) {
+        notify(error.message, true);
+      }
+    });
+    $("export-calendar").addEventListener("click", async () => {
+      try {
+        await exportOutlookCalendar();
       } catch (error) {
         notify(error.message, true);
       }

@@ -17,6 +17,7 @@ from app.services.graph_service import (
     create_calendar_event,
     create_todo_task,
     disconnect_graph,
+    export_calendar_to_outlook,
     format_graph_datetime,
     import_calendar_to_local,
     import_todo_to_local,
@@ -147,6 +148,27 @@ def graph_import_calendar(
 
     try:
         return import_calendar_to_local(db, start, end)
+    except GraphAuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except GraphApiError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@router.post("/calendar/export")
+def graph_export_calendar(
+    start: datetime | None = Query(default=None),
+    end: datetime | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> dict:
+    if start is None:
+        start = datetime.now(UTC)
+    if end is None:
+        end = start + timedelta(days=14)
+    if end <= start:
+        raise HTTPException(status_code=422, detail="end must be later than start")
+
+    try:
+        return export_calendar_to_outlook(db, start, end)
     except GraphAuthError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except GraphApiError as exc:

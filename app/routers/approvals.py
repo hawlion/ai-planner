@@ -11,6 +11,7 @@ from app.models import ActionItemCandidate, ApprovalRequest, SchedulingProposal
 from app.schemas import ApprovalOut, ApprovalResolve
 from app.services.actions import approve_candidate, reject_candidate
 from app.services.core import ensure_profile
+from app.services.graph_service import GraphApiError, GraphAuthError, is_graph_connected, sync_blocks_to_outlook
 from app.services.scheduler import apply_proposal
 
 router = APIRouter(prefix="/approvals", tags=["approvals"])
@@ -45,7 +46,12 @@ def resolve_approval(approval_id: str, payload: ApprovalResolve, db: Session = D
         if candidate and candidate.status == "pending":
             if decision == "approve":
                 profile = ensure_profile(db)
-                approve_candidate(db, candidate, profile)
+                _, blocks = approve_candidate(db, candidate, profile)
+                if blocks and is_graph_connected(db):
+                    try:
+                        sync_blocks_to_outlook(db, blocks)
+                    except (GraphAuthError, GraphApiError):
+                        pass
             else:
                 reject_candidate(candidate)
 
@@ -53,7 +59,12 @@ def resolve_approval(approval_id: str, payload: ApprovalResolve, db: Session = D
         proposal_id = approval.payload.get("proposal_id")
         proposal = db.get(SchedulingProposal, proposal_id)
         if proposal and proposal.status == "draft":
-            apply_proposal(db, proposal)
+            created_blocks, _ = apply_proposal(db, proposal)
+            if created_blocks and is_graph_connected(db):
+                try:
+                    sync_blocks_to_outlook(db, created_blocks)
+                except (GraphAuthError, GraphApiError):
+                    pass
 
     db.commit()
     db.refresh(approval)

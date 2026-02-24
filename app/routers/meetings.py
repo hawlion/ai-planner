@@ -20,6 +20,7 @@ from app.schemas import (
 )
 from app.services.actions import approve_candidate, reject_candidate
 from app.services.core import ensure_profile
+from app.services.graph_service import GraphApiError, GraphAuthError, is_graph_connected, sync_blocks_to_outlook
 from app.services.meeting_extractor import extract_action_items
 from app.services.openai_client import OpenAIIntegrationError, extract_action_items_openai, is_openai_available
 
@@ -179,12 +180,20 @@ def approve_action_item(
     for block in blocks:
         db.refresh(block)
 
+    outlook_synced = False
+    if blocks and is_graph_connected(db):
+        try:
+            sync_result = sync_blocks_to_outlook(db, blocks)
+            outlook_synced = sync_result["synced"] > 0
+        except (GraphAuthError, GraphApiError):
+            outlook_synced = False
+
     return ApproveActionItemResult(
         candidate_id=candidate.id,
         task=TaskOut.model_validate(task),
         created_blocks=[CalendarBlockOut.model_validate(block) for block in blocks],
         ms_todo_synced=False,
-        outlook_synced=False,
+        outlook_synced=outlook_synced,
     )
 
 

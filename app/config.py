@@ -20,7 +20,7 @@ class Settings:
     ms_tenant_id: str = os.getenv("MS_TENANT_ID", "common")
     ms_client_id: str = os.getenv("MS_CLIENT_ID", "")
     ms_client_secret: str = os.getenv("MS_CLIENT_SECRET", "")
-    ms_redirect_uri: str = os.getenv("MS_REDIRECT_URI", "http://127.0.0.1:8000/api/graph/auth/callback")
+    ms_redirect_uri: str = os.getenv("MS_REDIRECT_URI", "http://localhost:8000/api/graph/auth/callback")
     ms_scopes: str = os.getenv(
         "MS_SCOPES",
         "User.Read offline_access Calendars.ReadWrite Tasks.ReadWrite",
