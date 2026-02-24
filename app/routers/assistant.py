@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import get_db
-from app.models import ActionItemCandidate, ApprovalRequest, CalendarBlock, Meeting, Task
+from app.models import ActionItemCandidate, ApprovalRequest, CalendarBlock, Meeting, SchedulingProposal, Task
 from app.schemas import AssistantActionOut, AssistantChatRequest, AssistantChatResponse
 from app.services.actions import approve_candidate
 from app.services.core import ensure_profile
@@ -775,7 +775,10 @@ def _reschedule_from_message(db: Session, hint: str) -> tuple[str, list[Assistan
         db.commit()
         db.refresh(approval)
         return (
-            f"재배치 제안을 생성했고 승인 요청을 올렸습니다. (approval {approval.id})",
+            (
+                f"재배치 제안을 만들었습니다. 채팅에서 '승인' 또는 '취소'로 결정해 주세요. "
+                f"(approval {approval.id})"
+            ),
             [AssistantActionOut(type="reschedule_approval_requested", detail={"approval_id": approval.id})],
             ["approvals", "calendar"],
         )
@@ -1072,6 +1075,202 @@ def _delete_duplicate_tasks(db: Session) -> tuple[str, list[AssistantActionOut],
     )
 
 
+def _run_one_action(
+    db: Session,
+    parsed: dict,
+    message: str,
+    history_context: list[dict],
+    *,
+    require_confirmation: bool,
+) -> tuple[str, list[AssistantActionOut], list[str]]:
+    intent = parsed.get("intent", "unknown")
+    if intent == "register_meeting_note":
+        return _register_meeting_and_apply(db, parsed.get("meeting_note") or message)
+
+    if intent == "create_task":
+        title = (parsed.get("title") or parsed.get("task_keyword") or message).strip()
+        due = _parse_due(parsed.get("due"), message)
+        effort = int(parsed.get("effort_minutes") or 60)
+        priority = str(parsed.get("priority") or "medium")
+        return _create_task_from_message(db, title, due, effort, priority)
+
+    if intent == "reschedule_after_hour":
+        cutoff_hour = _extract_cutoff_hour(parsed.get("cutoff_hour"), message)
+        if cutoff_hour is None:
+            return ("기준 시간을 파악하지 못했습니다. 예: '오후 6시 이후 일정 재배치'", [], [])
+        if require_confirmation:
+            approval = _queue_chat_confirmation(
+                db,
+                {"intent": "reschedule_after_hour", "cutoff_hour": cutoff_hour},
+                summary=f"{cutoff_hour:02d}:00 이후 일정 재배치",
+                source_message=message,
+            )
+            return (
+                (
+                    f"{cutoff_hour:02d}:00 이후 일정을 재배치하려고 합니다. "
+                    "채팅에 '승인' 또는 '취소'라고 답해 주세요."
+                ),
+                [AssistantActionOut(type="approval_requested", detail={"approval_id": approval.id, "type": "chat"})],
+                ["approvals"],
+            )
+        return _reschedule_after_hour(db, cutoff_hour)
+
+    if intent == "reschedule_request":
+        hint = str(parsed.get("reschedule_hint") or parsed.get("time_hint") or parsed.get("title") or message)
+        return _reschedule_from_message(db, hint)
+
+    if intent == "delete_duplicate_tasks":
+        if require_confirmation:
+            approval = _queue_chat_confirmation(
+                db,
+                {"intent": "delete_duplicate_tasks"},
+                summary="중복 태스크 정리(중복 항목 취소 및 일정 재연결)",
+                source_message=message,
+            )
+            return (
+                "중복 태스크를 정리하려고 합니다. 채팅에 '승인' 또는 '취소'라고 답해 주세요.",
+                [AssistantActionOut(type="approval_requested", detail={"approval_id": approval.id, "type": "chat"})],
+                ["approvals"],
+            )
+        return _delete_duplicate_tasks(db)
+
+    if intent == "complete_task":
+        base_keyword = parsed.get("task_keyword") or parsed.get("title")
+        keyword = _extract_task_keyword(str(base_keyword or "")) or _extract_task_keyword(message)
+        history_keyword = _infer_keyword_from_history(
+            db,
+            message,
+            history_context,
+            statuses=("todo", "in_progress", "blocked", "done"),
+        )
+        if _has_reference_phrase(message) and history_keyword:
+            keyword = history_keyword
+        elif not keyword or _is_generic_keyword(keyword):
+            keyword = history_keyword
+        return _complete_task(db, keyword)
+
+    if intent == "update_priority":
+        base_keyword = parsed.get("task_keyword") or parsed.get("title")
+        keyword = _extract_task_keyword(str(base_keyword or "")) or _extract_task_keyword(message)
+        history_keyword = _infer_keyword_from_history(
+            db,
+            message,
+            history_context,
+            statuses=("todo", "in_progress", "blocked"),
+        )
+        if _has_reference_phrase(message) and history_keyword:
+            keyword = history_keyword
+        elif not keyword or _is_generic_keyword(keyword):
+            keyword = history_keyword
+        return _update_priority(db, keyword, parsed.get("priority"))
+
+    if intent == "update_due":
+        base_keyword = parsed.get("task_keyword") or parsed.get("title")
+        keyword = _extract_task_keyword(str(base_keyword or "")) or _extract_task_keyword(message)
+        history_keyword = _infer_keyword_from_history(
+            db,
+            message,
+            history_context,
+            statuses=("todo", "in_progress", "blocked"),
+        )
+        if _has_reference_phrase(message) and history_keyword:
+            keyword = history_keyword
+        elif not keyword or _is_generic_keyword(keyword):
+            keyword = history_keyword
+        due = _parse_due(parsed.get("due"), message)
+        return _update_due(db, keyword, due)
+
+    return ("요청 의도를 처리하지 못했습니다.", [], [])
+
+
+def _resolve_pending_approval_by_chat(
+    db: Session,
+    approval: ApprovalRequest,
+    *,
+    approve: bool,
+    message: str,
+    history_context: list[dict],
+) -> tuple[str, list[AssistantActionOut], list[str]]:
+    approval.status = "approved" if approve else "rejected"
+    approval.resolved_at = datetime.utcnow()
+    approval.reason = "resolved_via_chat"
+
+    if not approve:
+        db.commit()
+        return (
+            "요청한 작업을 취소했습니다.",
+            [AssistantActionOut(type="approval_rejected", detail={"approval_id": approval.id, "approval_type": approval.type})],
+            ["approvals"],
+        )
+
+    if approval.type == CHAT_CONFIRM_TYPE:
+        action = approval.payload.get("action") or {}
+        reply, actions, refresh = _run_one_action(
+            db,
+            action,
+            message=approval.payload.get("source_message") or message,
+            history_context=history_context,
+            require_confirmation=False,
+        )
+        return (
+            f"승인되었습니다.\n{reply}",
+            [AssistantActionOut(type="approval_approved", detail={"approval_id": approval.id, "approval_type": approval.type})]
+            + actions,
+            sorted(set(["approvals", *refresh])),
+        )
+
+    if approval.type == "action_item":
+        candidate_id = approval.payload.get("candidate_id")
+        candidate = db.get(ActionItemCandidate, candidate_id)
+        if candidate and candidate.status == "pending":
+            profile = ensure_profile(db)
+            _, blocks = approve_candidate(db, candidate, profile)
+            synced = 0
+            if blocks and is_graph_connected(db):
+                try:
+                    sync_result = sync_blocks_to_outlook(db, blocks)
+                    synced = int(sync_result["synced"])
+                except (GraphAuthError, GraphApiError):
+                    synced = 0
+            db.commit()
+            reply = f"승인되었습니다. 액션아이템을 할일로 반영했습니다: {candidate.title}"
+            if synced:
+                reply += f" (Outlook 동기화 {synced}건)"
+            return (
+                reply,
+                [AssistantActionOut(type="approval_approved", detail={"approval_id": approval.id, "approval_type": approval.type})],
+                ["approvals", "tasks", "calendar"],
+            )
+        db.commit()
+        return ("승인할 액션아이템을 찾지 못했습니다.", [], ["approvals"])
+
+    if approval.type == "reschedule":
+        proposal_id = approval.payload.get("proposal_id")
+        proposal = db.get(SchedulingProposal, proposal_id)
+        if proposal and proposal.status == "draft":
+            created_blocks, _ = apply_proposal(db, proposal)
+            synced = 0
+            if created_blocks and is_graph_connected(db):
+                try:
+                    sync_result = sync_blocks_to_outlook(db, created_blocks)
+                    synced = int(sync_result["synced"])
+                except (GraphAuthError, GraphApiError):
+                    synced = 0
+            reply = f"승인되었습니다. 재배치를 적용해 일정 {len(created_blocks)}건을 생성했습니다."
+            if synced:
+                reply += f" (Outlook 동기화 {synced}건)"
+            return (
+                reply,
+                [AssistantActionOut(type="approval_approved", detail={"approval_id": approval.id, "approval_type": approval.type})],
+                ["approvals", "calendar"],
+            )
+        db.commit()
+        return ("승인할 재배치 제안을 찾지 못했습니다.", [], ["approvals"])
+
+    db.commit()
+    return ("승인되었습니다.", [AssistantActionOut(type="approval_approved", detail={"approval_id": approval.id})], ["approvals"])
+
+
 def _fallback_classify(text: str) -> dict:
     lowered = text.lower()
     if _looks_like_meeting_note(text):
@@ -1126,7 +1325,47 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
         for turn in payload.history
         if turn.text.strip()
     ]
+    pending_clarification = _latest_pending_approval(db, types=(CHAT_CLARIFICATION_TYPE,))
+    if pending_clarification:
+        if _is_negative(message):
+            pending_clarification.status = "rejected"
+            pending_clarification.resolved_at = datetime.utcnow()
+            pending_clarification.reason = "clarification_canceled_by_user"
+            db.commit()
+            return AssistantChatResponse(
+                reply="요청을 취소했습니다. 새로 요청해 주세요.",
+                actions=[AssistantActionOut(type="clarification_canceled", detail={"clarification_id": pending_clarification.id})],
+                refresh=["approvals"],
+            )
+
+        original_message = str(pending_clarification.payload.get("original_message") or "").strip()
+        pending_clarification.status = "approved"
+        pending_clarification.resolved_at = datetime.utcnow()
+        pending_clarification.reason = "clarification_resolved_via_chat"
+        db.commit()
+
+        if original_message:
+            message = f"{original_message}\n추가정보: {message}"
+
+    approval_id = _extract_uuid(message)
+    if _is_affirmative(message) or _is_negative(message):
+        pending_approval = _latest_pending_approval(
+            db,
+            types=tuple(CHAT_APPROVABLE_TYPES),
+            approval_id=approval_id,
+        )
+        if pending_approval:
+            reply, actions, refresh = _resolve_pending_approval_by_chat(
+                db,
+                pending_approval,
+                approve=_is_affirmative(message),
+                message=message,
+                history_context=history_context,
+            )
+            return AssistantChatResponse(reply=reply, actions=actions, refresh=sorted(set(refresh)))
+
     planned_actions: list[dict] = []
+    plan_note: str | None = None
     if is_openai_available():
         try:
             plan = parse_assistant_plan_openai(
@@ -1136,8 +1375,10 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
                 history=history_context,
             )
             planned_actions = [item.model_dump() for item in plan.actions]
+            plan_note = plan.note
         except OpenAIIntegrationError:
             planned_actions = []
+            plan_note = None
 
     if not planned_actions:
         planned_actions = [_fallback_classify(message)]
@@ -1186,88 +1427,36 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
         if reference_mode and intent in {"complete_task", "update_priority", "update_due"} and reference_action_processed:
             continue
 
-        if intent == "register_meeting_note":
-            reply, actions, refresh = _register_meeting_and_apply(db, parsed.get("meeting_note") or message)
-        elif intent == "create_task":
-            title = (parsed.get("title") or parsed.get("task_keyword") or message).strip()
-            due = _parse_due(parsed.get("due"), message)
-            effort = int(parsed.get("effort_minutes") or 60)
-            priority = str(parsed.get("priority") or "medium")
-            reply, actions, refresh = _create_task_from_message(db, title, due, effort, priority)
-        elif intent == "reschedule_after_hour":
-            cutoff_hour = _extract_cutoff_hour(parsed.get("cutoff_hour"), message)
-            reply, actions, refresh = _reschedule_after_hour(db, cutoff_hour)
-        elif intent == "reschedule_request":
-            hint = str(parsed.get("reschedule_hint") or parsed.get("time_hint") or parsed.get("title") or message)
-            reply, actions, refresh = _reschedule_from_message(db, hint)
-        elif intent == "delete_duplicate_tasks":
-            reply, actions, refresh = _delete_duplicate_tasks(db)
-        elif intent == "complete_task":
-            base_keyword = parsed.get("task_keyword") or parsed.get("title")
-            keyword = _extract_task_keyword(str(base_keyword or "")) or _extract_task_keyword(message)
-            history_keyword = _infer_keyword_from_history(
-                db,
-                message,
-                history_context,
-                statuses=("todo", "in_progress", "blocked", "done"),
+        clarification = _needs_clarification_for_action(db, parsed, message, history_context)
+        if clarification:
+            clarification_req = _queue_chat_clarification(db, clarification, message)
+            return AssistantChatResponse(
+                reply=f"{clarification}\n답변해 주시면 이어서 처리합니다.",
+                actions=[AssistantActionOut(type="clarification_requested", detail={"clarification_id": clarification_req.id})],
+                refresh=["approvals"],
             )
-            if reference_mode and history_keyword:
-                keyword = history_keyword
-            elif not keyword or _is_generic_keyword(keyword):
-                keyword = history_keyword
-            reply, actions, refresh = _complete_task(db, keyword)
-            if reference_mode and (keyword or history_keyword):
-                reference_action_processed = True
-        elif intent == "update_priority":
-            base_keyword = parsed.get("task_keyword") or parsed.get("title")
-            keyword = _extract_task_keyword(str(base_keyword or "")) or _extract_task_keyword(message)
-            history_keyword = _infer_keyword_from_history(
-                db,
-                message,
-                history_context,
-                statuses=("todo", "in_progress", "blocked"),
-            )
-            if reference_mode and history_keyword:
-                keyword = history_keyword
-            elif not keyword or _is_generic_keyword(keyword):
-                keyword = history_keyword
-            reply, actions, refresh = _update_priority(db, keyword, parsed.get("priority"))
-            if reference_mode and (keyword or history_keyword):
-                reference_action_processed = True
-        elif intent == "update_due":
-            base_keyword = parsed.get("task_keyword") or parsed.get("title")
-            keyword = _extract_task_keyword(str(base_keyword or "")) or _extract_task_keyword(message)
-            history_keyword = _infer_keyword_from_history(
-                db,
-                message,
-                history_context,
-                statuses=("todo", "in_progress", "blocked"),
-            )
-            if reference_mode and history_keyword:
-                keyword = history_keyword
-            elif not keyword or _is_generic_keyword(keyword):
-                keyword = history_keyword
-            due = _parse_due(parsed.get("due"), message)
-            reply, actions, refresh = _update_due(db, keyword, due)
-            if reference_mode and (keyword or history_keyword):
-                reference_action_processed = True
-        else:
-            continue
 
+        reply, actions, refresh = _run_one_action(
+            db,
+            parsed,
+            message=message,
+            history_context=history_context,
+            require_confirmation=True,
+        )
         reply_parts.append(reply)
         merged_actions.extend(actions)
         refresh_set.update(refresh)
 
+        if reference_mode and intent in {"complete_task", "update_priority", "update_due"}:
+            reference_action_processed = True
+
     if not reply_parts:
+        question = _clarification_question(message, plan_note)
+        clarification_req = _queue_chat_clarification(db, question, message)
         return AssistantChatResponse(
-            reply=(
-                "요청 의도를 명확히 파악하지 못했습니다. 예시: "
-                "'내일 오전 보고서 작업 추가', '보고서 작업 완료 처리', "
-                "'오후 6시 이후 일정 모두 재배치', '현재 중복되는 태스크 정리', "
-                "'이번주 일정 재배치', '회의록: ...', '보고서 마감 내일 오후 5시로 변경'"
-            ),
-            actions=[],
-            refresh=[],
+            reply=f"{question}\n답변해 주시면 이어서 처리합니다.",
+            actions=[AssistantActionOut(type="clarification_requested", detail={"clarification_id": clarification_req.id})],
+            refresh=["approvals"],
         )
 
     merged_reply = "\n".join(f"{index + 1}. {part}" for index, part in enumerate(reply_parts))

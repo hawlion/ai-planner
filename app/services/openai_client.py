@@ -356,7 +356,7 @@ def parse_assistant_plan_openai(
         " Never use a generic one-word keyword like '작업', '고객', '미팅'."
         " For requests like 'after 6pm' or '오후 6시 이후', use reschedule_after_hour and set cutoff_hour."
         " For duplicate cleanup requests, use delete_duplicate_tasks."
-        " If matching is uncertain, keep intent as unknown."
+        " If matching is uncertain, keep intent as unknown and set note as one concise clarification question in Korean."
         " due should be ISO-8601 datetime when inferable, else null."
         " If message is meeting notes/transcript, use register_meeting_note with full note in meeting_note."
         " For meeting-note messages, do not generate extra create_task actions."
