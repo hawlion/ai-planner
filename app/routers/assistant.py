@@ -65,6 +65,73 @@ GENERIC_KEYWORDS = {
     "보고서",
     "준비",
 }
+GENERIC_EVENT_TITLES = {
+    "일정",
+    "스케줄",
+    "캘린더",
+    "미팅",
+    "회의",
+    "약속",
+    "event",
+    "calendar",
+    "meeting",
+    "call",
+    "sync",
+}
+GENERIC_TASK_TITLES = {
+    "작업",
+    "업무",
+    "할일",
+    "할 일",
+    "태스크",
+    "task",
+    "todo",
+    "to-do",
+}
+TITLE_DROP_TOKENS = {
+    "추가",
+    "등록",
+    "생성",
+    "만들어",
+    "만들어줘",
+    "만들",
+    "잡아",
+    "잡아줘",
+    "해줘",
+    "해주세요",
+    "부탁",
+    "좀",
+    "일정",
+    "스케줄",
+    "캘린더",
+    "event",
+    "calendar",
+    "할일",
+    "할",
+    "일",
+    "태스크",
+    "task",
+    "todo",
+    "to-do",
+    "오늘",
+    "내일",
+    "모레",
+    "이번주",
+    "다음주",
+    "금주",
+    "오전",
+    "오후",
+    "저녁",
+    "아침",
+    "밤",
+    "새벽",
+    "이후",
+    "부터",
+    "까지",
+    "에",
+    "로",
+    "으로",
+}
 REFERENCE_TOKENS = {
     "그거",
     "그 일정",
@@ -594,6 +661,192 @@ def _extract_task_keyword(raw_text: str) -> str | None:
     return keyword if len(keyword) >= 2 else None
 
 
+def _strip_korean_particle(token: str) -> str:
+    return re.sub(r"(은|는|이|가|을|를|에|에게|와|과|도|로|으로|부터|까지|에서)$", "", token)
+
+
+def _contains_datetime_phrase(text: str) -> bool:
+    lowered = text.lower()
+    if re.search(r"\d{1,2}\s*:\s*\d{2}", lowered):
+        return True
+    if re.search(r"\d{1,2}\s*시(?:\s*\d{1,2}\s*분)?", text):
+        return True
+    if any(token in lowered for token in ["today", "tomorrow", "next week", "this week"]):
+        return True
+    if re.search(r"\b(am|pm)\b", lowered):
+        return True
+    if any(token in text for token in ["오늘", "내일", "모레", "이번주", "다음주", "오전", "오후", "아침", "저녁", "밤", "새벽"]):
+        return True
+    return any(token in text for token in ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"])
+
+
+def _clean_candidate_title(raw_title: str | None) -> str:
+    title = str(raw_title or "").replace("\n", " ").strip()
+    if not title:
+        return ""
+
+    title = re.sub(r"\s+", " ", title)
+    title = title.strip(" '\"`[](){}.,:;")
+    # Remove command-like suffix to keep only the semantic title.
+    title = re.sub(
+        r"(?:일정|스케줄|캘린더|event|calendar)\s*(?:추가|등록|생성|만들어줘|만들어|만들|잡아줘|잡아)$",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    ).strip()
+    title = re.sub(
+        r"(?:할일|할 일|태스크|task|todo|to-do)\s*(?:추가|등록|생성|만들어줘|만들어|만들)$",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    ).strip()
+    title = re.sub(r"\s+", " ", title)
+    return title[:120].strip()
+
+
+def _looks_like_datetime_token(token: str) -> bool:
+    if not token:
+        return False
+    if token in WEEKDAY_KO or token.endswith("요일"):
+        return True
+    if token in {"오늘", "내일", "모레", "이번주", "다음주", "금주", "today", "tomorrow"}:
+        return True
+    if re.fullmatch(r"\d{1,2}(?::\d{2})?", token):
+        return True
+    if re.fullmatch(r"(?:am|pm)?\d{1,2}(?::\d{2})?(?:am|pm)?", token.lower()):
+        return True
+    if re.fullmatch(r"(?:오전|오후|아침|저녁|밤|새벽)?\d{1,2}시(?:\d{1,2}분?)?", token):
+        return True
+    return bool(re.search(r"\d{1,2}\s*시|\d{1,2}\s*:\s*\d{2}", token))
+
+
+def _extract_title_from_message(message: str, *, intent: str) -> str | None:
+    text = _clean_candidate_title(message)
+    if not text:
+        return None
+
+    quoted_match = re.search(r"[\"'“”‘’]([^\"'“”‘’]{2,120})[\"'“”‘’]", text)
+    if quoted_match:
+        quoted = _clean_candidate_title(quoted_match.group(1))
+        if quoted:
+            return quoted
+
+    tokens: list[str] = []
+    for raw_token in re.split(r"\s+", text):
+        trimmed = re.sub(r"^[^0-9A-Za-z가-힣]+|[^0-9A-Za-z가-힣]+$", "", raw_token)
+        if not trimmed:
+            continue
+
+        lowered = _strip_korean_particle(trimmed.lower())
+        if not lowered:
+            continue
+        if lowered in TITLE_DROP_TOKENS:
+            continue
+        if lowered in {"am", "pm"} or _looks_like_datetime_token(lowered):
+            continue
+
+        tokens.append(trimmed)
+
+    candidate = _clean_candidate_title(" ".join(tokens))
+    if not candidate:
+        return None
+
+    if intent == "create_task":
+        candidate = re.sub(r"^(?:할일|할 일|task|todo)\s+", "", candidate, flags=re.IGNORECASE).strip()
+
+    return candidate or None
+
+
+def _is_ambiguous_creation_title(title: str | None, *, intent: str) -> bool:
+    cleaned = _clean_candidate_title(title)
+    if not cleaned:
+        return True
+
+    tokens: list[str] = []
+    for raw in re.split(r"\s+", cleaned):
+        lowered = _strip_korean_particle(re.sub(r"[^0-9A-Za-z가-힣]+", "", raw.lower()))
+        if not lowered:
+            continue
+        if lowered in TITLE_DROP_TOKENS:
+            continue
+        if _looks_like_datetime_token(lowered):
+            continue
+        if intent == "create_event" and lowered in {"일정", "스케줄", "캘린더", "event", "calendar"}:
+            continue
+        if intent == "create_task" and lowered in {"작업", "업무", "할일", "할", "일", "태스크", "task", "todo", "to-do"}:
+            continue
+        tokens.append(lowered)
+
+    if not tokens:
+        return True
+
+    if len(tokens) == 1:
+        token = tokens[0]
+        generic_pool = GENERIC_EVENT_TITLES if intent == "create_event" else GENERIC_TASK_TITLES
+        if token in generic_pool:
+            return True
+        if len(_normalize_text(token)) <= 2:
+            return True
+
+    return False
+
+
+def _title_quality_score(title: str, *, intent: str) -> int:
+    cleaned = _clean_candidate_title(title)
+    if not cleaned:
+        return -999
+
+    score = 0
+    if not _is_ambiguous_creation_title(cleaned, intent=intent):
+        score += 50
+
+    token_count = len([token for token in cleaned.split() if token.strip()])
+    if 1 <= token_count <= 5:
+        score += 10
+    elif token_count >= 9:
+        score -= 10
+
+    if len(cleaned) <= 30:
+        score += 8
+    elif len(cleaned) >= 50:
+        score -= 12
+
+    lowered = cleaned.lower()
+    if any(token in lowered for token in ["추가", "등록", "생성", "만들", "잡아", "해줘", "해주세요"]):
+        score -= 24
+    if _contains_datetime_phrase(cleaned):
+        score -= 20
+    return score
+
+
+def _resolve_creation_title(action: dict, message: str, *, intent: str) -> str | None:
+    raw_candidates = [
+        str(action.get("title") or "").strip(),
+        str(action.get("task_keyword") or "").strip(),
+        _extract_title_from_message(message, intent=intent) or "",
+    ]
+
+    best_title: str | None = None
+    best_score = -999
+    seen: set[str] = set()
+
+    for raw in raw_candidates:
+        cleaned = _clean_candidate_title(raw)
+        if not cleaned:
+            continue
+        normalized = _normalize_text(cleaned)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+
+        score = _title_quality_score(cleaned, intent=intent)
+        if score > best_score:
+            best_title = cleaned
+            best_score = score
+
+    return best_title
+
+
 def _extract_titles_from_assistant_text(text: str) -> list[str]:
     markers = [
         "할일을 생성했습니다:",
@@ -676,6 +929,15 @@ def _needs_clarification_for_action(
         due = _parse_due(action.get("start") or action.get("due"), message)
         if due is None:
             return "일정 시간을 알려주세요. 예: '이번주 목요일 오후 3시 미팅 일정 추가'."
+        title = _resolve_creation_title(action, message, intent="create_event")
+        if _is_ambiguous_creation_title(title, intent="create_event"):
+            return "일정 제목이 모호합니다. 어떤 일정인지 한 번 더 알려주세요. 예: '공인알림 미팅'."
+        return None
+
+    if intent == "create_task":
+        title = _resolve_creation_title(action, message, intent="create_task")
+        if _is_ambiguous_creation_title(title, intent="create_task"):
+            return "할일 제목이 모호합니다. 어떤 작업인지 한 번 더 알려주세요. 예: '고객사 견적서 검토'."
         return None
 
     if intent in {"delete_task", "start_task", "update_task"}:
@@ -1673,14 +1935,14 @@ def _run_one_action(
         return _register_meeting_and_apply(db, parsed.get("meeting_note") or message)
 
     if intent == "create_task":
-        title = (parsed.get("title") or parsed.get("task_keyword") or message).strip()
+        title = _resolve_creation_title(parsed, message, intent="create_task") or "새 작업"
         due = _parse_due(parsed.get("due"), message)
         effort = int(parsed.get("effort_minutes") or 60)
         priority = str(parsed.get("priority") or "medium")
         return _create_task_from_message(db, title, due, effort, priority)
 
     if intent == "create_event":
-        title = (parsed.get("title") or "새 일정").strip()
+        title = _resolve_creation_title(parsed, message, intent="create_event") or "새 일정"
         start = _parse_due(parsed.get("start") or parsed.get("due"), message)
         duration = int(parsed.get("duration_minutes") or parsed.get("effort_minutes") or 60)
         return _create_event_from_message(db, title, start, duration)

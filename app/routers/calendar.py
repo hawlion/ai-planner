@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.models import CalendarBlock
 from app.schemas import CalendarBlockCreate, CalendarBlockOut, CalendarBlockPatch
+from app.services.graph_service import GraphApiError, GraphAuthError, delete_blocks_from_outlook, is_graph_connected
 
 router = APIRouter(prefix="/calendar/blocks", tags=["calendar"])
 
@@ -88,6 +89,23 @@ def delete_block(block_id: str, db: Session = Depends(get_db)) -> dict:
     row = db.get(CalendarBlock, block_id)
     if row is None:
         return {"deleted": False, "block_id": block_id}
+
+    outlook_deleted = 0
+    outlook_event_id = (row.outlook_event_id or "").strip()
+    if outlook_event_id:
+        if not is_graph_connected(db):
+            raise HTTPException(
+                status_code=409,
+                detail="Outlook 연동이 끊겨 일정 원본을 삭제할 수 없습니다. 다시 연결 후 삭제해 주세요.",
+            )
+        try:
+            result = delete_blocks_from_outlook(db, [row])
+        except (GraphAuthError, GraphApiError) as exc:
+            raise HTTPException(status_code=502, detail=f"Outlook 일정 삭제 실패: {exc}") from exc
+        if int(result.get("failed", 0)) > 0:
+            raise HTTPException(status_code=502, detail="Outlook 일정 삭제에 실패했습니다. 잠시 후 다시 시도해 주세요.")
+        outlook_deleted = int(result.get("deleted", 0))
+
     db.delete(row)
     db.commit()
-    return {"deleted": True, "block_id": block_id}
+    return {"deleted": True, "block_id": block_id, "outlook_deleted": outlook_deleted}

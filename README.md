@@ -61,6 +61,33 @@ uvicorn app.main:app --reload --port 8000
   - `OPENAI_TEMPERATURE=0.2`
   - `OPENAI_ASSISTANT_TEMPERATURE=0.1`
 
+## Assistant Intent Schema
+- `create_task`: 할일 생성
+- `update_task`: 할일 필드(제목/마감/우선순위/상태/설명/소요시간) 수정
+- `delete_task`: 할일 삭제
+- `start_task`: 할일 상태를 `in_progress`로 변경
+- `complete_task`: 할일 완료 처리
+- `update_priority`: 할일 우선순위 변경
+- `update_due`: 할일 마감 변경
+- `list_tasks`: 할일 목록 조회
+- `create_event`: 캘린더 일정 생성
+- `move_event`: 일정 시간 이동
+- `update_event`: 일정 제목 수정
+- `delete_event`: 일정 삭제
+- `list_events`: 특정 날짜 일정 목록 조회
+- `find_free_time`: 빈 시간대 탐색
+- `reschedule_request`: 재배치 제안 생성/적용
+- `reschedule_after_hour`: 특정 시각 이후 일정 재배치
+- `delete_duplicate_tasks`: 중복 태스크 정리
+- `register_meeting_note`: 회의록 등록 + 액션아이템 추출
+- `unknown`: 의도 불명확(명확화 질문 생성)
+
+주요 공통 필드:
+- `title`, `task_keyword`, `new_title`
+- `due`, `start`, `end`, `target_date`
+- `effort_minutes`, `duration_minutes`
+- `priority`, `status`, `description`, `limit`
+
 ## 주요 API
 - `GET/PATCH /api/profile`
 - `POST /api/assistant/chat`

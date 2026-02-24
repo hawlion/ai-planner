@@ -278,18 +278,55 @@ async function loadCalendarData() {
 }
 
 async function deleteCalendarBlock(id, isOutlook) {
-  if (isOutlook) {
-    notify("Outlook 일정은 아직 직접 삭제할 수 없습니다.", true);
-    return;
-  }
+  const rawId = String(id || "");
+  const isLocal = rawId.startsWith("local-");
+  const isRemoteOutlook = rawId.startsWith("outlook-");
+
   try {
-    await api(`/calendar/blocks/${id.replace('local-', '')}`, { method: "DELETE" });
+    notify("일정 삭제 중...");
+
+    if (isLocal) {
+      await api(`/calendar/blocks/${rawId.replace("local-", "")}`, { method: "DELETE" });
+    } else if (isRemoteOutlook) {
+      await api(`/graph/calendar/events/${encodeURIComponent(rawId.replace("outlook-", ""))}`, { method: "DELETE" });
+    } else if (isOutlook) {
+      await api(`/graph/calendar/events/${encodeURIComponent(rawId)}`, { method: "DELETE" });
+    } else {
+      await api(`/calendar/blocks/${rawId}`, { method: "DELETE" });
+    }
+
     notify("일정이 삭제되었습니다.");
     closeEventModal();
     await refreshCalendarOnly();
   } catch (error) {
     notify(`삭제 실패: ${error.message}`, true);
   }
+}
+
+function bindEventDeleteButtons(container) {
+  if (!container) return;
+  container.querySelectorAll(".event-delete[data-event-id]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const encodedId = button.dataset.eventId || "";
+      const rawId = encodedId ? decodeURIComponent(encodedId) : "";
+      const isOutlook = (button.dataset.eventOutlook || "0") === "1";
+      if (!rawId) return;
+      deleteCalendarBlock(rawId, isOutlook);
+    });
+  });
+}
+
+function bindEventOpenTargets(container) {
+  if (!container) return;
+  container.querySelectorAll("[data-open-event-id]").forEach((target) => {
+    target.addEventListener("click", () => {
+      const encodedId = target.dataset.openEventId || "";
+      if (!encodedId) return;
+      openEventModal(decodeURIComponent(encodedId));
+    });
+  });
 }
 
 function toLocalDatetimeValue(date) {
@@ -476,9 +513,10 @@ function renderWeekGrid() {
         const width = 100 / event.lanes;
 
         const isOutlook = event.kind === "outlook" || event.kind === "mixed";
+        const encodedId = encodeURIComponent(event.id);
         return `
-          <div class="calendar-event ${event.kind}" style="top:${top}px;height:${height}px;left:calc(${left}% + 2px);width:calc(${width}% - 4px);" onclick="openEventModal('${event.id}')">
-            <button class="event-delete" onclick="event.stopPropagation(); deleteCalendarBlock('${event.id}', ${isOutlook})" title="일정 삭제">×</button>
+          <div class="calendar-event ${event.kind}" data-open-event-id="${encodedId}" style="top:${top}px;height:${height}px;left:calc(${left}% + 2px);width:calc(${width}% - 4px);">
+            <button class="event-delete" data-event-id="${encodedId}" data-event-outlook="${isOutlook ? "1" : "0"}" title="일정 삭제">×</button>
             <div class="event-time">${fmtTime(event.start)}</div>
             <div class="event-title">${escapeHtml(event.title)}</div>
           </div>
@@ -507,6 +545,8 @@ function renderWeekGrid() {
   });
 
   container.innerHTML = dayColumns.join("");
+  bindEventOpenTargets(container);
+  bindEventDeleteButtons(container);
   container.querySelectorAll("[data-day-column]").forEach((el) => {
     el.addEventListener("click", () => {
       state.selectedDate = startOfDay(new Date(el.dataset.dayColumn));
@@ -536,11 +576,12 @@ function renderAgenda() {
       const tags = [`<span class="tag">${event.kind === "outlook" ? "Outlook" : "Local"}</span>`];
       if (event.kind === "mixed") tags.push('<span class="tag outlook">Synced</span>');
       const isOutlook = event.kind === "outlook" || event.kind === "mixed";
+      const encodedId = encodeURIComponent(event.id);
       return `
-        <div class="agenda-item" onclick="openEventModal('${event.id}')">
+        <div class="agenda-item" data-open-event-id="${encodedId}">
           <div style="display: flex; justify-content: space-between; align-items: flex-start;">
             <div class="agenda-title">${escapeHtml(event.title)}</div>
-            <button class="event-delete" style="position: relative; opacity: 1; opacity: 0.7;" onclick="event.stopPropagation(); deleteCalendarBlock('${event.id}', ${isOutlook})" title="일정 삭제">×</button>
+            <button class="event-delete" style="position: relative; opacity: 1; opacity: 0.7;" data-event-id="${encodedId}" data-event-outlook="${isOutlook ? "1" : "0"}" title="일정 삭제">×</button>
           </div>
           <div class="agenda-meta">${fmtDateTime(event.start)} - ${fmtTime(event.end)}</div>
           <div class="meta-row">${tags.join("")}</div>
@@ -548,6 +589,10 @@ function renderAgenda() {
       `;
     })
     .join("");
+
+  const agenda = $("agenda-list");
+  bindEventOpenTargets(agenda);
+  bindEventDeleteButtons(agenda);
 }
 
 function renderMiniMonth() {

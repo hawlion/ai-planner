@@ -4,9 +4,11 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
+from app.models import CalendarBlock
 from app.schemas import GraphAuthUrlOut, GraphCalendarEventCreate, GraphStatusOut, GraphTodoTaskCreate
 from app.services.graph_service import (
     GraphApiError,
@@ -16,6 +18,7 @@ from app.services.graph_service import (
     create_auth_url,
     create_calendar_event,
     create_todo_task,
+    delete_calendar_event,
     disconnect_graph,
     export_calendar_to_outlook,
     format_graph_datetime,
@@ -133,6 +136,28 @@ def graph_create_event(payload: GraphCalendarEventCreate, db: Session = Depends(
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except GraphApiError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@router.delete("/calendar/events/{event_id:path}")
+def graph_delete_event(event_id: str, db: Session = Depends(get_db)) -> dict:
+    try:
+        delete_calendar_event(db, event_id)
+    except GraphAuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except GraphApiError as exc:
+        if exc.status_code != 404:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    linked_rows = db.execute(
+        select(CalendarBlock).where(CalendarBlock.outlook_event_id == event_id)
+    ).scalars().all()
+    deleted_local = 0
+    for row in linked_rows:
+        db.delete(row)
+        deleted_local += 1
+    db.commit()
+
+    return {"deleted": True, "event_id": event_id, "deleted_local_blocks": deleted_local}
 
 
 @router.post("/calendar/import")
