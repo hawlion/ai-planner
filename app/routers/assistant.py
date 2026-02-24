@@ -1366,6 +1366,15 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
     ]
     pending_clarification = _latest_pending_approval(db, types=(CHAT_CLARIFICATION_TYPE,))
     if pending_clarification:
+        incoming_rule = _fallback_classify(message, allow_openai_nli=False)
+        if str(incoming_rule.get("intent") or "unknown") != "unknown":
+            pending_clarification.status = "rejected"
+            pending_clarification.resolved_at = datetime.utcnow()
+            pending_clarification.reason = "clarification_superseded_by_new_command"
+            db.commit()
+            pending_clarification = None
+
+    if pending_clarification:
         if _is_negative(message):
             pending_clarification.status = "rejected"
             pending_clarification.resolved_at = datetime.utcnow()

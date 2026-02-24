@@ -505,42 +505,51 @@ select:focus {
   position: absolute;
   border-radius: var(--radius-sm);
   padding: 6px 8px;
-  color: #fff;
+  color: var(--ink);
+  /* Switch to dark text by default */
   font-size: 12px;
   overflow: hidden;
-  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.1);
-  border-left: 4px solid rgba(255, 255, 255, 0.5);
+  box-shadow: none;
+  /* Flat */
+  border-left: 3px solid rgba(0, 0, 0, 0.1);
+  /* Subtle definition */
   transition: transform 0.2s ease, box-shadow 0.2s ease;
 }
 
 .calendar-event:hover {
   transform: scale(1.02);
   z-index: 10;
-  box-shadow: 0 8px 16px rgba(15, 23, 42, 0.15);
+  box-shadow: var(--shadow-hover);
 }
 
 .calendar-event.local {
-  background: var(--brand);
+  background: var(--purple-bg);
+  color: var(--purple-txt);
+  border-left-color: var(--purple-txt);
 }
 
 .calendar-event.outlook {
-  background: var(--green);
+  background: var(--green-bg);
+  color: var(--green-txt);
+  border-left-color: var(--green-txt);
 }
 
 .calendar-event.mixed {
-  background: linear-gradient(135deg, var(--brand), var(--green));
+  background: var(--blue-bg);
+  color: var(--blue-txt);
+  border-left-color: var(--blue-txt);
 }
 
 .event-time {
-  opacity: 0.9;
+  opacity: 0.8;
   font-size: 11px;
   margin-bottom: 2px;
-  font-weight: 500;
+  font-weight: 600;
 }
 
 .event-title {
   margin-top: 0;
-  font-weight: 600;
+  font-weight: 500;
   line-height: 1.3;
 }
 

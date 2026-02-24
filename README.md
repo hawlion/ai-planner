@@ -48,11 +48,11 @@ uvicorn app.main:app --reload --port 8000
 5. `.env`에 `MS_CLIENT_ID`, `MS_CLIENT_SECRET`, `MS_TENANT_ID` 입력
 
 ## OpenAI 모델 상향 설정(권장)
-- 기본값은 `OPENAI_MODEL=gpt-5` 입니다.
+- 기본값은 `OPENAI_MODEL=gpt-5-mini` 입니다.
 - 자연어 명령 이해를 강화하려면 아래처럼 분리 설정하세요.
-  - `OPENAI_ASSISTANT_MODEL=gpt-5`
-  - `OPENAI_NLI_MODEL=gpt-5`
-  - `OPENAI_EXTRACTION_MODEL=gpt-5`
+  - `OPENAI_ASSISTANT_MODEL=gpt-5-mini`
+  - `OPENAI_NLI_MODEL=gpt-5-mini`
+  - `OPENAI_EXTRACTION_MODEL=gpt-5-mini`
   - `OPENAI_FALLBACK_MODEL=gpt-5-mini`
 - 고성능 모델 호출이 실패/미지원일 때는 자동으로 fallback 모델을 사용합니다.
 
