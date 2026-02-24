@@ -400,6 +400,37 @@ def create_calendar_event(db: Session, payload: dict) -> dict:
     return graph_request(db, "POST", "/me/events", json_body=payload)
 
 
+def delete_calendar_event(db: Session, event_id: str) -> None:
+    graph_request(db, "DELETE", f"/me/events/{event_id}")
+
+
+def delete_blocks_from_outlook(db: Session, blocks: list[CalendarBlock]) -> dict:
+    deleted = 0
+    skipped = 0
+    failed = 0
+
+    for block in blocks:
+        event_id = (block.outlook_event_id or "").strip()
+        if not event_id:
+            skipped += 1
+            continue
+
+        try:
+            delete_calendar_event(db, event_id)
+            deleted += 1
+        except GraphApiError as exc:
+            if exc.status_code == 404:
+                deleted += 1
+            else:
+                failed += 1
+                continue
+
+        block.outlook_event_id = None
+
+    db.commit()
+    return {"blocks": len(blocks), "deleted": deleted, "skipped": skipped, "failed": failed}
+
+
 def _block_event_payload(block: CalendarBlock) -> dict:
     payload: dict = {
         "subject": block.title or "AAWO Block",
@@ -538,8 +569,9 @@ def import_calendar_to_local(db: Session, start: datetime, end: datetime) -> dic
         row.title = event.get("subject") or row.title
         row.start = start_dt
         row.end = end_dt
-        row.source = "external"
-        row.locked = True
+        if row.source == "external":
+            row.source = "external"
+            row.locked = True
         imported += 1
 
     db.commit()

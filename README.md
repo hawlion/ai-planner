@@ -16,6 +16,7 @@
 - Microsoft Graph OAuth: Outlook Calendar / Microsoft To Do 실연동
 - Outlook 캘린더 양방향 반영: 가져오기(import) + 로컬 블록 내보내기(export)
 - AI Assistant Chat: 회의록 등록/할일 조정/일정 재배치를 대화로 실행
+  - 예: `오후 6시 이후 일정들 모두 재배치해줘`, `현재 중복되는 태스크들 삭제해줘`
 
 ## 기술 스택
 - Backend: FastAPI + SQLAlchemy + SQLite
@@ -44,6 +45,15 @@ uvicorn app.main:app --reload --port 8000
 4. Certificates & secrets에서 Client secret 생성
 5. `.env`에 `MS_CLIENT_ID`, `MS_CLIENT_SECRET`, `MS_TENANT_ID` 입력
 
+## OpenAI 모델 상향 설정(권장)
+- 기본값은 `OPENAI_MODEL=gpt-5` 입니다.
+- 자연어 명령 이해를 강화하려면 아래처럼 분리 설정하세요.
+  - `OPENAI_ASSISTANT_MODEL=gpt-5`
+  - `OPENAI_NLI_MODEL=gpt-5`
+  - `OPENAI_EXTRACTION_MODEL=gpt-5`
+  - `OPENAI_FALLBACK_MODEL=gpt-5-mini`
+- 고성능 모델 호출이 실패/미지원일 때는 자동으로 fallback 모델을 사용합니다.
+
 ## 주요 API
 - `GET/PATCH /api/profile`
 - `POST /api/assistant/chat`
@@ -70,6 +80,7 @@ uvicorn app.main:app --reload --port 8000
 ## 참고
 - 현재 DB는 로컬 `aawo.db` 파일을 사용합니다.
 - `OPENAI_API_KEY`가 설정되면 회의 Action Item 추출과 NLI 의도 파싱에 OpenAI API를 우선 사용합니다.
+- Assistant Chat은 최근 대화 히스토리를 함께 전달해 문맥 기반 후속 명령(예: "그거 내일로 옮겨줘") 해석 정확도를 높였습니다.
 - 키가 없거나 OpenAI 호출이 실패하면 기존 규칙 기반 파서로 자동 폴백합니다.
 - Microsoft OAuth Redirect URI는 `http://localhost:8000/api/graph/auth/callback`로 Azure App Registration에 등록해야 합니다.
 - 필요 권한(scope): `User.Read`, `offline_access`, `Calendars.ReadWrite`, `Tasks.ReadWrite`

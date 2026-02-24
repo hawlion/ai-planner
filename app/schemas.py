@@ -345,8 +345,14 @@ class GraphTodoTaskCreate(BaseModel):
     body: str | None = None
 
 
+class AssistantChatTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    text: str = Field(min_length=1, max_length=2000)
+
+
 class AssistantChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
+    history: list[AssistantChatTurn] = Field(default_factory=list, max_length=20)
 
 
 class AssistantActionOut(BaseModel):

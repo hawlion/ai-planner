@@ -64,6 +64,58 @@ class AssistantActionOutput(BaseModel):
     note: str | None = ""
 
 
+class AssistantPlanAction(BaseModel):
+    intent: Literal[
+        "create_task",
+        "reschedule_request",
+        "reschedule_after_hour",
+        "complete_task",
+        "update_priority",
+        "update_due",
+        "delete_duplicate_tasks",
+        "register_meeting_note",
+        "unknown",
+    ]
+    title: str | None = None
+    task_keyword: str | None = None
+    due: str | None = None
+    cutoff_hour: int | None = Field(default=None, ge=0, le=23)
+    effort_minutes: int | None = Field(default=None, ge=15, le=8 * 60)
+    priority: Literal["low", "medium", "high", "critical"] | None = None
+    meeting_note: str | None = None
+    reschedule_hint: str | None = None
+
+
+class AssistantPlanOutput(BaseModel):
+    actions: list[AssistantPlanAction] = Field(default_factory=list)
+    note: str | None = ""
+
+
+
+MODEL_PURPOSE = Literal["default", "assistant", "nli", "extraction"]
+
+
+def _model_candidates(purpose: MODEL_PURPOSE) -> list[str]:
+    candidates: list[str] = []
+    if purpose == "assistant":
+        candidates.append(settings.openai_assistant_model)
+    elif purpose == "nli":
+        candidates.append(settings.openai_nli_model)
+    elif purpose == "extraction":
+        candidates.append(settings.openai_extraction_model)
+
+    candidates.extend([settings.openai_model, settings.openai_fallback_model])
+
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for model in candidates:
+        name = (model or "").strip()
+        if not name or name in seen:
+            continue
+        deduped.append(name)
+        seen.add(name)
+    return deduped
+
 
 def is_openai_available() -> bool:
     return bool(settings.openai_api_key and OpenAI is not None)
@@ -79,33 +131,52 @@ def _client() -> OpenAI:
 
 
 
-def _chat_json(system_prompt: str, user_prompt: str) -> dict:
+def _chat_json(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    purpose: MODEL_PURPOSE = "default",
+    temperature: float | None = None,
+) -> dict:
     client = _client()
+    models = _model_candidates(purpose)
+    if not models:
+        raise OpenAIIntegrationError("No OpenAI model candidates configured")
 
-    try:
-        response = client.chat.completions.create(
-            model=settings.openai_model,
-            temperature=0.1,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
-    except Exception as exc:  # noqa: BLE001
-        raise OpenAIIntegrationError(f"OpenAI API request failed: {exc}") from exc
+    temp = settings.openai_temperature if temperature is None else float(temperature)
+    last_error: Exception | None = None
 
-    content = ""
-    try:
-        content = response.choices[0].message.content or "{}"
-        if isinstance(content, list):
-            content = "".join(
-                part.get("text", "") if isinstance(part, dict) else str(part)
-                for part in content
+    for model in models:
+        content = ""
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                temperature=temp,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
             )
-        return json.loads(content)
-    except Exception as exc:  # noqa: BLE001
-        raise OpenAIIntegrationError(f"OpenAI response parse failed: {exc}; raw={content!r}") from exc
+            content = response.choices[0].message.content or "{}"
+            if isinstance(content, list):
+                content = "".join(
+                    part.get("text", "") if isinstance(part, dict) else str(part)
+                    for part in content
+                )
+            return json.loads(content)
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            logger.warning(
+                "OpenAI request failed for purpose=%s model=%s: %s",
+                purpose,
+                model,
+                exc,
+            )
+
+    raise OpenAIIntegrationError(
+        f"OpenAI API request failed for all models={models}: {last_error}"
+    ) from last_error
 
 
 
@@ -156,7 +227,7 @@ def extract_action_items_openai(transcript: list[dict], summary: str | None, bas
         f"{'\n'.join(transcript_lines)}"
     )
 
-    payload = _chat_json(system_prompt, user_prompt)
+    payload = _chat_json(system_prompt, user_prompt, purpose="extraction")
     try:
         envelope = ActionItemsEnvelope.model_validate(payload)
     except ValidationError as exc:
@@ -204,7 +275,7 @@ def parse_nli_openai(text: str, base_dt: datetime) -> NLIOutput:
         f"command={text}"
     )
 
-    payload = _chat_json(system_prompt, user_prompt)
+    payload = _chat_json(system_prompt, user_prompt, purpose="nli")
     try:
         parsed = NLIOutput.model_validate(payload)
     except ValidationError as exc:
@@ -231,10 +302,85 @@ def parse_assistant_action_openai(text: str, base_dt: datetime) -> AssistantActi
         f"user_message={text}"
     )
 
-    payload = _chat_json(system_prompt, user_prompt)
+    payload = _chat_json(
+        system_prompt,
+        user_prompt,
+        purpose="assistant",
+        temperature=settings.openai_assistant_temperature,
+    )
     try:
         parsed = AssistantActionOutput.model_validate(payload)
     except ValidationError as exc:
         raise OpenAIIntegrationError(f"OpenAI assistant action schema validation failed: {exc}") from exc
+
+    return parsed
+
+
+def parse_assistant_plan_openai(
+    text: str,
+    base_dt: datetime,
+    task_context: list[dict],
+    history: list[dict] | None = None,
+) -> AssistantPlanOutput:
+    context_lines: list[str] = []
+    for item in task_context[:40]:
+        context_lines.append(
+            "- title={title} | status={status} | priority={priority} | due={due}".format(
+                title=item.get("title") or "",
+                status=item.get("status") or "",
+                priority=item.get("priority") or "",
+                due=item.get("due") or "",
+            )
+        )
+
+    history_lines: list[str] = []
+    for turn in (history or [])[-8:]:
+        role = str(turn.get("role") or "").strip().lower()
+        text_value = str(turn.get("text") or "").strip()
+        if role not in {"user", "assistant"} or not text_value:
+            continue
+        history_lines.append(f"{role}: {text_value}")
+
+    system_prompt = (
+        "You are an action planner for a Korean/English work assistant."
+        " Return strict JSON only with shape:"
+        ' {"actions":[{"intent":string,"title":string|null,"task_keyword":string|null,"due":string|null,'
+        '"cutoff_hour":int|null,"effort_minutes":int|null,"priority":string|null,'
+        '"meeting_note":string|null,"reschedule_hint":string|null}],'
+        '"note":string|null}.'
+        " Supported intent values are:"
+        " create_task, reschedule_request, reschedule_after_hour, complete_task, update_priority,"
+        " update_due, delete_duplicate_tasks, register_meeting_note, unknown."
+        " Parse multiple requests in one message into multiple actions in order."
+        " For complete/update actions, choose task_keyword from existing task titles and make it specific."
+        " Never use a generic one-word keyword like '작업', '고객', '미팅'."
+        " For requests like 'after 6pm' or '오후 6시 이후', use reschedule_after_hour and set cutoff_hour."
+        " For duplicate cleanup requests, use delete_duplicate_tasks."
+        " If matching is uncertain, keep intent as unknown."
+        " due should be ISO-8601 datetime when inferable, else null."
+        " If message is meeting notes/transcript, use register_meeting_note with full note in meeting_note."
+        " For meeting-note messages, do not generate extra create_task actions."
+        " Resolve references like '그거/방금 거/that one' using recent conversation when possible."
+        " Keep actions concise and executable."
+    )
+
+    user_prompt = (
+        f"timezone={settings.timezone}\n"
+        f"base_datetime={base_dt.isoformat()}\n"
+        f"recent_conversation:\n{'\n'.join(history_lines) if history_lines else '(none)'}\n"
+        f"existing_tasks:\n{'\n'.join(context_lines)}\n"
+        f"user_message={text}"
+    )
+
+    payload = _chat_json(
+        system_prompt,
+        user_prompt,
+        purpose="assistant",
+        temperature=settings.openai_assistant_temperature,
+    )
+    try:
+        parsed = AssistantPlanOutput.model_validate(payload)
+    except ValidationError as exc:
+        raise OpenAIIntegrationError(f"OpenAI assistant plan schema validation failed: {exc}") from exc
 
     return parsed

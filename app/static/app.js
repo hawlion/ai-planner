@@ -1,13 +1,20 @@
 const API = "/api";
+const HOUR_START = 7;
+const HOUR_END = 22;
+const HOUR_HEIGHT = 56;
+const MIN_EVENT_HEIGHT = 18;
 
 const state = {
   profile: null,
   graph: null,
   tasks: [],
+  approvals: [],
+  chatHistory: [],
   localBlocks: [],
   remoteEvents: [],
   weekStart: startOfWeek(new Date()),
   selectedDate: startOfDay(new Date()),
+  miniMonth: new Date(new Date().getFullYear(), new Date().getMonth(), 1),
 };
 
 const $ = (id) => document.getElementById(id);
@@ -26,17 +33,17 @@ function startOfDay(date) {
 }
 
 function startOfWeek(date) {
-  const day = date.getDay(); // 0 = Sun, 1 = Mon
+  const day = date.getDay();
   const diff = day === 0 ? -6 : 1 - day;
   const monday = new Date(date);
-  monday.setDate(date.getDate() + diff);
+  monday.setDate(monday.getDate() + diff);
   return startOfDay(monday);
 }
 
 function addDays(date, days) {
-  const next = new Date(date);
-  next.setDate(next.getDate() + days);
-  return next;
+  const d = new Date(date);
+  d.setDate(d.getDate() + days);
+  return d;
 }
 
 function isSameDay(a, b) {
@@ -47,46 +54,43 @@ function isSameDay(a, b) {
   );
 }
 
+function fmtDate(value) {
+  return value.toLocaleDateString("ko-KR", { month: "short", day: "numeric", weekday: "short" });
+}
+
+function fmtDateTime(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  return date.toLocaleString("ko-KR", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
+function fmtTime(date) {
+  return date.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
+}
+
 function toDateTimeInputValue(date) {
   const pad = (n) => String(n).padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-function fmtDate(date) {
-  return date.toLocaleDateString("ko-KR", { month: "short", day: "numeric", weekday: "short" });
-}
-
-function fmtDateTime(value) {
-  if (!value) return "-";
-  const date = value instanceof Date ? value : new Date(value);
-  return date.toLocaleString("ko-KR", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
-}
-
-function fmtTimeRange(start, end) {
-  const s = start.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
-  const e = end.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
-  return `${s} - ${e}`;
-}
-
 function notify(message, isError = false) {
   const el = $("status-message");
   if (!el) return;
-  el.textContent = message;
-  el.style.color = isError ? "#be2234" : "#516080";
+  el.textContent = message || "";
+  el.style.color = isError ? "#d93025" : "#5a6788";
 }
 
 async function api(path, options = {}) {
-  const res = await fetch(`${API}${path}`, {
+  const response = await fetch(`${API}${path}`, {
     headers: { "Content-Type": "application/json" },
     ...options,
   });
 
-  const isJson = res.headers.get("content-type")?.includes("application/json");
-  const body = isJson ? await res.json() : await res.text();
+  const isJson = response.headers.get("content-type")?.includes("application/json");
+  const body = isJson ? await response.json() : await response.text();
 
-  if (!res.ok) {
+  if (!response.ok) {
     const detail = typeof body === "object" ? body.detail || JSON.stringify(body) : body;
-    throw new Error(detail || `HTTP ${res.status}`);
+    throw new Error(detail || `HTTP ${response.status}`);
   }
 
   return body;
@@ -117,35 +121,30 @@ async function loadGraphStatus() {
 
 function renderGraphStatus() {
   const label = $("graph-status-label");
-  const note = $("graph-status-note");
-  if (!state.graph) {
-    label.textContent = "Graph 상태 확인 중";
-    label.className = "status-pill";
-    note.textContent = "";
-    return;
-  }
+  if (!label || !state.graph) return;
 
   if (state.graph.connected) {
-    label.textContent = "Graph 연결됨";
     label.className = "status-pill connected";
-    note.textContent = state.graph.username ? state.graph.username : "Microsoft 계정 연결";
+    label.textContent = `연결됨: ${state.graph.username || "Microsoft"}`;
     return;
   }
 
   if (!state.graph.configured) {
-    label.textContent = "Graph 설정 누락";
     label.className = "status-pill warn";
-    note.textContent = `누락: ${(state.graph.missing_settings || []).join(", ")}`;
+    label.textContent = "Graph 설정 누락";
     return;
   }
 
-  label.textContent = "Graph 미연결";
   label.className = "status-pill";
-  note.textContent = "Outlook 연결 버튼을 눌러 로그인하세요.";
+  label.textContent = "Graph 미연결";
 }
 
 async function loadTasks() {
   state.tasks = await api("/tasks");
+}
+
+async function loadApprovals() {
+  state.approvals = await api("/approvals?status=pending");
 }
 
 function parseGraphDateTime(value) {
@@ -156,19 +155,15 @@ function parseGraphDateTime(value) {
 }
 
 function normalizeLocalBlocks(blocks) {
-  return blocks.map((block) => {
-    const kind = block.source === "external" ? "outlook" : block.outlook_event_id ? "mixed" : "local";
-    return {
-      id: `local-${block.id}`,
-      title: block.title || "일정",
-      start: new Date(block.start),
-      end: new Date(block.end),
-      kind,
-      source: block.source,
-      outlookId: block.outlook_event_id || null,
-      raw: block,
-    };
-  });
+  return blocks.map((block) => ({
+    id: `local-${block.id}`,
+    title: block.title || "일정",
+    start: new Date(block.start),
+    end: new Date(block.end),
+    kind: block.source === "external" ? "outlook" : block.outlook_event_id ? "mixed" : "local",
+    source: block.source,
+    outlookId: block.outlook_event_id || null,
+  }));
 }
 
 function normalizeRemoteEvents(events) {
@@ -180,85 +175,190 @@ function normalizeRemoteEvents(events) {
     kind: "outlook",
     source: "outlook",
     outlookId: event.id,
-    raw: event,
   }));
 }
 
 function mergedEvents() {
   const local = normalizeLocalBlocks(state.localBlocks);
-  const knownOutlookIds = new Set(local.map((item) => item.outlookId).filter(Boolean));
-  const remote = normalizeRemoteEvents(state.remoteEvents).filter((item) => !knownOutlookIds.has(item.outlookId));
+  const known = new Set(local.map((item) => item.outlookId).filter(Boolean));
+  const remote = normalizeRemoteEvents(state.remoteEvents).filter((item) => !known.has(item.outlookId));
 
   return [...local, ...remote]
-    .filter((item) => item.start && item.end)
+    .filter((item) => item.start instanceof Date && item.end instanceof Date)
     .sort((a, b) => a.start.getTime() - b.start.getTime());
 }
 
 async function loadCalendarData() {
   const start = state.weekStart;
   const end = addDays(state.weekStart, 7);
-  const qs = `start=${encodeURIComponent(start.toISOString())}&end=${encodeURIComponent(end.toISOString())}`;
+  const query = `start=${encodeURIComponent(start.toISOString())}&end=${encodeURIComponent(end.toISOString())}`;
 
-  const localPromise = api(`/calendar/blocks?${qs}`);
-  const remotePromise = state.graph?.connected ? api(`/graph/calendar/events?${qs}`) : Promise.resolve([]);
+  const localPromise = api(`/calendar/blocks?${query}`);
+  const remotePromise = state.graph?.connected ? api(`/graph/calendar/events?${query}`) : Promise.resolve([]);
   const [local, remote] = await Promise.all([localPromise, remotePromise]);
-
   state.localBlocks = local;
   state.remoteEvents = remote;
 }
 
-function renderWeekRange() {
+function renderHeaderRange() {
   const start = state.weekStart;
   const end = addDays(state.weekStart, 6);
-  $("week-range").textContent = `${fmtDate(start)} - ${fmtDate(end)}`;
+  $("range-title").textContent = `${start.getFullYear()}년 ${start.getMonth() + 1}월 ${start.getDate()}일 - ${end.getMonth() + 1}월 ${end.getDate()}일`;
 }
 
-function renderCalendar() {
-  renderWeekRange();
-  const events = mergedEvents();
-  const container = $("calendar-grid");
+function getWeekDays() {
+  return Array.from({ length: 7 }, (_, idx) => addDays(state.weekStart, idx));
+}
 
-  const cells = Array.from({ length: 7 }, (_, idx) => {
-    const day = addDays(state.weekStart, idx);
-    const dayEvents = events.filter((event) => isSameDay(event.start, day));
-    const activeClass = isSameDay(state.selectedDate, day) ? "active" : "";
+function renderWeekHeader() {
+  const container = $("week-days-header");
+  const weekDays = getWeekDays();
+  const today = startOfDay(new Date());
 
-    const chips = dayEvents.length
-      ? dayEvents
-          .slice(0, 4)
-          .map(
-            (event) =>
-              `<div class="event-chip ${event.kind}">${escapeHtml(
-                `${event.start.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })} ${event.title}`,
-              )}</div>`,
-          )
-          .join("")
-      : `<div class="muted">일정 없음</div>`;
-
-    return `
-      <div class="day-cell ${activeClass}" data-day="${day.toISOString()}">
-        <div class="day-head">
-          <span>${day.toLocaleDateString("ko-KR", { weekday: "short" })}</span>
-          <span class="date-num">${day.getDate()}</span>
+  const headerHtml = [
+    '<div class="time-head-empty"></div>',
+    ...weekDays.map((day) => {
+      const classes = ["week-day-head"];
+      if (isSameDay(day, state.selectedDate)) classes.push("selected");
+      if (isSameDay(day, today)) classes.push("today");
+      return `
+        <div class="${classes.join(" ")}" data-select-day="${day.toISOString()}">
+          <div class="dow">${day.toLocaleDateString("ko-KR", { weekday: "short" })}</div>
+          <div class="dom">${day.getDate()}</div>
         </div>
-        <div class="day-events">${chips}</div>
-      </div>
-    `;
+      `;
+    }),
+  ];
+
+  container.innerHTML = headerHtml.join("");
+  container.querySelectorAll("[data-select-day]").forEach((el) => {
+    el.addEventListener("click", async () => {
+      state.selectedDate = startOfDay(new Date(el.dataset.selectDay));
+      state.miniMonth = new Date(state.selectedDate.getFullYear(), state.selectedDate.getMonth(), 1);
+      renderWeekHeader();
+      renderWeekGrid();
+      renderAgenda();
+      renderMiniMonth();
+    });
+  });
+}
+
+function renderTimeLabels() {
+  const labels = [];
+  for (let hour = HOUR_START; hour <= HOUR_END; hour += 1) {
+    const label = hour === 12 ? "오후 12:00" : hour > 12 ? `오후 ${hour - 12}:00` : `오전 ${hour}:00`;
+    labels.push(`<div class="time-slot-label">${label}</div>`);
+  }
+  $("time-labels").innerHTML = labels.join("");
+}
+
+function eventIntersectionWithDay(event, dayStart, dayEnd) {
+  if (event.end <= dayStart || event.start >= dayEnd) return null;
+  const start = new Date(Math.max(event.start.getTime(), dayStart.getTime()));
+  const end = new Date(Math.min(event.end.getTime(), dayEnd.getTime()));
+  return { ...event, start, end };
+}
+
+function layoutDayEvents(events) {
+  if (!events.length) return [];
+
+  const sorted = [...events].sort((a, b) => a.start.getTime() - b.start.getTime() || a.end.getTime() - b.end.getTime());
+  const clusters = [];
+  let cluster = [];
+  let active = [];
+
+  for (const event of sorted) {
+    active = active.filter((item) => item.end.getTime() > event.start.getTime());
+    if (!active.length && cluster.length) {
+      clusters.push(cluster);
+      cluster = [];
+    }
+    cluster.push({ ...event });
+    active.push(event);
+  }
+  if (cluster.length) clusters.push(cluster);
+
+  const positioned = [];
+  for (const items of clusters) {
+    const laneEnds = [];
+    for (const item of items) {
+      let lane = laneEnds.findIndex((end) => end.getTime() <= item.start.getTime());
+      if (lane === -1) {
+        lane = laneEnds.length;
+        laneEnds.push(item.end);
+      } else {
+        laneEnds[lane] = item.end;
+      }
+      item.lane = lane;
+    }
+    const lanes = Math.max(1, laneEnds.length);
+    for (const item of items) {
+      item.lanes = lanes;
+      positioned.push(item);
+    }
+  }
+  return positioned;
+}
+
+function renderWeekGrid() {
+  const container = $("week-columns");
+  const weekDays = getWeekDays();
+  const allEvents = mergedEvents();
+  const gridHeight = (HOUR_END - HOUR_START) * HOUR_HEIGHT;
+
+  const dayColumns = weekDays.map((day) => {
+    const dayStart = startOfDay(day);
+    const dayEnd = addDays(dayStart, 1);
+    const visibleStart = new Date(dayStart);
+    visibleStart.setHours(HOUR_START, 0, 0, 0);
+    const visibleEnd = new Date(dayStart);
+    visibleEnd.setHours(HOUR_END, 0, 0, 0);
+
+    const eventsForDay = allEvents
+      .map((event) => eventIntersectionWithDay(event, visibleStart, visibleEnd))
+      .filter(Boolean);
+    const positioned = layoutDayEvents(eventsForDay);
+
+    const eventsHtml = positioned
+      .map((event) => {
+        const startMinutes = (event.start.getHours() - HOUR_START) * 60 + event.start.getMinutes();
+        const durationMinutes = Math.max(15, (event.end.getTime() - event.start.getTime()) / 60000);
+        const top = (startMinutes / 60) * HOUR_HEIGHT;
+        const height = Math.max(MIN_EVENT_HEIGHT, (durationMinutes / 60) * HOUR_HEIGHT);
+        const left = (event.lane / event.lanes) * 100;
+        const width = 100 / event.lanes;
+
+        return `
+          <div class="calendar-event ${event.kind}" style="top:${top}px;height:${height}px;left:calc(${left}% + 2px);width:calc(${width}% - 4px);">
+            <div class="event-time">${fmtTime(event.start)}</div>
+            <div class="event-title">${escapeHtml(event.title)}</div>
+          </div>
+        `;
+      })
+      .join("");
+
+    return `<div class="day-column" data-day-column="${dayStart.toISOString()}" style="height:${gridHeight}px">${eventsHtml}</div>`;
   });
 
-  container.innerHTML = cells.join("");
-  container.querySelectorAll("[data-day]").forEach((cell) => {
-    cell.addEventListener("click", () => {
-      state.selectedDate = startOfDay(new Date(cell.dataset.day));
-      renderCalendar();
+  container.innerHTML = dayColumns.join("");
+  container.querySelectorAll("[data-day-column]").forEach((el) => {
+    el.addEventListener("click", () => {
+      state.selectedDate = startOfDay(new Date(el.dataset.dayColumn));
+      renderWeekHeader();
       renderAgenda();
+      renderMiniMonth();
     });
   });
 }
 
 function renderAgenda() {
-  const events = mergedEvents().filter((event) => isSameDay(event.start, state.selectedDate));
-  $("agenda-date").textContent = fmtDate(state.selectedDate);
+  const dayStart = startOfDay(state.selectedDate);
+  const dayEnd = addDays(dayStart, 1);
+  $("agenda-date").textContent = fmtDate(dayStart);
+
+  const events = mergedEvents()
+    .filter((event) => event.end > dayStart && event.start < dayEnd)
+    .sort((a, b) => a.start.getTime() - b.start.getTime());
 
   if (!events.length) {
     $("agenda-list").innerHTML = `<div class="agenda-item"><div class="agenda-meta">선택한 날짜에 일정이 없습니다.</div></div>`;
@@ -267,22 +367,72 @@ function renderAgenda() {
 
   $("agenda-list").innerHTML = events
     .map((event) => {
-      const sourceTag =
-        event.kind === "outlook" ? `<span class="tag outlook">Outlook</span>` : `<span class="tag">Local</span>`;
-      const syncTag = event.kind === "mixed" ? `<span class="tag">Synced</span>` : "";
+      const tags = [`<span class="tag">${event.kind === "outlook" ? "Outlook" : "Local"}</span>`];
+      if (event.kind === "mixed") tags.push('<span class="tag outlook">Synced</span>');
       return `
         <div class="agenda-item">
           <div class="agenda-title">${escapeHtml(event.title)}</div>
-          <div class="agenda-meta">${fmtTimeRange(event.start, event.end)}</div>
-          <div class="meta-row">${sourceTag}${syncTag}</div>
+          <div class="agenda-meta">${fmtDateTime(event.start)} - ${fmtTime(event.end)}</div>
+          <div class="meta-row">${tags.join("")}</div>
         </div>
       `;
     })
     .join("");
 }
 
+function renderMiniMonth() {
+  const container = $("mini-month");
+  const title = $("mini-title");
+  const base = state.miniMonth;
+  const year = base.getFullYear();
+  const month = base.getMonth();
+  title.textContent = `${year}년 ${month + 1}월`;
+
+  const first = new Date(year, month, 1);
+  const offset = (first.getDay() + 6) % 7;
+  const start = addDays(first, -offset);
+  const today = startOfDay(new Date());
+  const weekStart = state.weekStart;
+  const weekEnd = addDays(weekStart, 7);
+
+  const cells = [];
+  for (let i = 0; i < 42; i += 1) {
+    const day = addDays(start, i);
+    const classes = ["mini-day"];
+    if (day.getMonth() !== month) classes.push("outside");
+    if (isSameDay(day, today)) classes.push("today");
+    if (isSameDay(day, state.selectedDate)) classes.push("selected");
+    if (day >= weekStart && day < weekEnd) classes.push("in-week");
+
+    cells.push(
+      `<button class="${classes.join(" ")}" type="button" data-mini-day="${day.toISOString()}">${day.getDate()}</button>`,
+    );
+  }
+  container.innerHTML = cells.join("");
+
+  container.querySelectorAll("[data-mini-day]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const day = startOfDay(new Date(button.dataset.miniDay));
+      const nextWeek = startOfWeek(day);
+      const weekChanged = nextWeek.getTime() !== state.weekStart.getTime();
+      state.selectedDate = day;
+      state.weekStart = nextWeek;
+      state.miniMonth = new Date(day.getFullYear(), day.getMonth(), 1);
+
+      if (weekChanged) {
+        await loadCalendarData();
+      }
+      renderHeaderRange();
+      renderWeekHeader();
+      renderWeekGrid();
+      renderAgenda();
+      renderMiniMonth();
+    });
+  });
+}
+
 function renderTasks() {
-  const ordered = [...state.tasks].sort((a, b) => {
+  const sorted = [...state.tasks].sort((a, b) => {
     const aDone = a.status === "done" ? 1 : 0;
     const bDone = b.status === "done" ? 1 : 0;
     if (aDone !== bDone) return aDone - bDone;
@@ -291,30 +441,42 @@ function renderTasks() {
     return aDue - bDue;
   });
 
-  if (!ordered.length) {
-    $("todo-list").innerHTML = `<div class="todo-item"><div class="todo-meta">등록된 할일이 없습니다.</div></div>`;
+  if (!sorted.length) {
+    $("todo-list").innerHTML = `<div class="todo-item"><div class="todo-meta">할일이 없습니다.</div></div>`;
     return;
   }
 
-  $("todo-list").innerHTML = ordered
+  $("todo-list").innerHTML = sorted
     .map((task) => {
-      const doneClass = task.status === "done" ? "done" : "";
-      const dueText = task.due ? fmtDateTime(task.due) : "마감 미정";
-      const statusTag = task.status === "done" ? `<span class="tag done">done</span>` : `<span class="tag">${task.status}</span>`;
-
+      const done = task.status === "done";
       return `
-        <div class="todo-item ${doneClass}">
+        <div class="todo-item">
           <div class="todo-title">${escapeHtml(task.title)}</div>
-          <div class="todo-meta">마감 ${escapeHtml(dueText)} · 우선순위 ${escapeHtml(task.priority)}</div>
+          <div class="todo-meta">${task.due ? fmtDateTime(task.due) : "마감 없음"} · ${escapeHtml(task.priority)}</div>
           <div class="meta-row">
-            ${statusTag}
-            <button class="btn btn-ghost btn-mini" data-task-done="${task.id}">완료</button>
-            <button class="btn btn-ghost btn-mini" data-task-progress="${task.id}">진행중</button>
+            <span class="tag ${done ? "done" : ""}">${escapeHtml(task.status)}</span>
+            <button class="btn btn-ghost btn-mini" type="button" data-task-progress="${task.id}">진행중</button>
+            <button class="btn btn-ghost btn-mini" type="button" data-task-done="${task.id}">완료</button>
           </div>
         </div>
       `;
     })
     .join("");
+
+  document.querySelectorAll("[data-task-progress]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        await api(`/tasks/${button.dataset.taskProgress}`, {
+          method: "PATCH",
+          body: JSON.stringify({ status: "in_progress" }),
+        });
+        await refreshTasksOnly();
+        notify("할일 상태를 진행중으로 변경했습니다.");
+      } catch (error) {
+        notify(error.message, true);
+      }
+    });
+  });
 
   document.querySelectorAll("[data-task-done]").forEach((button) => {
     button.addEventListener("click", async () => {
@@ -330,16 +492,67 @@ function renderTasks() {
       }
     });
   });
+}
 
-  document.querySelectorAll("[data-task-progress]").forEach((button) => {
+function approvalSummary(approval) {
+  const payload = approval.payload || {};
+  if (approval.type === "reschedule") {
+    return payload.summary || "일정 재배치 승인 요청";
+  }
+  if (approval.type === "action_item") {
+    return payload.reason ? `사유: ${payload.reason}` : "회의 액션아이템 승인 요청";
+  }
+  return JSON.stringify(payload);
+}
+
+function renderApprovals() {
+  const list = $("approvals-list");
+  $("approval-count").textContent = `(${state.approvals.length}건)`;
+
+  if (!state.approvals.length) {
+    list.innerHTML = `<div class="approval-item"><div class="approval-meta">대기 중인 승인 요청이 없습니다.</div></div>`;
+    return;
+  }
+
+  list.innerHTML = state.approvals
+    .map(
+      (approval) => `
+        <div class="approval-item">
+          <div class="approval-title">${escapeHtml(approval.type)}</div>
+          <div class="approval-meta">${escapeHtml(approvalSummary(approval))}</div>
+          <div class="meta-row">
+            <button class="btn btn-primary btn-mini" type="button" data-approval-approve="${approval.id}">승인</button>
+            <button class="btn btn-danger btn-mini" type="button" data-approval-reject="${approval.id}">거절</button>
+          </div>
+        </div>
+      `,
+    )
+    .join("");
+
+  list.querySelectorAll("[data-approval-approve]").forEach((button) => {
     button.addEventListener("click", async () => {
       try {
-        await api(`/tasks/${button.dataset.taskProgress}`, {
-          method: "PATCH",
-          body: JSON.stringify({ status: "in_progress" }),
+        await api(`/approvals/${button.dataset.approvalApprove}/resolve`, {
+          method: "POST",
+          body: JSON.stringify({ decision: "approve" }),
         });
-        await refreshTasksOnly();
-        notify("할일 상태를 진행중으로 변경했습니다.");
+        await refreshAll();
+        notify("승인 요청을 승인했습니다.");
+      } catch (error) {
+        notify(error.message, true);
+      }
+    });
+  });
+
+  list.querySelectorAll("[data-approval-reject]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        await api(`/approvals/${button.dataset.approvalReject}/resolve`, {
+          method: "POST",
+          body: JSON.stringify({ decision: "reject" }),
+        });
+        await refreshAll();
+        notify("승인 요청을 거절했습니다.");
       } catch (error) {
         notify(error.message, true);
       }
@@ -372,14 +585,13 @@ async function createTask(event) {
   $("task-form").reset();
   $("task-effort").value = "60";
   await refreshTasksOnly();
-  notify("새 할일을 추가했습니다.");
+  notify("할일을 추가했습니다.");
 }
 
 async function connectGraph() {
   const result = await api("/graph/auth/url");
   if (!result.configured || !result.auth_url) {
-    const msg = `Graph 설정 누락: ${(result.missing_settings || []).join(", ")}`;
-    throw new Error(msg);
+    throw new Error(`Graph 설정 누락: ${(result.missing_settings || []).join(", ")}`);
   }
   window.location.href = result.auth_url;
 }
@@ -388,7 +600,7 @@ async function disconnectGraph() {
   await api("/graph/disconnect", { method: "POST" });
   await loadGraphStatus();
   state.remoteEvents = [];
-  renderCalendar();
+  renderWeekGrid();
   renderAgenda();
   notify("Outlook 연결을 해제했습니다.");
 }
@@ -401,10 +613,9 @@ async function syncBidirectional(silent = false) {
   const exportResult = await api("/graph/calendar/export", { method: "POST" });
   const importResult = await api("/graph/calendar/import", { method: "POST" });
   await refreshAll();
-
   if (!silent) {
     notify(
-      `양방향 동기화 완료 · 내보내기 ${exportResult.synced}건(생성 ${exportResult.created}, 업데이트 ${exportResult.updated}) / 가져오기 ${importResult.imported}건`,
+      `동기화 완료 · 내보내기 ${exportResult.synced}건(생성 ${exportResult.created}, 업데이트 ${exportResult.updated}) / 가져오기 ${importResult.imported}건`,
     );
   }
 }
@@ -419,19 +630,25 @@ async function syncTodoFromGraph() {
     throw new Error("가져올 To Do 목록이 없습니다.");
   }
 
-  const listId = lists[0].id;
-  const result = await api(`/graph/todo/lists/${listId}/import`, { method: "POST" });
+  const first = lists[0];
+  const result = await api(`/graph/todo/lists/${first.id}/import`, { method: "POST" });
   await refreshTasksOnly();
   notify(`To Do 가져오기 완료: ${result.imported}/${result.tasks}`);
 }
 
-function addChatMessage(role, text) {
+function addChatMessage(role, text, remember = true) {
   const log = $("chat-log");
-  const item = document.createElement("div");
-  item.className = `chat-msg ${role}`;
-  item.innerHTML = escapeHtml(text).replaceAll("\n", "<br />");
-  log.appendChild(item);
+  const box = document.createElement("div");
+  box.className = `chat-msg ${role}`;
+  box.innerHTML = escapeHtml(text).replaceAll("\n", "<br />");
+  log.appendChild(box);
   log.scrollTop = log.scrollHeight;
+
+  if (!remember) return;
+  state.chatHistory.push({ role, text });
+  if (state.chatHistory.length > 20) {
+    state.chatHistory = state.chatHistory.slice(-20);
+  }
 }
 
 async function sendChat(event) {
@@ -440,18 +657,17 @@ async function sendChat(event) {
   const message = input.value.trim();
   if (!message) return;
 
+  const history = state.chatHistory.slice(-12);
   addChatMessage("user", message);
   input.value = "";
 
   try {
     const result = await api("/assistant/chat", {
       method: "POST",
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ message, history }),
     });
-
-    const actionSummary = (result.actions || []).map((a) => a.type).join(", ");
+    const actionSummary = (result.actions || []).map((item) => item.type).join(", ");
     addChatMessage("assistant", actionSummary ? `${result.reply}\n\n작업: ${actionSummary}` : result.reply);
-
     await refreshAll();
   } catch (error) {
     addChatMessage("assistant", `오류: ${error.message}`);
@@ -459,18 +675,34 @@ async function sendChat(event) {
   }
 }
 
-async function refreshCalendarAndAgenda() {
+async function refreshCalendarOnly() {
   await loadCalendarData();
-  renderCalendar();
+  renderHeaderRange();
+  renderWeekHeader();
+  renderWeekGrid();
   renderAgenda();
+  renderMiniMonth();
 }
 
 async function refreshAll() {
   await loadGraphStatus();
-  await Promise.all([loadTasks(), loadCalendarData()]);
-  renderCalendar();
+  await Promise.all([loadTasks(), loadApprovals(), loadCalendarData()]);
+  renderHeaderRange();
+  renderWeekHeader();
+  renderWeekGrid();
   renderAgenda();
+  renderMiniMonth();
   renderTasks();
+  renderApprovals();
+}
+
+function scrollCalendarToNow() {
+  const wrap = document.querySelector(".time-grid-wrap");
+  if (!wrap) return;
+  const now = new Date();
+  const hoursFromStart = now.getHours() - HOUR_START + now.getMinutes() / 60;
+  const target = Math.max(0, (hoursFromStart - 1) * HOUR_HEIGHT);
+  wrap.scrollTop = target;
 }
 
 function bindEvents() {
@@ -514,15 +746,6 @@ function bindEvents() {
     }
   });
 
-  $("refresh-all").addEventListener("click", async () => {
-    try {
-      await refreshAll();
-      notify("화면 데이터를 새로고침했습니다.");
-    } catch (error) {
-      notify(error.message, true);
-    }
-  });
-
   $("task-form").addEventListener("submit", async (event) => {
     try {
       await createTask(event);
@@ -531,22 +754,46 @@ function bindEvents() {
     }
   });
 
-  $("week-prev").addEventListener("click", async () => {
+  $("refresh-approvals").addEventListener("click", async () => {
+    try {
+      await loadApprovals();
+      renderApprovals();
+      notify("승인 요청 목록을 갱신했습니다.");
+    } catch (error) {
+      notify(error.message, true);
+    }
+  });
+
+  $("nav-prev").addEventListener("click", async () => {
     state.weekStart = addDays(state.weekStart, -7);
     state.selectedDate = addDays(state.selectedDate, -7);
-    await refreshCalendarAndAgenda();
+    state.miniMonth = new Date(state.selectedDate.getFullYear(), state.selectedDate.getMonth(), 1);
+    await refreshCalendarOnly();
   });
 
-  $("week-next").addEventListener("click", async () => {
+  $("nav-next").addEventListener("click", async () => {
     state.weekStart = addDays(state.weekStart, 7);
     state.selectedDate = addDays(state.selectedDate, 7);
-    await refreshCalendarAndAgenda();
+    state.miniMonth = new Date(state.selectedDate.getFullYear(), state.selectedDate.getMonth(), 1);
+    await refreshCalendarOnly();
   });
 
-  $("week-today").addEventListener("click", async () => {
-    state.weekStart = startOfWeek(new Date());
+  $("nav-today").addEventListener("click", async () => {
     state.selectedDate = startOfDay(new Date());
-    await refreshCalendarAndAgenda();
+    state.weekStart = startOfWeek(new Date());
+    state.miniMonth = new Date(state.selectedDate.getFullYear(), state.selectedDate.getMonth(), 1);
+    await refreshCalendarOnly();
+    scrollCalendarToNow();
+  });
+
+  $("mini-prev").addEventListener("click", () => {
+    state.miniMonth = new Date(state.miniMonth.getFullYear(), state.miniMonth.getMonth() - 1, 1);
+    renderMiniMonth();
+  });
+
+  $("mini-next").addEventListener("click", () => {
+    state.miniMonth = new Date(state.miniMonth.getFullYear(), state.miniMonth.getMonth() + 1, 1);
+    renderMiniMonth();
   });
 
   $("chat-form").addEventListener("submit", sendChat);
@@ -568,9 +815,9 @@ function bindEvents() {
 async function bootstrap() {
   try {
     bindEvents();
+    renderTimeLabels();
 
-    const now = new Date();
-    const due = addDays(now, 1);
+    const due = addDays(new Date(), 1);
     due.setHours(10, 0, 0, 0);
     $("task-due").value = toDateTimeInputValue(due);
 
@@ -586,10 +833,12 @@ async function bootstrap() {
 
     await loadProfile();
     await refreshAll();
+    scrollCalendarToNow();
 
     addChatMessage(
       "assistant",
-      "AI Assistant 준비 완료. 회의록 등록, 일정 재배치, 할일 완료/우선순위 변경 요청을 바로 처리할 수 있습니다.",
+      "AI Assistant 준비 완료. 회의록 등록, 일정 재배치, 할일 조정을 자연어로 요청하세요.",
+      false,
     );
   } catch (error) {
     notify(error.message, true);
