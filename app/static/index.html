@@ -136,9 +136,25 @@
         </article>
 
         <article class="card">
-          <h3>Graph Sync 상태</h3>
-          <button id="ping-sync" class="btn btn-ghost">Graph Ping</button>
+          <h3>Microsoft Graph</h3>
+          <div class="row">
+            <button id="graph-connect" class="btn btn-primary">Outlook 연결</button>
+            <button id="graph-disconnect" class="btn btn-danger">연결 해제</button>
+            <button id="ping-sync" class="btn btn-ghost">Graph Ping</button>
+          </div>
+          <div id="graph-message" class="muted"></div>
           <pre id="sync-status" class="code-box"></pre>
+        </article>
+
+        <article class="card">
+          <h3>Outlook/To Do 가져오기</h3>
+          <div class="stack">
+            <button id="import-calendar" class="btn btn-ghost">Outlook 일정 가져오기 (14일)</button>
+            <button id="load-todo-lists" class="btn btn-ghost">To Do 목록 조회</button>
+            <select id="todo-list-select"></select>
+            <button id="import-todo" class="btn btn-ghost">선택한 To Do 가져오기</button>
+          </div>
+          <div id="graph-import-result" class="muted"></div>
         </article>
       </section>
     </main>

@@ -12,7 +12,7 @@
 - Scheduling proposal/apply 분리: 제약 기반 제안 생성 후 적용
 - Daily briefing: Top tasks, 리스크, 가용 시간 스냅샷
 - NLI command: 자연어 기반 간단한 작업 생성/의도 파싱
-- Graph sync 상태(스텁): 429 백오프 정책 시뮬레이션
+- Microsoft Graph OAuth: Outlook Calendar / Microsoft To Do 실연동
 
 ## 기술 스택
 - Backend: FastAPI + SQLAlchemy + SQLite
@@ -27,12 +27,19 @@ source .venv/bin/activate
 pip install -r requirements.txt
 # 환경변수 설정(.env 사용 가능)
 cp .env.example .env
-# .env 파일에 OPENAI_API_KEY를 입력
+# .env 파일에 OPENAI_API_KEY, MS_CLIENT_ID, MS_CLIENT_SECRET 입력
 uvicorn app.main:app --reload --port 8000
 ```
 
 브라우저에서 아래 주소를 엽니다.
 - http://127.0.0.1:8000
+
+## Microsoft Graph 설정
+1. Azure Portal > App registrations > New registration
+2. Redirect URI(Web): `http://127.0.0.1:8000/api/graph/auth/callback`
+3. API permissions(Delegated): `User.Read`, `offline_access`, `Calendars.ReadWrite`, `Tasks.ReadWrite`
+4. Certificates & secrets에서 Client secret 생성
+5. `.env`에 `MS_CLIENT_ID`, `MS_CLIENT_SECRET`, `MS_TENANT_ID` 입력
 
 ## 주요 API
 - `GET/PATCH /api/profile`
@@ -47,9 +54,17 @@ uvicorn app.main:app --reload --port 8000
 - `POST /api/scheduling/proposals/{id}/apply`
 - `GET /api/briefings/daily`
 - `POST /api/nli/command`
+- `GET /api/graph/auth/url`
+- `GET /api/graph/auth/callback`
+- `GET /api/graph/status`
+- `GET /api/graph/calendar/events`
+- `POST /api/graph/calendar/import`
+- `GET /api/graph/todo/lists`
+- `POST /api/graph/todo/lists/{list_id}/import`
 
 ## 참고
-- Microsoft Graph 실제 연동은 스텁으로 구현되어 있으며, `app/services/graph_connector.py`를 실제 SDK 호출로 교체하면 됩니다.
 - 현재 DB는 로컬 `aawo.db` 파일을 사용합니다.
 - `OPENAI_API_KEY`가 설정되면 회의 Action Item 추출과 NLI 의도 파싱에 OpenAI API를 우선 사용합니다.
 - 키가 없거나 OpenAI 호출이 실패하면 기존 규칙 기반 파서로 자동 폴백합니다.
+- Microsoft OAuth Redirect URI는 `http://127.0.0.1:8000/api/graph/auth/callback`로 Azure App Registration에 등록해야 합니다.
+- 필요 권한(scope): `User.Read`, `offline_access`, `Calendars.ReadWrite`, `Tasks.ReadWrite`

@@ -21,6 +21,12 @@ def _parse_hhmm(value: str) -> tuple[int, int]:
     return int(h), int(m)
 
 
+def _coerce_timezone(dt: datetime, tz: ZoneInfo) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=tz)
+    return dt.astimezone(tz)
+
+
 def _day_work_minutes(profile: UserProfile, target_date: date) -> tuple[int, datetime | None, datetime | None]:
     tz = ZoneInfo(profile.timezone)
     day_key = DAY_KEYS[target_date.weekday()]
@@ -73,7 +79,7 @@ def build_daily_briefing(db: Session, profile: UserProfile, target_date: date) -
     tasks = db.execute(tasks_stmt).scalars().all()
 
     def task_sort_key(task: Task) -> tuple[int, datetime]:
-        due = task.due or datetime.max.replace(tzinfo=tz)
+        due = _coerce_timezone(task.due, tz) if task.due else datetime.max.replace(tzinfo=tz)
         return (-PRIORITY_SCORE.get(task.priority, 1), due)
 
     tasks = sorted(tasks, key=task_sort_key)
@@ -86,10 +92,22 @@ def build_daily_briefing(db: Session, profile: UserProfile, target_date: date) -
     )
     blocks = db.execute(blocks_stmt).scalars().all()
 
-    busy_ranges = [(max(block.start, day_start), min(block.end, day_end)) for block in blocks]
+    busy_ranges = []
+    for block in blocks:
+        start = _coerce_timezone(block.start, tz)
+        end = _coerce_timezone(block.end, tz)
+        busy_ranges.append((max(start, day_start), min(end, day_end)))
     busy_minutes = sum(max(0, _to_minutes(start, end)) for start, end in busy_ranges)
-    focus_minutes = sum(max(0, _to_minutes(block.start, block.end)) for block in blocks if block.type in ("focus_block", "task_block"))
-    meeting_minutes = sum(max(0, _to_minutes(block.start, block.end)) for block in blocks if block.type == "other" and block.source == "external")
+    focus_minutes = sum(
+        max(0, _to_minutes(_coerce_timezone(block.start, tz), _coerce_timezone(block.end, tz)))
+        for block in blocks
+        if block.type in ("focus_block", "task_block")
+    )
+    meeting_minutes = sum(
+        max(0, _to_minutes(_coerce_timezone(block.start, tz), _coerce_timezone(block.end, tz)))
+        for block in blocks
+        if block.type == "other" and block.source == "external"
+    )
 
     work_minutes, work_start, work_end = _day_work_minutes(profile, target_date)
     free_minutes = max(0, work_minutes - busy_minutes)
@@ -114,11 +132,11 @@ def build_daily_briefing(db: Session, profile: UserProfile, target_date: date) -
         )
 
     risks: list[str] = []
-    overdue = [task for task in tasks if task.due and task.due < day_start]
+    overdue = [task for task in tasks if task.due and _coerce_timezone(task.due, tz) < day_start]
     if overdue:
         risks.append(f"기한 경과 작업 {len(overdue)}건")
 
-    due_today = [task for task in tasks if task.due and day_start <= task.due < day_end]
+    due_today = [task for task in tasks if task.due and day_start <= _coerce_timezone(task.due, tz) < day_end]
     if len(due_today) >= 3:
         risks.append("오늘 마감 작업이 3건 이상입니다")
 

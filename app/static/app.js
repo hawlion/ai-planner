@@ -343,13 +343,71 @@ async function runNLI(event) {
 }
 
 async function loadSyncStatus() {
-  const status = await api("/sync/status");
+  const status = await api("/graph/status");
   $("sync-status").textContent = JSON.stringify(status, null, 2);
+  $("graph-message").textContent = status.connected
+    ? `연결됨: ${status.username || "Microsoft 계정"}`
+    : status.configured
+      ? "연결되지 않음"
+      : `설정 누락: ${(status.missing_settings || []).join(", ")}`;
 }
 
 async function pingSync() {
-  const result = await api("/sync/ping", { method: "POST" });
+  const result = await api("/graph/ping", { method: "POST" });
   $("sync-status").textContent = JSON.stringify(result, null, 2);
+}
+
+async function connectGraph() {
+  const result = await api("/graph/auth/url");
+  if (!result.configured) {
+    const missing = (result.missing_settings || []).join(", ");
+    throw new Error(`Microsoft Graph 설정이 필요합니다: ${missing}`);
+  }
+  if (!result.auth_url) {
+    throw new Error("인증 URL을 생성하지 못했습니다.");
+  }
+  window.location.href = result.auth_url;
+}
+
+async function disconnectGraph() {
+  await api("/graph/disconnect", { method: "POST" });
+  await loadSyncStatus();
+}
+
+async function importOutlookCalendar() {
+  const result = await api("/graph/calendar/import", { method: "POST" });
+  $("graph-import-result").textContent = `캘린더 반영: ${result.imported}/${result.events}`;
+  await loadCalendar();
+}
+
+async function loadTodoLists() {
+  const lists = await api("/graph/todo/lists");
+  const select = $("todo-list-select");
+  select.innerHTML = "";
+
+  if (!lists.length) {
+    select.innerHTML = `<option value="">목록 없음</option>`;
+    return;
+  }
+
+  lists.forEach((list) => {
+    const option = document.createElement("option");
+    option.value = list.id;
+    option.textContent = list.displayName || list.wellknownListName || list.id;
+    select.appendChild(option);
+  });
+}
+
+async function importTodoList() {
+  const select = $("todo-list-select");
+  const listId = select.value;
+  if (!listId) {
+    throw new Error("가져올 To Do 목록을 먼저 선택하세요.");
+  }
+
+  const result = await api(`/graph/todo/lists/${listId}/import`, { method: "POST" });
+  $("graph-import-result").textContent = `To Do 반영: ${result.imported}/${result.tasks}`;
+  await loadTasks();
 }
 
 function setProposalDefaults() {
@@ -369,6 +427,15 @@ function setProposalDefaults() {
 async function bootstrap() {
   try {
     setProposalDefaults();
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("graph") === "connected") {
+      notify("Microsoft Graph 연결이 완료되었습니다.");
+      history.replaceState({}, "", "/");
+    }
+    if (params.get("graph_error")) {
+      notify(`Graph 연결 실패: ${params.get("graph_error")}`, true);
+      history.replaceState({}, "", "/");
+    }
 
     $("save-profile").addEventListener("click", async () => {
       try {
@@ -386,9 +453,51 @@ async function bootstrap() {
     $("meeting-form").addEventListener("submit", ingestMeeting);
     $("proposal-form").addEventListener("submit", createProposals);
     $("nli-form").addEventListener("submit", runNLI);
-    $("ping-sync").addEventListener("click", pingSync);
+    $("ping-sync").addEventListener("click", async () => {
+      try {
+        await pingSync();
+      } catch (error) {
+        notify(error.message, true);
+      }
+    });
+    $("graph-connect").addEventListener("click", async () => {
+      try {
+        await connectGraph();
+      } catch (error) {
+        notify(error.message, true);
+      }
+    });
+    $("graph-disconnect").addEventListener("click", async () => {
+      try {
+        await disconnectGraph();
+      } catch (error) {
+        notify(error.message, true);
+      }
+    });
+    $("import-calendar").addEventListener("click", async () => {
+      try {
+        await importOutlookCalendar();
+      } catch (error) {
+        notify(error.message, true);
+      }
+    });
+    $("load-todo-lists").addEventListener("click", async () => {
+      try {
+        await loadTodoLists();
+      } catch (error) {
+        notify(error.message, true);
+      }
+    });
+    $("import-todo").addEventListener("click", async () => {
+      try {
+        await importTodoList();
+      } catch (error) {
+        notify(error.message, true);
+      }
+    });
 
     await Promise.all([loadProfile(), loadBriefing(), loadTasks(), loadCalendar(), loadApprovals(), loadSyncStatus()]);
+    await loadTodoLists().catch(() => {});
   } catch (error) {
     notify(error.message, true);
   }

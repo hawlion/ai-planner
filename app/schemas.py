@@ -312,3 +312,34 @@ class NLIResponse(BaseModel):
     intent: str
     extracted: dict[str, Any]
     note: str
+
+
+class GraphAuthUrlOut(BaseModel):
+    configured: bool
+    auth_url: str | None = None
+    missing_settings: list[str] = Field(default_factory=list)
+    redirect_uri: str | None = None
+
+
+class GraphStatusOut(BaseModel):
+    configured: bool
+    connected: bool
+    username: str | None = None
+    tenant_id: str | None = None
+    scopes: list[str] = Field(default_factory=list)
+    missing_settings: list[str] = Field(default_factory=list)
+    redirect_uri: str | None = None
+
+
+class GraphCalendarEventCreate(BaseModel):
+    subject: str = Field(min_length=1, max_length=200)
+    start: datetime
+    end: datetime
+    body: str | None = None
+    location: str | None = None
+
+
+class GraphTodoTaskCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=250)
+    due: datetime | None = None
+    body: str | None = None

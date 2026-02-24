@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.db import Base, engine
-from app.routers import approvals, briefing, calendar, health, meetings, nli, profile, projects, scheduling, sync, tasks
+from app.routers import approvals, briefing, calendar, graph, health, meetings, nli, profile, projects, scheduling, sync, tasks
 from app.services.core import ensure_profile
 from app.db import SessionLocal
 
@@ -34,6 +34,7 @@ app.include_router(approvals.router, prefix=api_prefix)
 app.include_router(scheduling.router, prefix=api_prefix)
 app.include_router(briefing.router, prefix=api_prefix)
 app.include_router(sync.router, prefix=api_prefix)
+app.include_router(graph.router, prefix=api_prefix)
 app.include_router(nli.router, prefix=api_prefix)
 
 static_dir = Path(__file__).parent / "static"

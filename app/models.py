@@ -203,3 +203,16 @@ class SyncStatus(Base):
     last_429_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     recent_429_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class GraphConnection(Base, TimestampedMixin):
+    __tablename__ = "graph_connections"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    connected: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    username: Mapped[str | None] = mapped_column(String(240))
+    tenant_id: Mapped[str | None] = mapped_column(String(120))
+    home_account_id: Mapped[str | None] = mapped_column(String(240))
+    token_cache: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    pending_state: Mapped[str | None] = mapped_column(String(120))
+    scopes: Mapped[str | None] = mapped_column(Text)

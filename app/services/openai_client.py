@@ -28,9 +28,9 @@ class ActionItemOutput(BaseModel):
     title: str = Field(min_length=3, max_length=180)
     assignee_name: str | None = None
     due: str | None = None
-    effort_minutes: int = Field(default=60, ge=15, le=8 * 60)
+    effort_minutes: int = Field(default=60, ge=0, le=8 * 60)
     confidence: float = Field(default=0.7, ge=0.0, le=1.0)
-    rationale: str = Field(default="Action item extracted from meeting context")
+    rationale: str | None = Field(default="Action item extracted from meeting context")
 
 
 class ActionItemsEnvelope(BaseModel):
@@ -44,7 +44,7 @@ class NLIOutput(BaseModel):
     effort_minutes: int | None = Field(default=None, ge=15, le=8 * 60)
     priority: Literal["low", "medium", "high", "critical"] | None = None
     time_hint: str | None = None
-    note: str = ""
+    note: str | None = ""
 
 
 
@@ -155,13 +155,15 @@ def extract_action_items_openai(transcript: list[dict], summary: str | None, bas
         seen.add(key)
 
         due_dt = _parse_due(item.due, base_dt)
+        effort = item.effort_minutes if item.effort_minutes >= 15 else 60
+        confidence = max(0.0, min(1.0, float(item.confidence)))
         items.append(
             DraftActionItem(
                 title=item.title.strip(),
                 assignee_name=item.assignee_name,
                 due=due_dt,
-                effort_minutes=item.effort_minutes,
-                confidence=item.confidence,
+                effort_minutes=effort,
+                confidence=confidence,
                 rationale=item.rationale or "LLM extraction",
             )
         )

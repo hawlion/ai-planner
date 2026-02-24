@@ -43,7 +43,10 @@ def _process_meeting(meeting_db_id: str) -> None:
             if is_openai_available():
                 try:
                     drafts = extract_action_items_openai(meeting.transcript, meeting.summary, base_dt=base_time)
-                    extraction_mode = "openai"
+                    if drafts:
+                        extraction_mode = "openai"
+                    else:
+                        drafts = extract_action_items(meeting.transcript, meeting.summary, base_dt=base_time)
                 except OpenAIIntegrationError as exc:
                     logger.warning("OpenAI extraction failed, falling back to rule-based extractor: %s", exc)
                     drafts = extract_action_items(meeting.transcript, meeting.summary, base_dt=base_time)
