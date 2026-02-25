@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
@@ -88,6 +88,13 @@ class Project(Base, TimestampedMixin):
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
     kpi: Mapped[str | None] = mapped_column(Text)
+    target_kpi: Mapped[str | None] = mapped_column(String(200))
+    category: Mapped[str | None] = mapped_column(String(120))
+    importance: Mapped[str] = mapped_column(String(12), default="medium", nullable=False)
+    is_recurring: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    cadence: Mapped[str | None] = mapped_column(String(24))
+    cadence_payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    estimated_effort_minutes: Mapped[int] = mapped_column(Integer, default=120, nullable=False)
     priority: Mapped[str] = mapped_column(String(12), default="medium", nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 
@@ -216,6 +223,27 @@ class SchedulingChange(Base, TimestampedMixin):
     payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
 
     proposal: Mapped[SchedulingProposal] = relationship(back_populates="changes")
+
+
+class WeeklyRoadmap(Base, TimestampedMixin):
+    __tablename__ = "weekly_roadmaps"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    profile_id: Mapped[str] = mapped_column(String(36), index=True)
+    period_type: Mapped[str] = mapped_column(String(16), default="weekly", nullable=False)
+    week_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    work_capacity_minutes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    workload_snapshot: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    plan_items: Mapped[list[dict]] = mapped_column(JSON, default=list, nullable=False)
+    blocked_reasons: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    actionable_suggestions: Mapped[list[dict]] = mapped_column(JSON, default=list, nullable=False)
+    constraints: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    notes: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    built_by: Mapped[str] = mapped_column(String(24), default="scheduler", nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="active", nullable=False)
+    last_built_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class AuditLog(Base, TimestampedMixin):

@@ -40,6 +40,8 @@ class UserProfilePatch(UserProfileBase):
 class UserProfileOut(UserProfileBase):
     id: str
     version: int
+    onboarding_version: int = 0
+    learning: dict[str, Any] | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -50,6 +52,13 @@ class ProjectCreate(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     description: str | None = None
     kpi: str | None = None
+    target_kpi: str | None = None
+    category: str | None = None
+    importance: Literal["low", "medium", "high", "critical"] = "medium"
+    is_recurring: bool = False
+    cadence: str | None = None
+    cadence_payload: dict[str, Any] | None = None
+    estimated_effort_minutes: int = Field(default=120, ge=15, le=8 * 60)
     priority: Literal["low", "medium", "high", "critical"] = "medium"
     milestones: list["MilestoneCreate"] = Field(default_factory=list)
 
@@ -58,6 +67,13 @@ class ProjectPatch(BaseModel):
     title: str | None = None
     description: str | None = None
     kpi: str | None = None
+    target_kpi: str | None = None
+    category: str | None = None
+    importance: Literal["low", "medium", "high", "critical"] | None = None
+    is_recurring: bool | None = None
+    cadence: str | None = None
+    cadence_payload: dict[str, Any] | None = None
+    estimated_effort_minutes: int | None = Field(default=None, ge=15, le=8 * 60)
     priority: Literal["low", "medium", "high", "critical"] | None = None
     milestones: list["MilestoneCreate"] | None = None
     version: int | None = None
@@ -86,6 +102,13 @@ class ProjectOut(BaseModel):
     title: str
     description: str | None
     kpi: str | None
+    target_kpi: str | None
+    category: str | None
+    importance: str
+    is_recurring: bool
+    cadence: str | None
+    cadence_payload: dict[str, Any] | None
+    estimated_effort_minutes: int
     priority: str
     milestones: list[MilestoneOut] = Field(default_factory=list)
     version: int
@@ -321,6 +344,81 @@ class DailyBriefingOut(BaseModel):
     risks: list[str]
     reminders: list[str]
     snapshot: dict[str, int]
+    workload_suggestions: list["WorkloadSuggestionOut"] = Field(default_factory=list)
+
+
+class WorkloadSuggestionOut(BaseModel):
+    suggestion_id: str
+    suggestion_type: Literal["propose", "apply", "preview"] = "propose"
+    action_type: Literal[
+        "move_events",
+        "move_events_after_hour",
+        "reduce_meeting_load",
+        "split_focus_blocks",
+        "shift_workload",
+        "apply_roadmap",
+    ]
+    title: str
+    rationale: str
+    can_auto_apply: bool = False
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class WeeklyRoadmapItemOut(BaseModel):
+    id: str
+    title: str
+    project_id: str | None
+    task_id: str | None
+    week_start: date
+    planned_minutes: int
+    remaining_minutes: int
+    confidence: float
+    rationale: str
+    status: Literal["queued", "allocated", "over_capacity", "not_scheduled"] = "queued"
+    source: Literal["task", "project", "constraint"] = "task"
+
+
+class WeeklyRoadmapRequest(BaseModel):
+    weeks: int = Field(default=8, ge=1, le=24)
+    horizon_start: date | None = None
+
+
+class WeeklyRoadmapApplyRequest(BaseModel):
+    roadmap_id: str
+
+
+class RoadmapDiffItem(BaseModel):
+    key: str
+    old_value: Any | None = None
+    new_value: Any | None = None
+
+
+class WeeklyRoadmapDiffOut(BaseModel):
+    roadmap_id: str
+    previous_roadmap_id: str | None = None
+    changed_fields: list[str] = Field(default_factory=list)
+    diffs: list[RoadmapDiffItem] = Field(default_factory=list)
+
+
+class WeeklyRoadmapOut(BaseModel):
+    id: str
+    profile_id: str
+    period_type: str
+    week_start: datetime
+    work_capacity_minutes: int
+    workload_snapshot: dict[str, Any]
+    plan_items: list[WeeklyRoadmapItemOut]
+    blocked_reasons: list[str]
+    actionable_suggestions: list[WorkloadSuggestionOut]
+    constraints: dict[str, Any]
+    notes: str
+    confidence: float
+    built_by: str
+    version: int
+    status: str
+    last_built_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
 
 
 class SyncStatusOut(BaseModel):
