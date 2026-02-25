@@ -192,8 +192,30 @@ select:focus {
 }
 
 .status-line {
-  display: none;
-  /* Hide for cleaner look, notifications will be enough */
+  display: flex;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: #f8fafc;
+  color: #334155;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 8px 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.status-line.error {
+  background: #fff1f2;
+  border-color: #fecdd3;
+  color: #9f1239;
+}
+
+.status-line.ok {
+  background: #f0fdf4;
+  border-color: #bbf7d0;
+  color: #166534;
 }
 
 .workspace-grid {
@@ -325,6 +347,23 @@ select:focus {
   transition: all 0.2s ease;
 }
 
+.todo-item.duplicate {
+  border-color: #fca5a5;
+  background: #fff7f7;
+}
+
+.task-dup-badge {
+  display: inline-flex;
+  margin-left: 6px;
+  padding: 1px 7px;
+  font-size: 10px;
+  font-weight: 700;
+  border-radius: 999px;
+  background: #fee2e2;
+  color: #991b1b;
+  border: 1px solid #fca5a5;
+}
+
 .todo-item:hover,
 .approval-item:hover,
 .agenda-item:hover {
@@ -448,6 +487,18 @@ select:focus {
   border-color: var(--line-strong);
   color: var(--ink-soft);
   text-decoration: line-through;
+}
+
+.tag.conflict {
+  background: #fee2e2;
+  border-color: #fca5a5;
+  color: #991b1b;
+}
+
+.tag.linked {
+  background: #ecfeff;
+  border-color: #99f6e4;
+  color: #155e75;
 }
 
 .calendar-panel {
@@ -618,6 +669,25 @@ select:focus {
   opacity: 1;
 }
 
+.calendar-event.conflict {
+  border-left-color: #dc2626 !important;
+  box-shadow: inset 0 0 0 1px rgba(220, 38, 38, 0.35);
+}
+
+.event-conflict-badge {
+  position: absolute;
+  top: 2px;
+  right: 20px;
+  background: #fee2e2;
+  color: #991b1b;
+  border: 1px solid #fca5a5;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 700;
+  padding: 0 6px;
+  line-height: 14px;
+}
+
 .calendar-event.local {
   background: var(--purple-bg);
   color: var(--purple-txt);
@@ -647,6 +717,15 @@ select:focus {
   margin-top: 0;
   font-weight: 500;
   line-height: 1.3;
+}
+
+.event-link {
+  margin-top: 2px;
+  font-size: 10px;
+  opacity: 0.85;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .chat-panel {

@@ -40,6 +40,24 @@ def default_preferences() -> dict:
             "avoid_late_afternoon": False,
             "max_back_to_back_minutes": 90,
         },
+        "learning": {
+            "enabled": True,
+            "started_at": None,
+            "window_days": 14,
+            "last_adjusted_at": None,
+            "signals": {
+                "event_start_hours": {},
+                "task_due_hours": {},
+                "total_events": 0,
+                "total_task_due": 0,
+            },
+            "applied": {
+                "prefer_morning": False,
+                "avoid_late_afternoon": False,
+                "last_total_events": 0,
+                "last_total_task_due": 0,
+            },
+        },
         "buffers": {"before_meeting_minutes": 5, "after_meeting_minutes": 5, "travel_minutes_default": 0},
         "notification_preferences": {"block_start_reminder_minutes": 10, "due_reminders": [2, 1, 0]},
     }

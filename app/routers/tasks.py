@@ -9,8 +9,9 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.models import Task
 from app.schemas import TaskCreate, TaskOut, TaskPatch
-from app.services.core import add_audit
+from app.services.core import add_audit, ensure_profile
 from app.services.graph_service import GraphApiError, GraphAuthError, delete_task_from_todo, is_graph_connected, sync_task_to_todo
+from app.services.learning import apply_learning_if_due, record_task_due_signal
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -50,6 +51,10 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)) -> TaskOut:
     row = Task(**payload.model_dump())
     db.add(row)
     db.flush()
+    if row.due:
+        profile = ensure_profile(db)
+        record_task_due_signal(profile, row.due)
+        apply_learning_if_due(profile)
     add_audit(
         db,
         action="task.created",
@@ -92,6 +97,8 @@ def patch_task(task_id: str, payload: TaskPatch, db: Session = Depends(get_db)) 
     if "project_id" in data and data["project_id"] == "":
         data["project_id"] = None
 
+    old_due = row.due
+
     changed_fields: list[str] = []
     for field, value in data.items():
         if field == "version":
@@ -100,6 +107,11 @@ def patch_task(task_id: str, payload: TaskPatch, db: Session = Depends(get_db)) 
         changed_fields.append(field)
 
     row.version += 1
+    if "due" in data and data["due"] != old_due and row.due is not None:
+        profile = ensure_profile(db)
+        record_task_due_signal(profile, row.due)
+        apply_learning_if_due(profile)
+
     add_audit(
         db,
         action="task.updated",

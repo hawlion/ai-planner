@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.schemas import UserProfileOut, UserProfilePatch
 from app.services.core import add_audit, ensure_profile
+from app.services.learning import maybe_get_learning_snapshot, normalize_profile
 
 router = APIRouter(prefix="/profile", tags=["profile"])
 
@@ -14,6 +15,12 @@ router = APIRouter(prefix="/profile", tags=["profile"])
 def get_profile(db: Session = Depends(get_db)) -> UserProfileOut:
     profile = ensure_profile(db)
     return UserProfileOut.model_validate(profile)
+
+
+@router.get("/learning")
+def get_profile_learning(db: Session = Depends(get_db)) -> dict:
+    profile = ensure_profile(db)
+    return maybe_get_learning_snapshot(profile)
 
 
 @router.patch("", response_model=UserProfileOut)
@@ -45,6 +52,7 @@ def patch_profile(payload: UserProfilePatch, db: Session = Depends(get_db)) -> U
     if data.get("preferences") is not None:
         profile.preferences = data["preferences"]
         changed_fields.append("preferences")
+    normalize_profile(profile)
 
     profile.version += 1
     add_audit(

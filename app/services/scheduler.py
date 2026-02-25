@@ -251,6 +251,36 @@ def _deep_overlap_minutes(
     return int(total)
 
 
+def _meeting_preference_flags(profile: UserProfile) -> tuple[bool, bool]:
+    prefs = profile.preferences if isinstance(profile.preferences, dict) else {}
+    meeting = prefs.get("meeting_preferences")
+    if not isinstance(meeting, dict):
+        return False, False
+    return bool(meeting.get("prefer_morning", False)), bool(meeting.get("avoid_late_afternoon", False))
+
+
+def _meeting_time_score(start: datetime, end: datetime, tz: ZoneInfo, profile: UserProfile) -> int:
+    prefer_morning, avoid_late_afternoon = _meeting_preference_flags(profile)
+    if not prefer_morning and not avoid_late_afternoon:
+        return 0
+
+    local_start = _coerce_timezone(start, tz)
+    local_end = _coerce_timezone(end, tz)
+    start_hour = local_start.hour
+    score = 0
+
+    if prefer_morning:
+        if start_hour <= 12:
+            score += 600
+        else:
+            score -= 300
+
+    if avoid_late_afternoon and (start_hour >= 16 or local_end.hour >= 16):
+        score -= 800
+
+    return score
+
+
 def _slot_segments_from_intervals(
     intervals: list[Interval],
     horizon_start: datetime,
@@ -288,6 +318,7 @@ def _candidate_score(
     deep_windows: list[tuple[str, time, time, float]],
     tz: ZoneInfo,
     horizon_from: datetime,
+    profile: UserProfile,
 ) -> int:
     priority = PRIORITY_SCORE.get(task.priority, 1)
     minutes = int(max(0, (end - start).total_seconds() // 60))
@@ -305,12 +336,35 @@ def _candidate_score(
         minutes_to_due = int((due - start_norm).total_seconds() // 60)
         due_urgency_bonus = max(0, (24 * 60 * 3 - minutes_to_due) // 6)
 
+    learning_score = _meeting_time_score(start, end, tz, profile)
+
     if strategy == "urgent":
-        return int(base_reward + due_urgency_bonus - (start_bias // 4) - lateness * (180 + priority * 30) + deep_bonus * 2)
+        return int(
+            base_reward
+            + due_urgency_bonus
+            - (start_bias // 4)
+            - lateness * (180 + priority * 30)
+            + deep_bonus * 2
+            + learning_score
+        )
     if strategy == "focus":
         long_block_bonus = 500 if minutes >= 90 else 0
-        return int(base_reward + long_block_bonus - (start_bias // 10) - lateness * (90 + priority * 10) + deep_bonus * 12)
-    return int(base_reward + due_urgency_bonus // 2 - (start_bias // 6) - lateness * (130 + priority * 20) + deep_bonus * 4)
+        return int(
+            base_reward
+            + long_block_bonus
+            - (start_bias // 10)
+            - lateness * (90 + priority * 10)
+            + deep_bonus * 12
+            + learning_score
+        )
+    return int(
+        base_reward
+        + due_urgency_bonus // 2
+        - (start_bias // 6)
+        - lateness * (130 + priority * 20)
+        + deep_bonus * 4
+        + learning_score
+    )
 
 
 def _allocate_changes_cpsat(
@@ -368,7 +422,7 @@ def _allocate_changes_cpsat(
         for slot_start, slot_end in candidates:
             start_dt = horizon_from + timedelta(minutes=slot_start * slot_minutes)
             end_dt = horizon_from + timedelta(minutes=slot_end * slot_minutes)
-            score = _candidate_score(task, start_dt, end_dt, strategy, deep_windows, tz, horizon_from)
+            score = _candidate_score(task, start_dt, end_dt, strategy, deep_windows, tz, horizon_from, profile)
             scored.append((score, slot_start, slot_end, start_dt, end_dt))
 
         scored.sort(key=lambda item: item[0], reverse=True)
@@ -439,6 +493,7 @@ def _pick_interval(
     due: datetime | None,
     deep_windows: list[tuple[str, time, time, float]],
     tz: ZoneInfo,
+    profile: UserProfile,
 ) -> int | None:
     best_idx = None
     best_score = None
@@ -447,18 +502,19 @@ def _pick_interval(
     for idx, interval in enumerate(intervals):
         if interval.minutes < required_minutes:
             continue
+        learning_score = _meeting_time_score(interval.start, interval.end, tz, profile)
 
         if strategy == "stable":
-            score = interval.start.timestamp()
+            score = interval.start.timestamp() - learning_score
         elif strategy == "urgent":
             lateness_penalty = 0.0
             interval_end_norm = _as_naive_utc(interval.end)
             if due_norm and interval_end_norm > due_norm:
                 lateness_penalty = (interval_end_norm - due_norm).total_seconds() / 60 * 5.0
-            score = interval.start.timestamp() + lateness_penalty
+            score = interval.start.timestamp() + lateness_penalty - learning_score
         else:
             focus_bonus = _interval_focus_score(interval, deep_windows, tz)
-            score = interval.start.timestamp() - focus_bonus * 60
+            score = interval.start.timestamp() - focus_bonus * 60 - learning_score
 
         if best_score is None or score < best_score:
             best_idx = idx
@@ -486,7 +542,7 @@ def _allocate_changes(
     for task in _task_order(strategy, tasks):
         required = _task_required_minutes(task, slot_minutes)
 
-        picked = _pick_interval(available, required, strategy, task.due, deep_windows, tz)
+        picked = _pick_interval(available, required, strategy, task.due, deep_windows, tz, profile)
         if picked is None:
             continue
 
@@ -526,19 +582,37 @@ def _proposal_summary(strategy: str, *, engine: str) -> str:
     return f"{prefix} 집중형 제안: 딥워크 블록 우선 확보"
 
 
-def _proposal_explanation(strategy: str, *, engine: str, meta: dict | None = None) -> dict:
+def _proposal_explanation(
+    strategy: str,
+    *,
+    engine: str,
+    profile: UserProfile,
+    meta: dict | None = None,
+) -> dict:
+    prefer_morning, avoid_late_afternoon = _meeting_preference_flags(profile)
+    learning_applied = prefer_morning or avoid_late_afternoon
+    constraints = [
+        "근무시간/점심시간 준수",
+        "기존 캘린더 블록 충돌 회피",
+        "슬롯 단위 배치",
+    ]
+    notes = f"전략={strategy}"
+    if learning_applied:
+        constraints.append("학습 선호도 기반 보정 적용")
+        notes += " · 학습 선호도 기반 보정 적용"
+
     explanation = {
-        "constraints_applied": [
-            "근무시간/점심시간 준수",
-            "기존 캘린더 블록 충돌 회피",
-            "슬롯 단위 배치",
-        ],
+        "constraints_applied": constraints,
         "tradeoffs": [
             "변경 최소화와 마감 우선순위의 균형",
             "딥워크 확보와 전체 처리량 간 균형",
         ],
-        "notes": f"전략={strategy}",
+        "notes": notes,
         "engine": engine,
+        "learning_preferences": {
+            "prefer_morning": prefer_morning,
+            "avoid_late_afternoon": avoid_late_afternoon,
+        },
     }
     if meta:
         explanation["solver"] = meta
@@ -648,7 +722,7 @@ def generate_proposals(
 
             proposal = SchedulingProposal(
                 summary=_proposal_summary(strategy, engine="ortools_cp_sat"),
-                explanation=_proposal_explanation(strategy, engine="ortools_cp_sat", meta=meta),
+                explanation=_proposal_explanation(strategy, engine="ortools_cp_sat", profile=profile, meta=meta),
                 score={**_score(changes_payload, tasks_by_id), "engine": "ortools_cp_sat"},
                 horizon_from=horizon_from,
                 horizon_to=horizon_to,
@@ -674,7 +748,7 @@ def generate_proposals(
 
         proposal = SchedulingProposal(
             summary=_proposal_summary(strategy, engine="heuristic"),
-            explanation=_proposal_explanation(strategy, engine="heuristic"),
+            explanation=_proposal_explanation(strategy, engine="heuristic", profile=profile),
             score={**_score(changes_payload, tasks_by_id), "engine": "heuristic"},
             horizon_from=horizon_from,
             horizon_to=horizon_to,

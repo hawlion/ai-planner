@@ -9,7 +9,8 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.models import CalendarBlock
 from app.schemas import CalendarBlockCreate, CalendarBlockOut, CalendarBlockPatch
-from app.services.core import add_audit
+from app.services.core import add_audit, ensure_profile
+from app.services.learning import apply_learning_if_due, record_event_start_signal
 from app.services.graph_service import GraphApiError, GraphAuthError, delete_blocks_from_outlook, is_graph_connected
 
 router = APIRouter(prefix="/calendar/blocks", tags=["calendar"])
@@ -43,10 +44,15 @@ def create_block(payload: CalendarBlockCreate, db: Session = Depends(get_db)) ->
         raise HTTPException(status_code=422, detail="end must be later than start")
 
     _check_overlap(db, payload.start, payload.end)
+    profile = ensure_profile(db)
 
     row = CalendarBlock(**payload.model_dump())
     db.add(row)
     db.flush()
+    if row.source != "external":
+        record_event_start_signal(profile, row.start)
+        apply_learning_if_due(profile)
+
     add_audit(
         db,
         action="calendar_block.created",
@@ -92,12 +98,17 @@ def patch_block(block_id: str, payload: CalendarBlockPatch, db: Session = Depend
     if new_start != row.start or new_end != row.end:
         _check_overlap(db, new_start, new_end, exclude_id=row.id)
 
+    profile = ensure_profile(db)
+    should_record_event_start = row.source != "external" and (new_start != row.start)
     changed_fields: list[str] = []
     for field, value in data.items():
         if field == "version":
             continue
         setattr(row, field, value)
         changed_fields.append(field)
+    if should_record_event_start:
+        record_event_start_signal(profile, row.start)
+        apply_learning_if_due(profile)
 
     row.version += 1
     add_audit(

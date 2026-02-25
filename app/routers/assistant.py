@@ -16,6 +16,7 @@ from app.models import ActionItemCandidate, ApprovalRequest, CalendarBlock, Emai
 from app.schemas import AssistantActionOut, AssistantChatRequest, AssistantChatResponse
 from app.services.actions import approve_candidate, reject_candidate
 from app.services.core import ensure_profile
+from app.services.learning import apply_learning_if_due, record_event_start_signal, record_task_due_signal
 from app.services.graph_service import (
     GraphApiError,
     GraphAuthError,
@@ -1173,6 +1174,7 @@ def _register_meeting_and_apply(db: Session, note_text: str) -> tuple[str, list[
 def _create_task_from_message(
     db: Session, title: str, due: datetime | None, effort_minutes: int, priority: str
 ) -> tuple[str, list[AssistantActionOut], list[str]]:
+    profile = ensure_profile(db)
     task = Task(
         title=title.strip() or "새 작업",
         due=due,
@@ -1181,6 +1183,9 @@ def _create_task_from_message(
         source="chat",
     )
     db.add(task)
+    if task.due:
+        record_task_due_signal(profile, task.due)
+        apply_learning_if_due(profile)
     db.commit()
     db.refresh(task)
     return (
@@ -1232,6 +1237,10 @@ def _create_event_from_message(
         source="aawo",
     )
     db.add(block)
+    profile = ensure_profile(db)
+    if block.source != "external":
+        record_event_start_signal(profile, block.start)
+        apply_learning_if_due(profile)
     db.flush()
 
     synced = 0
@@ -1310,6 +1319,12 @@ def _reschedule_from_message(db: Session, hint: str) -> tuple[str, list[Assistan
 
     created_blocks, updated_blocks = apply_proposal(db, proposal)
     changed_blocks = [*created_blocks, *updated_blocks]
+    if changed_blocks:
+        for block in changed_blocks:
+            if block.source != "external":
+                record_event_start_signal(profile, block.start)
+        apply_learning_if_due(profile)
+
     synced = 0
     if changed_blocks and is_graph_connected(db):
         try:
@@ -1407,6 +1422,10 @@ def _update_due(db: Session, keyword: str | None, due: datetime | None) -> tuple
         return ("마감일을 변경할 할일을 찾지 못했습니다.", [], [])
 
     task.due = due
+    profile = ensure_profile(db)
+    if task.due:
+        record_task_due_signal(profile, task.due)
+        apply_learning_if_due(profile)
     task.version += 1
     db.commit()
     return (
@@ -1436,12 +1455,17 @@ def _update_task_from_message(
     if not task:
         return ("수정할 할일을 찾지 못했습니다. 정확한 작업 제목을 알려주세요.", [], [])
 
+    old_due = task.due
     changed: list[str] = []
     if new_title and new_title.strip() and new_title.strip() != task.title:
         task.title = new_title.strip()
         changed.append("제목")
     if due is not None:
         task.due = due
+        if task.due != old_due and task.due:
+            profile = ensure_profile(db)
+            record_task_due_signal(profile, task.due)
+            apply_learning_if_due(profile)
         changed.append("마감")
     if priority:
         mapped = PRIORITY_MAP.get(priority.strip().lower()) or PRIORITY_MAP.get(priority.strip())
@@ -1666,6 +1690,10 @@ def _move_event_from_message(
 
     target.start = new_start
     target.end = end
+    if target.source != "external":
+        profile = ensure_profile(db)
+        record_event_start_signal(profile, target.start)
+        apply_learning_if_due(profile)
     target.version += 1
     db.commit()
     db.refresh(target)
@@ -1751,6 +1779,12 @@ def _reschedule_after_hour(
     changed_blocks = [*created_blocks, *updated_blocks]
     if not changed_blocks:
         return ("재배치 제안을 만들었지만 적용 가능한 슬롯이 없어 변경하지 못했습니다.", [], ["calendar"])
+
+    if changed_blocks:
+        for block in changed_blocks:
+            if block.source != "external":
+                record_event_start_signal(profile, block.start)
+        apply_learning_if_due(profile)
 
     updated_ids = {row.id for row in updated_blocks}
     removed_blocks = [row for row in targets if row.task_id in task_ids and row.id not in updated_ids]

@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import AuditLog, UserProfile
+from app.services.learning import normalize_profile
 
 
 def now_local() -> datetime:
@@ -16,6 +17,10 @@ def now_local() -> datetime:
 def ensure_profile(db: Session) -> UserProfile:
     profile = db.query(UserProfile).order_by(UserProfile.created_at.asc()).first()
     if profile:
+        if normalize_profile(profile):
+            db.add(profile)
+            db.commit()
+            db.refresh(profile)
         return profile
 
     profile = UserProfile(timezone=settings.timezone)

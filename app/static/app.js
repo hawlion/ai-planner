@@ -1,8 +1,14 @@
 const API = "/api";
 const HOUR_START = 7;
 const HOUR_END = 22;
-const HOUR_HEIGHT = 56;
+const HOUR_HEIGHT = 60;
 const MIN_EVENT_HEIGHT = 18;
+const DEFAULT_BLOCK_MINUTES = 60;
+const STATIC_PROMPT_CHIPS = [
+  { label: "회의록 등록", prompt: "회의록: PM: 금요일까지 제안서 초안 작성. 디자이너: 목요일 오전 시안 공유" },
+  { label: "일정 재배치", prompt: "이번 주 일정 재배치해줘" },
+  { label: "우선순위 변경", prompt: "보고서 작업 우선순위 높음으로 변경해줘" },
+];
 
 const state = {
   profile: null,
@@ -19,6 +25,11 @@ const state = {
   approvalPromptInFlight: false,
   approvalPromptTimer: null,
   previewedApprovals: new Set(),
+  syncInProgress: false,
+  llmErrorReason: "",
+  llmErrorAt: null,
+  systemNotice: "",
+  systemNoticeIsError: false,
   chatHistory: [],
   localBlocks: [],
   remoteEvents: [],
@@ -97,11 +108,33 @@ function localInputToIso(value) {
   return date.toISOString();
 }
 
-function notify(message, isError = false) {
+function renderSystemStatus() {
   const el = $("status-message");
   if (!el) return;
-  el.textContent = message || "";
-  el.style.color = isError ? "#d93025" : "#5a6788";
+
+  let graphPart = "Graph: 미설정";
+  if (state.graphAuthError) {
+    graphPart = "Graph: 오류(재연결 필요)";
+  } else if (state.graph?.connected) {
+    graphPart = `Graph: 연결됨${state.graph.username ? `(${state.graph.username})` : ""}`;
+  } else if (state.graph?.configured) {
+    graphPart = "Graph: 미연결";
+  }
+
+  const syncAt = state.syncStatus?.last_delta_sync_at ? fmtDateTime(state.syncStatus.last_delta_sync_at) : "이력 없음";
+  const syncPart = state.syncInProgress ? "Sync: 진행 중" : `Sync: ${syncAt}`;
+  const llmPart = state.llmErrorReason ? `LLM: 오류(${clipText(state.llmErrorReason, 80)})` : "LLM: 정상";
+  const noticePart = state.systemNotice ? `알림: ${clipText(state.systemNotice, 120)}` : "";
+
+  el.textContent = [graphPart, syncPart, llmPart, noticePart].filter(Boolean).join(" | ");
+  const severity = state.systemNoticeIsError || state.graphAuthError || state.llmErrorReason ? "error" : "ok";
+  el.className = `status-line ${severity}`;
+}
+
+function notify(message, isError = false) {
+  state.systemNotice = String(message || "").trim();
+  state.systemNoticeIsError = Boolean(isError);
+  renderSystemStatus();
 }
 
 async function api(path, options = {}) {
@@ -147,6 +180,7 @@ async function loadGraphStatus() {
 
 async function loadSyncStatus() {
   state.syncStatus = await api("/sync/status");
+  renderSystemStatus();
 }
 
 function selectedDateParam() {
@@ -164,28 +198,22 @@ async function loadDailyBriefing() {
 
 function renderGraphStatus() {
   const label = $("graph-status-label");
-  if (!label || !state.graph) return;
-
-  if (state.graphAuthError) {
-    label.className = "status-pill warn";
-    label.textContent = "Graph 재연결 필요";
-    return;
+  if (label && state.graph) {
+    if (state.graphAuthError) {
+      label.className = "status-pill warn";
+      label.textContent = "Graph 재연결 필요";
+    } else if (state.graph.connected) {
+      label.className = "status-pill connected";
+      label.textContent = `연결됨: ${state.graph.username || "Microsoft"}`;
+    } else if (!state.graph.configured) {
+      label.className = "status-pill warn";
+      label.textContent = "Graph 설정 누락";
+    } else {
+      label.className = "status-pill";
+      label.textContent = "Graph 미연결";
+    }
   }
-
-  if (state.graph.connected) {
-    label.className = "status-pill connected";
-    label.textContent = `연결됨: ${state.graph.username || "Microsoft"}`;
-    return;
-  }
-
-  if (!state.graph.configured) {
-    label.className = "status-pill warn";
-    label.textContent = "Graph 설정 누락";
-    return;
-  }
-
-  label.className = "status-pill";
-  label.textContent = "Graph 미연결";
+  renderSystemStatus();
 }
 
 function renderDailyBriefing() {
@@ -269,6 +297,7 @@ function normalizeLocalBlocks(blocks) {
     end: new Date(block.end),
     kind: block.source === "external" ? "outlook" : block.outlook_event_id ? "mixed" : "local",
     source: block.source,
+    taskId: block.task_id || null,
     outlookId: block.outlook_event_id || null,
     version: typeof block.version === "number" ? block.version : null,
   }));
@@ -294,6 +323,59 @@ function mergedEvents() {
   return [...local, ...remote]
     .filter((item) => item.start instanceof Date && item.end instanceof Date)
     .sort((a, b) => a.start.getTime() - b.start.getTime());
+}
+
+function normalizedTaskKey(title) {
+  return String(title || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9가-힣\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildTaskDuplicateCounts() {
+  const counts = new Map();
+  for (const task of state.tasks || []) {
+    if (!task || task.status === "canceled") continue;
+    const key = normalizedTaskKey(task.title);
+    if (key.length < 2) continue;
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  return counts;
+}
+
+function eventIsConflicted(target, all) {
+  return all.some(
+    (other) =>
+      other.id !== target.id &&
+      other.start < target.end &&
+      other.end > target.start,
+  );
+}
+
+function countEventConflicts(events) {
+  const conflictedIds = new Set();
+  for (let i = 0; i < events.length; i += 1) {
+    for (let j = i + 1; j < events.length; j += 1) {
+      if (events[j].start >= events[i].end) break;
+      if (events[i].start < events[j].end && events[j].start < events[i].end) {
+        conflictedIds.add(events[i].id);
+        conflictedIds.add(events[j].id);
+      }
+    }
+  }
+  return conflictedIds.size;
+}
+
+function taskTitleById(taskId) {
+  if (!taskId) return "";
+  const row = (state.tasks || []).find((item) => item.id === taskId);
+  return row?.title || "";
+}
+
+function linkedBlockCount(taskId) {
+  if (!taskId) return 0;
+  return (state.localBlocks || []).filter((block) => block.task_id === taskId).length;
 }
 
 async function loadCalendarData() {
@@ -578,14 +660,19 @@ function renderWeekGrid() {
         const height = Math.max(MIN_EVENT_HEIGHT, (durationMinutes / 60) * HOUR_HEIGHT);
         const left = (event.lane / event.lanes) * 100;
         const width = 100 / event.lanes;
+        const hasConflict = event.lanes > 1;
+        const linkedTaskTitle = taskTitleById(event.taskId);
+        const linkedTaskHtml = linkedTaskTitle ? `<div class="event-link">🔗 ${escapeHtml(linkedTaskTitle)}</div>` : "";
 
         const isOutlook = event.kind === "outlook" || event.kind === "mixed";
         const encodedId = encodeURIComponent(event.id);
         return `
-          <div class="calendar-event ${event.kind}" data-open-event-id="${encodedId}" style="top:${top}px;height:${height}px;left:calc(${left}% + 2px);width:calc(${width}% - 4px);">
+          <div class="calendar-event ${event.kind}${hasConflict ? " conflict" : ""}" data-open-event-id="${encodedId}" style="top:${top}px;height:${height}px;left:calc(${left}% + 2px);width:calc(${width}% - 4px);">
             <button class="event-delete" data-event-id="${encodedId}" data-event-outlook="${isOutlook ? "1" : "0"}" title="일정 삭제">×</button>
+            ${hasConflict ? `<span class="event-conflict-badge">중복</span>` : ""}
             <div class="event-time">${fmtTime(event.start)}</div>
             <div class="event-title">${escapeHtml(event.title)}</div>
+            ${linkedTaskHtml}
           </div>
         `;
       })
@@ -643,6 +730,11 @@ function renderAgenda() {
     .map((event) => {
       const tags = [`<span class="tag">${event.kind === "outlook" ? "Outlook" : "Local"}</span>`];
       if (event.kind === "mixed") tags.push('<span class="tag outlook">Synced</span>');
+      if (eventIsConflicted(event, events)) tags.push('<span class="tag conflict">중복</span>');
+      if (event.taskId) {
+        const linkedTask = taskTitleById(event.taskId);
+        if (linkedTask) tags.push(`<span class="tag linked">할일:${escapeHtml(linkedTask)}</span>`);
+      }
       const isOutlook = event.kind === "outlook" || event.kind === "mixed";
       const encodedId = encodeURIComponent(event.id);
       return `
@@ -746,7 +838,106 @@ function openChatWindow() {
   fab.style.display = "none";
 }
 
+function roundToHalfHour(date) {
+  const d = new Date(date);
+  d.setSeconds(0, 0);
+  const minutes = d.getMinutes();
+  if (minutes === 0 || minutes === 30) return d;
+  if (minutes < 30) d.setMinutes(30);
+  else {
+    d.setHours(d.getHours() + 1);
+    d.setMinutes(0);
+  }
+  return d;
+}
+
+function withinVisibleWorkingHours(start, end) {
+  if (!isSameDay(start, end)) return false;
+  const startHour = start.getHours() + start.getMinutes() / 60;
+  const endHour = end.getHours() + end.getMinutes() / 60;
+  return startHour >= HOUR_START && endHour <= HOUR_END;
+}
+
+function hasEventConflict(start, end, events) {
+  return events.some((event) => event.start < end && event.end > start);
+}
+
+function buildTaskBlockCandidates(task, durationMinutes) {
+  const now = roundToHalfHour(new Date());
+  const candidates = [];
+  const seen = new Set();
+
+  const pushCandidate = (date) => {
+    const key = date.toISOString();
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(date);
+  };
+
+  if (task?.due) {
+    const due = new Date(task.due);
+    if (!Number.isNaN(due.getTime())) {
+      pushCandidate(new Date(due.getTime() - durationMinutes * 60000));
+      pushCandidate(new Date(due.getTime() - (durationMinutes + 60) * 60000));
+    }
+  }
+
+  pushCandidate(new Date(now));
+  const base = new Date(now);
+  for (let day = 0; day < 7; day += 1) {
+    for (let hour = Math.max(9, HOUR_START); hour <= Math.min(18, HOUR_END - 1); hour += 1) {
+      for (const minute of [0, 30]) {
+        const slot = new Date(base);
+        slot.setDate(base.getDate() + day);
+        slot.setHours(hour, minute, 0, 0);
+        pushCandidate(slot);
+      }
+    }
+  }
+  return candidates;
+}
+
+async function createCalendarBlockForTask(taskId) {
+  const task = (state.tasks || []).find((item) => item.id === taskId);
+  if (!task) throw new Error("대상 할일을 찾지 못했습니다.");
+
+  const duration = Math.max(30, Math.min(180, Number(task.effort_minutes || DEFAULT_BLOCK_MINUTES)));
+  const events = mergedEvents();
+  const candidates = buildTaskBlockCandidates(task, duration);
+
+  for (const start of candidates) {
+    const end = new Date(start.getTime() + duration * 60000);
+    if (end <= new Date()) continue;
+    if (!withinVisibleWorkingHours(start, end)) continue;
+    if (hasEventConflict(start, end, events)) continue;
+
+    try {
+      await api("/calendar/blocks", {
+        method: "POST",
+        body: JSON.stringify({
+          type: "task_block",
+          title: task.title,
+          start: start.toISOString(),
+          end: end.toISOString(),
+          task_id: task.id,
+          locked: false,
+        }),
+      });
+      await refreshAll();
+      notify(`할일을 캘린더에 배치했습니다: ${task.title}`);
+      return;
+    } catch (error) {
+      const msg = String(error?.message || "");
+      if (msg.includes("Calendar conflict")) continue;
+      throw error;
+    }
+  }
+
+  throw new Error("가용 슬롯을 찾지 못했습니다. 일정 재배치를 먼저 실행해 주세요.");
+}
+
 function renderTasks() {
+  const duplicateCounts = buildTaskDuplicateCounts();
   const activeTasks = state.tasks.filter(t => t.status !== "canceled" && t.status !== "done").sort((a, b) => {
     const aDue = a.due ? new Date(a.due).getTime() : Number.MAX_SAFE_INTEGER;
     const bDue = b.due ? new Date(b.due).getTime() : Number.MAX_SAFE_INTEGER;
@@ -764,17 +955,23 @@ function renderTasks() {
     return;
   }
 
-  const renderItem = (task) => `
-    <div class="todo-item">
-      <div class="todo-title">${escapeHtml(task.title)}</div>
-      <div class="todo-meta">${task.due ? fmtDateTime(task.due) : "마감 없음"} · ${escapeHtml(task.priority)}</div>
+  const renderItem = (task) => {
+    const dupKey = normalizedTaskKey(task.title);
+    const dupCount = duplicateCounts.get(dupKey) || 0;
+    const linkedCount = linkedBlockCount(task.id);
+    return `
+    <div class="todo-item ${dupCount > 1 ? "duplicate" : ""}">
+      <div class="todo-title">${escapeHtml(task.title)}${dupCount > 1 ? ` <span class="task-dup-badge">중복 x${dupCount}</span>` : ""}</div>
+      <div class="todo-meta">${task.due ? fmtDateTime(task.due) : "마감 없음"} · ${escapeHtml(task.priority)} · 캘린더 ${linkedCount}건</div>
       <div class="meta-row">
         <span class="tag ${task.status === "done" ? "done" : ""}">${escapeHtml(task.status)}</span>
+        <button class="btn btn-ghost btn-mini" type="button" data-task-schedule="${task.id}">캘린더로 배치</button>
         <button class="btn btn-ghost btn-mini" type="button" data-task-progress="${task.id}" data-task-version="${task.version}">진행중</button>
         <button class="btn btn-ghost btn-mini" type="button" data-task-done="${task.id}" data-task-version="${task.version}">완료</button>
       </div>
     </div>
   `;
+  };
 
   let html = activeTasks.map(renderItem).join("");
 
@@ -817,6 +1014,16 @@ function renderTasks() {
         });
         await refreshTasksOnly();
         notify("할일 상태를 완료로 변경했습니다.");
+      } catch (error) {
+        notify(error.message, true);
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-task-schedule]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        await createCalendarBlockForTask(button.dataset.taskSchedule);
       } catch (error) {
         notify(error.message, true);
       }
@@ -1057,57 +1264,64 @@ async function syncBidirectional(silent = false) {
     throw new Error("Outlook 연결 후 동기화할 수 있습니다.");
   }
 
-  const exportResult = await api("/graph/calendar/export", { method: "POST" });
-  const importResult = await api("/sync/calendar/delta", { method: "POST" });
-  let todoExportResult = null;
-  let todoDeltaResult = null;
-  let mailDeltaResult = null;
-  let mailRecoveryUsed = false;
+  state.syncInProgress = true;
+  renderSystemStatus();
   try {
-    todoExportResult = await api("/graph/todo/export", { method: "POST" });
-    todoDeltaResult = await api("/sync/todo/delta", { method: "POST" });
-  } catch (error) {
-    console.warn("To Do export skipped:", error);
-  }
-  try {
-    mailDeltaResult = await api("/sync/mail/delta", { method: "POST" });
-    if ((mailDeltaResult?.processed || 0) === 0 && (mailDeltaResult?.skipped_read || 0) > 0) {
-      try {
-        const recovery = await api("/sync/mail/delta?reset=true&unread_only=false", { method: "POST" });
-        mailRecoveryUsed = true;
-        mailDeltaResult = {
-          processed: Number(mailDeltaResult.processed || 0) + Number(recovery.processed || 0),
-          created_approvals: Number(mailDeltaResult.created_approvals || 0) + Number(recovery.created_approvals || 0),
-          ignored: Number(mailDeltaResult.ignored || 0) + Number(recovery.ignored || 0),
-          skipped_existing: Number(mailDeltaResult.skipped_existing || 0) + Number(recovery.skipped_existing || 0),
-          skipped_read: Number(mailDeltaResult.skipped_read || 0) + Number(recovery.skipped_read || 0),
-          processed_read_actionable:
-            Number(mailDeltaResult.processed_read_actionable || 0) + Number(recovery.processed_read_actionable || 0),
-        };
-      } catch (recoveryError) {
-        console.warn("Mail delta recovery skipped:", recoveryError);
-      }
+    const exportResult = await api("/graph/calendar/export", { method: "POST" });
+    const importResult = await api("/sync/calendar/delta", { method: "POST" });
+    let todoExportResult = null;
+    let todoDeltaResult = null;
+    let mailDeltaResult = null;
+    let mailRecoveryUsed = false;
+    try {
+      todoExportResult = await api("/graph/todo/export", { method: "POST" });
+      todoDeltaResult = await api("/sync/todo/delta", { method: "POST" });
+    } catch (error) {
+      console.warn("To Do export skipped:", error);
     }
-  } catch (error) {
-    console.warn("Mail delta skipped:", error);
-  }
-  const createdApprovalCount = Number(mailDeltaResult?.created_approvals || 0);
-  if (createdApprovalCount > 0) {
-    await refreshAll({ promptPendingApproval: false });
-    promptNextPendingApprovalInChat({ preferType: "email_intake" });
-  } else {
-    await refreshAll();
-  }
-  if (!silent) {
-    const todoSummary = todoExportResult && todoDeltaResult
-      ? ` / To Do 내보내기 ${todoExportResult.created + todoExportResult.updated}건(생성 ${todoExportResult.created}, 업데이트 ${todoExportResult.updated}, 실패 ${todoExportResult.failed}) + delta ${todoDeltaResult.created + todoDeltaResult.updated}건(신규 ${todoDeltaResult.created}, 수정 ${todoDeltaResult.updated}, 삭제 ${todoDeltaResult.deleted})`
-      : " / To Do 내보내기 보류";
-    const mailSummary = mailDeltaResult
-      ? ` / 메일 분류 ${mailDeltaResult.processed}건(승인 요청 ${mailDeltaResult.created_approvals}, 무시 ${mailDeltaResult.ignored}, 기존건너뜀 ${mailDeltaResult.skipped_existing || 0}, 읽음건너뜀 ${mailDeltaResult.skipped_read || 0}, 읽음처리 ${mailDeltaResult.processed_read_actionable || 0}${mailRecoveryUsed ? ", 읽음메일 보강스캔 실행" : ""})`
-      : " / 메일 분류 보류";
-    notify(
-      `동기화 완료 · 일정 내보내기 ${exportResult.synced}건(생성 ${exportResult.created}, 업데이트 ${exportResult.updated}) / delta 반영 ${importResult.created + importResult.updated}건(신규 ${importResult.created}, 수정 ${importResult.updated}, 삭제 ${importResult.deleted})${todoSummary}${mailSummary}`,
-    );
+    try {
+      mailDeltaResult = await api("/sync/mail/delta", { method: "POST" });
+      if ((mailDeltaResult?.processed || 0) === 0 && (mailDeltaResult?.skipped_read || 0) > 0) {
+        try {
+          const recovery = await api("/sync/mail/delta?reset=true&unread_only=false", { method: "POST" });
+          mailRecoveryUsed = true;
+          mailDeltaResult = {
+            processed: Number(mailDeltaResult.processed || 0) + Number(recovery.processed || 0),
+            created_approvals: Number(mailDeltaResult.created_approvals || 0) + Number(recovery.created_approvals || 0),
+            ignored: Number(mailDeltaResult.ignored || 0) + Number(recovery.ignored || 0),
+            skipped_existing: Number(mailDeltaResult.skipped_existing || 0) + Number(recovery.skipped_existing || 0),
+            skipped_read: Number(mailDeltaResult.skipped_read || 0) + Number(recovery.skipped_read || 0),
+            processed_read_actionable:
+              Number(mailDeltaResult.processed_read_actionable || 0) + Number(recovery.processed_read_actionable || 0),
+          };
+        } catch (recoveryError) {
+          console.warn("Mail delta recovery skipped:", recoveryError);
+        }
+      }
+    } catch (error) {
+      console.warn("Mail delta skipped:", error);
+    }
+    const createdApprovalCount = Number(mailDeltaResult?.created_approvals || 0);
+    if (createdApprovalCount > 0) {
+      await refreshAll({ promptPendingApproval: false });
+      promptNextPendingApprovalInChat({ preferType: "email_intake" });
+    } else {
+      await refreshAll();
+    }
+    if (!silent) {
+      const todoSummary = todoExportResult && todoDeltaResult
+        ? ` / To Do 내보내기 ${todoExportResult.created + todoExportResult.updated}건(생성 ${todoExportResult.created}, 업데이트 ${todoExportResult.updated}, 실패 ${todoExportResult.failed}) + delta ${todoDeltaResult.created + todoDeltaResult.updated}건(신규 ${todoDeltaResult.created}, 수정 ${todoDeltaResult.updated}, 삭제 ${todoDeltaResult.deleted})`
+        : " / To Do 내보내기 보류";
+      const mailSummary = mailDeltaResult
+        ? ` / 메일 분류 ${mailDeltaResult.processed}건(승인 요청 ${mailDeltaResult.created_approvals}, 무시 ${mailDeltaResult.ignored}, 기존건너뜀 ${mailDeltaResult.skipped_existing || 0}, 읽음건너뜀 ${mailDeltaResult.skipped_read || 0}, 읽음처리 ${mailDeltaResult.processed_read_actionable || 0}${mailRecoveryUsed ? ", 읽음메일 보강스캔 실행" : ""})`
+        : " / 메일 분류 보류";
+      notify(
+        `동기화 완료 · 일정 내보내기 ${exportResult.synced}건(생성 ${exportResult.created}, 업데이트 ${exportResult.updated}) / delta 반영 ${importResult.created + importResult.updated}건(신규 ${importResult.created}, 수정 ${importResult.updated}, 삭제 ${importResult.deleted})${todoSummary}${mailSummary}`,
+      );
+    }
+  } finally {
+    state.syncInProgress = false;
+    renderSystemStatus();
   }
 }
 
@@ -1125,6 +1339,51 @@ async function syncTodoFromGraph() {
   const result = await api(`/graph/todo/lists/${first.id}/import`, { method: "POST" });
   await refreshTasksOnly();
   notify(`To Do 가져오기 완료: ${result.imported}/${result.tasks}`);
+}
+
+function buildDynamicPromptChips() {
+  const chips = [];
+  const now = new Date();
+  const activeTasks = (state.tasks || []).filter((task) => !["done", "canceled"].includes(task.status));
+  const pendingEmailApprovals = (state.approvals || []).filter((row) => row.type === "email_intake").length;
+  const conflictCount = countEventConflicts(mergedEvents());
+  const overdueCount = activeTasks.filter((task) => task.due && new Date(task.due) < now).length;
+  const unscheduledCount = activeTasks.filter((task) => linkedBlockCount(task.id) === 0).length;
+
+  if (pendingEmailApprovals > 0) {
+    chips.push({
+      label: `메일 승인 ${pendingEmailApprovals}건`,
+      prompt: "대기 중인 메일 승인 요청을 최신 순으로 하나씩 처리해줘",
+    });
+  }
+  if (conflictCount > 0) {
+    chips.push({
+      label: `중복 일정 ${conflictCount}건`,
+      prompt: "겹치는 일정들을 충돌 없게 재배치해줘",
+    });
+  }
+  if (overdueCount > 0) {
+    chips.push({
+      label: `지연 작업 ${overdueCount}건`,
+      prompt: "지연된 작업 우선순위와 마감 일정을 정리해줘",
+    });
+  }
+  if (unscheduledCount > 0) {
+    chips.push({
+      label: `미배치 작업 ${unscheduledCount}건`,
+      prompt: "아직 캘린더에 배치되지 않은 작업을 중요도 순으로 배치해줘",
+    });
+  }
+  return chips.slice(0, 4);
+}
+
+function renderPromptChips() {
+  const container = $("chat-prompts");
+  if (!container) return;
+  const merged = [...STATIC_PROMPT_CHIPS, ...buildDynamicPromptChips()];
+  container.innerHTML = merged
+    .map((chip) => `<button class="prompt-chip" type="button" data-prompt="${escapeHtml(chip.prompt)}">${escapeHtml(chip.label)}</button>`)
+    .join("");
 }
 
 function approvalCardMeta(action) {
@@ -1392,11 +1651,18 @@ function composeAssistantReply(result) {
   const llmError = actions.find((item) => item.type === "llm_error");
   if (llmError) {
     const reason = String(llmError?.detail?.reason || "").trim();
+    state.llmErrorReason = reason || "LLM 호출 실패";
+    state.llmErrorAt = new Date().toISOString();
+    renderSystemStatus();
     if (reason) {
       const brief = reason.length > 180 ? `${reason.slice(0, 180)}...` : reason;
       return `${result.reply}\n\n원인: ${brief}\n\n작업: llm_error`;
     }
+    return `${result.reply}\n\n작업: llm_error`;
   }
+  state.llmErrorReason = "";
+  state.llmErrorAt = null;
+  renderSystemStatus();
   const actionSummary = actions.map((item) => item.type).join(", ");
   return actionSummary ? `${result.reply}\n\n작업: ${actionSummary}` : result.reply;
 }
@@ -1440,6 +1706,7 @@ async function refreshCalendarOnly() {
   renderAgenda();
   renderMiniMonth();
   renderDailyBriefing();
+  renderPromptChips();
   ensureLiveBriefingTicker();
 }
 
@@ -1463,6 +1730,7 @@ async function refreshAll({ promptPendingApproval = true, preferApprovalType = n
   renderMiniMonth();
   renderTasks();
   renderDailyBriefing();
+  renderPromptChips();
   ensureLiveBriefingTicker();
   if (promptPendingApproval) {
     promptNextPendingApprovalInChat({ preferType: preferApprovalType });
@@ -1611,11 +1879,11 @@ function bindEvents() {
     }
   });
 
-  document.querySelectorAll(".prompt-chip").forEach((button) => {
-    button.addEventListener("click", () => {
-      $("chat-input").value = button.dataset.prompt || "";
-      $("chat-input").focus();
-    });
+  $("chat-prompts").addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target.closest(".prompt-chip") : null;
+    if (!target) return;
+    $("chat-input").value = target.dataset.prompt || "";
+    $("chat-input").focus();
   });
 
   document.addEventListener("visibilitychange", () => {
@@ -1631,6 +1899,7 @@ async function bootstrap() {
     bindEvents();
     initChatToggle();
     renderTimeLabels();
+    renderSystemStatus();
 
     const due = addDays(new Date(), 1);
     due.setHours(10, 0, 0, 0);
@@ -1649,6 +1918,7 @@ async function bootstrap() {
     await loadProfile();
     await refreshAll({ promptPendingApproval: false });
     scrollCalendarToNow();
+    renderPromptChips();
 
     addChatMessage(
       "assistant",
