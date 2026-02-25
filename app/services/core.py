@@ -25,6 +25,10 @@ def ensure_profile(db: Session) -> UserProfile:
     return profile
 
 
-def write_audit(db: Session, action: str, object_ref: str | None = None, actor: str = "user", meta: dict | None = None) -> None:
+def add_audit(db: Session, action: str, object_ref: str | None = None, actor: str = "user", meta: dict | None = None) -> None:
     db.add(AuditLog(action=action, object_ref=object_ref, actor=actor, meta=meta or {}))
+
+
+def write_audit(db: Session, action: str, object_ref: str | None = None, actor: str = "user", meta: dict | None = None) -> None:
+    add_audit(db, action=action, object_ref=object_ref, actor=actor, meta=meta)
     db.commit()

@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.models import CalendarBlock
-from app.schemas import GraphAuthUrlOut, GraphCalendarEventCreate, GraphStatusOut, GraphTodoTaskCreate
+from app.schemas import GraphAuthUrlOut, GraphCalendarEventCreate, GraphStatusOut, GraphTodoTaskCreate, GraphTodoTaskPatch
 from app.services.graph_service import (
     GraphApiError,
     GraphAuthError,
@@ -20,6 +20,7 @@ from app.services.graph_service import (
     create_todo_task,
     delete_calendar_event,
     disconnect_graph,
+    export_tasks_to_todo,
     export_calendar_to_outlook,
     format_graph_datetime,
     import_calendar_to_local,
@@ -29,6 +30,8 @@ from app.services.graph_service import (
     list_todo_tasks,
     ping_me,
     status_payload,
+    update_todo_task,
+    delete_todo_task,
 )
 
 router = APIRouter(prefix="/graph", tags=["graph"])
@@ -230,6 +233,62 @@ def graph_create_todo_task(list_id: str, payload: GraphTodoTaskCreate, db: Sessi
 
     try:
         return create_todo_task(db, list_id, body)
+    except GraphAuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except GraphApiError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@router.patch("/todo/lists/{list_id}/tasks/{task_id}")
+def graph_patch_todo_task(
+    list_id: str,
+    task_id: str,
+    payload: GraphTodoTaskPatch,
+    db: Session = Depends(get_db),
+) -> dict:
+    data = payload.model_dump(exclude_unset=True)
+    body: dict = {}
+    if "title" in data:
+        body["title"] = data["title"]
+    if "body" in data:
+        if data["body"]:
+            body["body"] = {"contentType": "text", "content": data["body"]}
+        else:
+            body["body"] = None
+    if "due" in data:
+        body["dueDateTime"] = format_graph_datetime(data["due"]) if data["due"] else None
+    if "status" in data:
+        body["status"] = data["status"]
+    if "importance" in data:
+        body["importance"] = data["importance"]
+
+    if not body:
+        raise HTTPException(status_code=422, detail="No fields to update")
+
+    try:
+        return update_todo_task(db, list_id, task_id, body)
+    except GraphAuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except GraphApiError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@router.delete("/todo/lists/{list_id}/tasks/{task_id}")
+def graph_delete_todo_task(list_id: str, task_id: str, db: Session = Depends(get_db)) -> dict:
+    try:
+        delete_todo_task(db, list_id, task_id)
+    except GraphAuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except GraphApiError as exc:
+        if exc.status_code != 404:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return {"deleted": True, "task_id": task_id, "list_id": list_id}
+
+
+@router.post("/todo/export")
+def graph_export_todo(list_id: str | None = Query(default=None), db: Session = Depends(get_db)) -> dict:
+    try:
+        return export_tasks_to_todo(db, list_id=list_id)
     except GraphAuthError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except GraphApiError as exc:

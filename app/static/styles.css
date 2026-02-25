@@ -734,6 +734,41 @@ select:focus {
   gap: 6px;
 }
 
+.chat-approval-edit {
+  margin-top: 8px;
+  border-top: 1px dashed var(--line);
+  padding-top: 8px;
+  display: grid;
+  gap: 6px;
+}
+
+.chat-approval-edit.hidden {
+  display: none;
+}
+
+.chat-edit-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.chat-edit-label {
+  font-size: 11px;
+  color: var(--ink-soft);
+  display: grid;
+  gap: 4px;
+}
+
+.chat-edit-input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--ink);
+}
+
 .chat-prompts {
   display: flex;
   flex-wrap: wrap;

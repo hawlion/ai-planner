@@ -25,6 +25,33 @@ class OpenAIIntegrationError(RuntimeError):
     pass
 
 
+def _clip_text(value: str | None, limit: int = 160) -> str:
+    text = (value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _is_retryable_openai_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    retry_tokens = [
+        "timeout",
+        "timed out",
+        "rate limit",
+        "429",
+        "503",
+        "502",
+        "500",
+        "overloaded",
+        "temporar",
+        "connection",
+        "network",
+        "service unavailable",
+        "retry",
+    ]
+    return any(token in text for token in retry_tokens)
+
+
 class ActionItemOutput(BaseModel):
     title: str = Field(min_length=3, max_length=180)
     assignee_name: str | None = None
@@ -133,6 +160,20 @@ class AssistantPlanOutput(BaseModel):
     note: str | None = ""
 
 
+class EmailTriageOutput(BaseModel):
+    classification: Literal["no_action", "task", "event", "task_and_event", "unclear"]
+    reason: str = Field(min_length=3, max_length=600)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    task_title: str | None = None
+    task_due: str | None = None
+    task_priority: Literal["low", "medium", "high", "critical"] | None = None
+    task_description: str | None = None
+    event_title: str | None = None
+    event_start: str | None = None
+    event_end: str | None = None
+    event_location: str | None = None
+
+
 
 MODEL_PURPOSE = Literal["default", "assistant", "nli", "extraction"]
 
@@ -188,68 +229,81 @@ def _chat_json(
     temp = settings.openai_temperature if temperature is None else float(temperature)
     last_error: Exception | None = None
     started_at = time.monotonic()
-    # Cap total wait so model fallback does not multiply user-facing latency.
-    max_total_wait = max(8.0, float(settings.openai_timeout_seconds) + 1.0)
+    # Cap total wait so model fallback/retries do not multiply user-facing latency.
+    max_total_wait = max(12.0, float(settings.openai_timeout_seconds) + 10.0)
+    max_retries = 2
 
     for model in models:
-        content = ""
-        try:
-            request_args = {
-                "model": model,
-                "temperature": temp,
-                "response_format": {"type": "json_object"},
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            }
-            response = client.chat.completions.create(**request_args)
-            content = response.choices[0].message.content or "{}"
-            if isinstance(content, list):
-                content = "".join(
-                    part.get("text", "") if isinstance(part, dict) else str(part)
-                    for part in content
-                )
-            return json.loads(content)
-        except Exception as exc:  # noqa: BLE001
-            # Some models (e.g. gpt-5-mini) only allow default temperature.
-            text = str(exc)
-            if "temperature" in text and ("Unsupported value" in text or "does not support" in text):
-                try:
-                    retry_args = {
-                        "model": model,
-                        "response_format": {"type": "json_object"},
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                    }
-                    response = client.chat.completions.create(**retry_args)
-                    content = response.choices[0].message.content or "{}"
-                    if isinstance(content, list):
-                        content = "".join(
-                            part.get("text", "") if isinstance(part, dict) else str(part)
-                            for part in content
-                        )
-                    return json.loads(content)
-                except Exception as retry_exc:  # noqa: BLE001
-                    exc = retry_exc
-            last_error = exc
-            logger.warning(
-                "OpenAI request failed for purpose=%s model=%s: %s",
-                purpose,
-                model,
-                exc,
-            )
-
-            elapsed = time.monotonic() - started_at
-            if elapsed >= max_total_wait:
+        for attempt in range(max_retries + 1):
+            content = ""
+            try:
+                request_args = {
+                    "model": model,
+                    "temperature": temp,
+                    "response_format": {"type": "json_object"},
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                }
+                response = client.chat.completions.create(**request_args)
+                content = response.choices[0].message.content or "{}"
+                if isinstance(content, list):
+                    content = "".join(
+                        part.get("text", "") if isinstance(part, dict) else str(part)
+                        for part in content
+                    )
+                return json.loads(content)
+            except Exception as exc:  # noqa: BLE001
+                # Some models (e.g. gpt-5-mini) only allow default temperature.
+                text = str(exc)
+                if "temperature" in text and ("Unsupported value" in text or "does not support" in text):
+                    try:
+                        retry_args = {
+                            "model": model,
+                            "response_format": {"type": "json_object"},
+                            "messages": [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt},
+                            ],
+                        }
+                        response = client.chat.completions.create(**retry_args)
+                        content = response.choices[0].message.content or "{}"
+                        if isinstance(content, list):
+                            content = "".join(
+                                part.get("text", "") if isinstance(part, dict) else str(part)
+                                for part in content
+                            )
+                        return json.loads(content)
+                    except Exception as retry_exc:  # noqa: BLE001
+                        exc = retry_exc
+                last_error = exc
                 logger.warning(
-                    "OpenAI fallback skipped due to total timeout budget reached: purpose=%s elapsed=%.2fs",
+                    "OpenAI request failed for purpose=%s model=%s attempt=%s: %s",
                     purpose,
-                    elapsed,
+                    model,
+                    attempt + 1,
+                    exc,
                 )
-                break
+
+                elapsed = time.monotonic() - started_at
+                exhausted = attempt >= max_retries
+                retryable = _is_retryable_openai_error(exc)
+                if elapsed >= max_total_wait:
+                    logger.warning(
+                        "OpenAI retries stopped by total timeout budget: purpose=%s elapsed=%.2fs",
+                        purpose,
+                        elapsed,
+                    )
+                    exhausted = True
+                if exhausted or not retryable:
+                    break
+
+                backoff = min(1.5 * (attempt + 1), 3.0)
+                time.sleep(backoff)
+
+        if time.monotonic() - started_at >= max_total_wait:
+            break
 
     raise OpenAIIntegrationError(
         f"OpenAI API request failed for all models={models}: {last_error}"
@@ -272,6 +326,28 @@ def _parse_due(value: str | None, base_dt: datetime) -> datetime | None:
         languages=["ko", "en"],
     )
     return parsed
+
+
+def _parse_datetime_value(value: str | None, base_dt: datetime) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=base_dt.tzinfo)
+        return parsed
+    except ValueError:
+        pass
+    return dateparser.parse(
+        value,
+        settings={
+            "PREFER_DATES_FROM": "future",
+            "RELATIVE_BASE": base_dt,
+            "TIMEZONE": settings.timezone,
+            "RETURN_AS_TIMEZONE_AWARE": True,
+        },
+        languages=["ko", "en"],
+    )
 
 
 
@@ -369,6 +445,63 @@ def parse_nli_openai(text: str, base_dt: datetime) -> NLIOutput:
     return parsed
 
 
+def parse_email_triage_openai(
+    *,
+    subject: str,
+    sender: str | None,
+    body_preview: str | None,
+    received_at: datetime,
+) -> EmailTriageOutput:
+    system_prompt = (
+        "You classify incoming work email for an AI planner."
+        " Return strict JSON only with fields:"
+        " classification(no_action|task|event|task_and_event|unclear),"
+        " reason, confidence, task_title, task_due, task_priority, task_description,"
+        " event_title, event_start, event_end, event_location."
+        " Rules:"
+        " 1) no_action if message is informational only, newsletter/promotional,"
+        "    FYI/announcement, automated receipt/notification, already-resolved thread,"
+        "    or does not require recipient action."
+        " 2) task/event/task_and_event only when explicit action or schedule commitment exists."
+        " 3) Do not hallucinate missing details."
+        " 4) task_title/event_title should be concise and concrete."
+        " 5) Datetime fields should be ISO-8601 when inferable; otherwise null."
+    )
+
+    user_prompt = (
+        f"timezone={settings.timezone}\n"
+        f"received_at={received_at.isoformat()}\n"
+        f"sender={(sender or '').strip()}\n"
+        f"subject={subject.strip()}\n"
+        f"body_preview={(body_preview or '').strip()}\n"
+    )
+
+    payload = _chat_json(system_prompt, user_prompt, purpose="assistant", temperature=settings.openai_assistant_temperature)
+    try:
+        parsed = EmailTriageOutput.model_validate(payload)
+    except ValidationError as exc:
+        raise OpenAIIntegrationError(f"OpenAI email triage schema validation failed: {exc}") from exc
+
+    # Normalize inferred datetimes if model returns natural language.
+    task_due = _parse_datetime_value(parsed.task_due, received_at)
+    event_start = _parse_datetime_value(parsed.event_start, received_at)
+    event_end = _parse_datetime_value(parsed.event_end, received_at)
+
+    return EmailTriageOutput(
+        classification=parsed.classification,
+        reason=parsed.reason,
+        confidence=float(parsed.confidence),
+        task_title=parsed.task_title,
+        task_due=task_due.isoformat() if task_due else None,
+        task_priority=parsed.task_priority,
+        task_description=parsed.task_description,
+        event_title=parsed.event_title,
+        event_start=event_start.isoformat() if event_start else None,
+        event_end=event_end.isoformat() if event_end else None,
+        event_location=parsed.event_location,
+    )
+
+
 def parse_assistant_action_openai(text: str, base_dt: datetime) -> AssistantActionOutput:
     system_prompt = (
         "You are an assistant action parser for a work planner."
@@ -415,42 +548,42 @@ def parse_assistant_plan_openai(
     pending_approvals: list[dict] | None = None,
 ) -> AssistantPlanOutput:
     context_lines: list[str] = []
-    for item in task_context[:40]:
+    for item in task_context[:30]:
         context_lines.append(
             "- title={title} | status={status} | priority={priority} | due={due}".format(
-                title=item.get("title") or "",
-                status=item.get("status") or "",
-                priority=item.get("priority") or "",
-                due=item.get("due") or "",
+                title=_clip_text(str(item.get("title") or ""), 90),
+                status=_clip_text(str(item.get("status") or ""), 24),
+                priority=_clip_text(str(item.get("priority") or ""), 24),
+                due=_clip_text(str(item.get("due") or ""), 40),
             )
         )
 
     history_lines: list[str] = []
-    for turn in (history or [])[-8:]:
+    for turn in (history or [])[-6:]:
         role = str(turn.get("role") or "").strip().lower()
-        text_value = str(turn.get("text") or "").strip()
+        text_value = _clip_text(str(turn.get("text") or ""), 280)
         if role not in {"user", "assistant"} or not text_value:
             continue
         history_lines.append(f"{role}: {text_value}")
 
     event_lines: list[str] = []
-    for item in (calendar_context or [])[:40]:
+    for item in (calendar_context or [])[:30]:
         event_lines.append(
             "- title={title} | start={start} | end={end} | source={source}".format(
-                title=item.get("title") or "",
-                start=item.get("start") or "",
-                end=item.get("end") or "",
-                source=item.get("source") or "",
+                title=_clip_text(str(item.get("title") or ""), 90),
+                start=_clip_text(str(item.get("start") or ""), 40),
+                end=_clip_text(str(item.get("end") or ""), 40),
+                source=_clip_text(str(item.get("source") or ""), 24),
             )
         )
 
     approval_lines: list[str] = []
-    for item in (pending_approvals or [])[:20]:
+    for item in (pending_approvals or [])[:15]:
         approval_lines.append(
             "- id={id} | type={type} | summary={summary}".format(
-                id=item.get("id") or "",
-                type=item.get("type") or "",
-                summary=item.get("summary") or "",
+                id=_clip_text(str(item.get("id") or ""), 48),
+                type=_clip_text(str(item.get("type") or ""), 24),
+                summary=_clip_text(str(item.get("summary") or ""), 120),
             )
         )
 

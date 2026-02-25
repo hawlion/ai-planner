@@ -7,13 +7,14 @@ from zoneinfo import ZoneInfo
 import dateparser
 from fastapi import APIRouter, Depends
 from sqlalchemy import and_, or_, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.db import get_db
-from app.models import ActionItemCandidate, ApprovalRequest, CalendarBlock, Meeting, SchedulingProposal, Task
+from app.db import engine, get_db
+from app.models import ActionItemCandidate, ApprovalRequest, CalendarBlock, EmailTriage, Meeting, SchedulingProposal, Task
 from app.schemas import AssistantActionOut, AssistantChatRequest, AssistantChatResponse
-from app.services.actions import approve_candidate
+from app.services.actions import approve_candidate, reject_candidate
 from app.services.core import ensure_profile
 from app.services.graph_service import (
     GraphApiError,
@@ -21,6 +22,7 @@ from app.services.graph_service import (
     delete_blocks_from_outlook,
     is_graph_connected,
     sync_blocks_to_outlook,
+    sync_task_to_todo,
 )
 from app.services.meeting_extractor import extract_action_items
 from app.services.openai_client import (
@@ -52,7 +54,7 @@ YES_TOKENS = {"응", "네", "예", "승인", "확인", "좋아", "진행", "ok",
 NO_TOKENS = {"아니", "아니요", "거절", "취소", "중단", "안해", "no", "nope", "reject", "cancel", "stop"}
 CHAT_CLARIFICATION_TYPE = "chat_clarification"
 CHAT_CONFIRM_TYPE = "chat_pending_action"
-CHAT_APPROVABLE_TYPES = {CHAT_CONFIRM_TYPE, "reschedule", "action_item"}
+CHAT_APPROVABLE_TYPES = {CHAT_CONFIRM_TYPE, "reschedule", "action_item", "email_intake"}
 GENERIC_KEYWORDS = {
     "작업",
     "업무",
@@ -524,6 +526,27 @@ def _latest_pending_approval(
     if approval_id:
         stmt = stmt.where(ApprovalRequest.id == approval_id)
     return db.execute(stmt.order_by(ApprovalRequest.created_at.desc())).scalars().first()
+
+
+def _parse_email_approval_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed
+    local = parsed.astimezone(ZoneInfo(settings.timezone))
+    return local.replace(tzinfo=None)
+
+
+def _ensure_email_triage_table(db: Session) -> None:
+    try:
+        db.execute(select(EmailTriage.id).limit(1))
+    except OperationalError:
+        db.rollback()
+        EmailTriage.__table__.create(bind=engine, checkfirst=True)
 
 
 def _queue_chat_confirmation(db: Session, action: dict, summary: str, source_message: str) -> ApprovalRequest:
@@ -1276,20 +1299,28 @@ def _reschedule_from_message(db: Session, hint: str) -> tuple[str, list[Assistan
                 f"재배치 제안을 만들었습니다. 채팅에서 '승인' 또는 '취소'로 결정해 주세요. "
                 f"(approval {approval.id})"
             ),
-            [AssistantActionOut(type="reschedule_approval_requested", detail={"approval_id": approval.id})],
+            [
+                AssistantActionOut(
+                    type="reschedule_approval_requested",
+                    detail={"approval_id": approval.id, "proposal_id": proposal.id, "type": "reschedule"},
+                )
+            ],
             ["approvals", "calendar"],
         )
 
-    created_blocks, _ = apply_proposal(db, proposal)
+    created_blocks, updated_blocks = apply_proposal(db, proposal)
+    changed_blocks = [*created_blocks, *updated_blocks]
     synced = 0
-    if created_blocks and is_graph_connected(db):
+    if changed_blocks and is_graph_connected(db):
         try:
-            sync_result = sync_blocks_to_outlook(db, created_blocks)
+            sync_result = sync_blocks_to_outlook(db, changed_blocks)
             synced = int(sync_result["synced"])
         except (GraphAuthError, GraphApiError):
             synced = 0
 
-    reply = f"재배치를 적용했습니다. 새 일정 {len(created_blocks)}건 생성"
+    reply = f"재배치를 적용했습니다. 일정 이동 {len(updated_blocks)}건"
+    if created_blocks:
+        reply += f", 신규 {len(created_blocks)}건 생성"
     if synced:
         reply += f", Outlook 동기화 {synced}건"
     if hint.strip():
@@ -1297,7 +1328,16 @@ def _reschedule_from_message(db: Session, hint: str) -> tuple[str, list[Assistan
     reply += "."
     return (
         reply,
-        [AssistantActionOut(type="reschedule_applied", detail={"proposal_id": proposal.id, "created_blocks": len(created_blocks)})],
+        [
+            AssistantActionOut(
+                type="reschedule_applied",
+                detail={
+                    "proposal_id": proposal.id,
+                    "created_blocks": len(created_blocks),
+                    "updated_blocks": len(updated_blocks),
+                },
+            )
+        ],
         ["calendar"],
     )
 
@@ -1707,11 +1747,13 @@ def _reschedule_after_hour(
         return ("재배치 가능한 제안을 만들지 못했습니다. 근무시간 또는 기존 일정 충돌을 확인해 주세요.", [], ["calendar"])
 
     proposal = proposals[0]
-    created_blocks, _ = apply_proposal(db, proposal)
-    if not created_blocks:
-        return ("재배치 제안을 만들었지만 적용 가능한 새 일정 슬롯이 없어 변경하지 못했습니다.", [], ["calendar"])
+    created_blocks, updated_blocks = apply_proposal(db, proposal)
+    changed_blocks = [*created_blocks, *updated_blocks]
+    if not changed_blocks:
+        return ("재배치 제안을 만들었지만 적용 가능한 슬롯이 없어 변경하지 못했습니다.", [], ["calendar"])
 
-    removed_blocks = [row for row in targets if row.task_id in task_ids]
+    updated_ids = {row.id for row in updated_blocks}
+    removed_blocks = [row for row in targets if row.task_id in task_ids and row.id not in updated_ids]
 
     deleted_outlook = 0
     if removed_blocks and is_graph_connected(db):
@@ -1728,17 +1770,19 @@ def _reschedule_after_hour(
     db.commit()
 
     synced = 0
-    if created_blocks and is_graph_connected(db):
+    if changed_blocks and is_graph_connected(db):
         try:
-            sync_result = sync_blocks_to_outlook(db, created_blocks)
+            sync_result = sync_blocks_to_outlook(db, changed_blocks)
             synced = int(sync_result["synced"])
         except (GraphAuthError, GraphApiError):
             synced = 0
 
     reply = (
         f"{cutoff_hour:02d}:00 이후 일정 재배치를 적용했습니다. "
-        f"기존 {removed_count}건 정리, 새 일정 {len(created_blocks)}건 생성"
+        f"기존 {removed_count}건 정리, 일정 이동 {len(updated_blocks)}건"
     )
+    if created_blocks:
+        reply += f", 새 일정 {len(created_blocks)}건 생성"
     if skipped_unlinked:
         reply += f", 미연결 일정 {skipped_unlinked}건 제외"
     if synced:
@@ -1756,6 +1800,7 @@ def _reschedule_after_hour(
                     "cutoff_hour": cutoff_hour,
                     "removed_blocks": removed_count,
                     "created_blocks": len(created_blocks),
+                    "updated_blocks": len(updated_blocks),
                     "skipped_unlinked": skipped_unlinked,
                 },
             )
@@ -2139,6 +2184,16 @@ def _resolve_pending_approval_by_chat(
     approval.reason = "resolved_via_chat"
 
     if not approve:
+        if approval.type == "action_item":
+            candidate_id = approval.payload.get("candidate_id")
+            candidate = db.get(ActionItemCandidate, candidate_id)
+            if candidate and candidate.status == "pending":
+                reject_candidate(candidate)
+        elif approval.type == "email_intake":
+            _ensure_email_triage_table(db)
+            triage = db.execute(select(EmailTriage).where(EmailTriage.approval_id == approval.id)).scalars().first()
+            if triage is not None:
+                triage.status = "rejected"
         db.commit()
         return (
             "요청한 작업을 취소했습니다.",
@@ -2193,15 +2248,18 @@ def _resolve_pending_approval_by_chat(
         proposal_id = approval.payload.get("proposal_id")
         proposal = db.get(SchedulingProposal, proposal_id)
         if proposal and proposal.status == "draft":
-            created_blocks, _ = apply_proposal(db, proposal)
+            created_blocks, updated_blocks = apply_proposal(db, proposal)
+            changed_blocks = [*created_blocks, *updated_blocks]
             synced = 0
-            if created_blocks and is_graph_connected(db):
+            if changed_blocks and is_graph_connected(db):
                 try:
-                    sync_result = sync_blocks_to_outlook(db, created_blocks)
+                    sync_result = sync_blocks_to_outlook(db, changed_blocks)
                     synced = int(sync_result["synced"])
                 except (GraphAuthError, GraphApiError):
                     synced = 0
-            reply = f"승인되었습니다. 재배치를 적용해 일정 {len(created_blocks)}건을 생성했습니다."
+            reply = f"승인되었습니다. 재배치를 적용해 일정 {len(updated_blocks)}건을 이동했습니다."
+            if created_blocks:
+                reply += f" (신규 {len(created_blocks)}건 생성)"
             if synced:
                 reply += f" (Outlook 동기화 {synced}건)"
             return (
@@ -2211,6 +2269,100 @@ def _resolve_pending_approval_by_chat(
             )
         db.commit()
         return ("승인할 재배치 제안을 찾지 못했습니다.", [], ["approvals"])
+
+    if approval.type == "email_intake":
+        _ensure_email_triage_table(db)
+        triage = db.execute(select(EmailTriage).where(EmailTriage.approval_id == approval.id)).scalars().first()
+        payload_data = approval.payload if isinstance(approval.payload, dict) else {}
+        task_data = payload_data.get("task") if isinstance(payload_data.get("task"), dict) else None
+        event_data = payload_data.get("event") if isinstance(payload_data.get("event"), dict) else None
+        message_id = str(payload_data.get("message_id") or "").strip()
+
+        created_task: Task | None = None
+        created_block: CalendarBlock | None = None
+        synced_todo = False
+        synced_calendar = 0
+
+        if task_data and str(task_data.get("title") or "").strip():
+            priority = str(task_data.get("priority") or "medium").strip().lower()
+            if priority not in {"low", "medium", "high", "critical"}:
+                priority = "medium"
+            created_task = Task(
+                title=str(task_data.get("title") or "").strip(),
+                description=str(task_data.get("description") or "").strip() or None,
+                due=_parse_email_approval_datetime(task_data.get("due")),
+                priority=priority,
+                source="email",
+                source_ref=message_id or None,
+                effort_minutes=60,
+            )
+            db.add(created_task)
+            db.flush()
+            if is_graph_connected(db):
+                try:
+                    sync_task_to_todo(db, created_task)
+                    synced_todo = True
+                except (GraphAuthError, GraphApiError):
+                    synced_todo = False
+
+        if event_data:
+            start = _parse_email_approval_datetime(event_data.get("start"))
+            end = _parse_email_approval_datetime(event_data.get("end"))
+            if start and (end is None or end <= start):
+                end = start + timedelta(hours=1)
+            if start and end and end > start:
+                created_block = CalendarBlock(
+                    type="other",
+                    title=str(event_data.get("title") or payload_data.get("subject") or "메일 기반 일정").strip(),
+                    start=start,
+                    end=end,
+                    task_id=created_task.id if created_task else None,
+                    locked=False,
+                    source="aawo",
+                )
+                db.add(created_block)
+                db.flush()
+                if is_graph_connected(db):
+                    try:
+                        sync_result = sync_blocks_to_outlook(db, [created_block])
+                        synced_calendar = int(sync_result.get("synced", 0) or 0)
+                    except (GraphAuthError, GraphApiError):
+                        synced_calendar = 0
+
+        if triage is not None:
+            triage.status = "approved"
+            triage.created_task_id = created_task.id if created_task else None
+            triage.created_block_id = created_block.id if created_block else None
+
+        db.commit()
+
+        created_labels: list[str] = []
+        refresh_keys = ["approvals"]
+        if created_task:
+            created_labels.append(f"할일 '{created_task.title}'")
+            refresh_keys.append("tasks")
+        if created_block:
+            created_labels.append(f"일정 '{created_block.title}'")
+            refresh_keys.append("calendar")
+
+        if created_labels:
+            reply = f"승인되었습니다. 메일 기반 {', '.join(created_labels)}을 생성했습니다."
+        else:
+            reply = "승인되었습니다. 다만 생성 가능한 일정/할일 정보가 부족해 변경 내역이 없습니다."
+
+        sync_notes: list[str] = []
+        if synced_todo:
+            sync_notes.append("To Do 동기화")
+        if synced_calendar:
+            sync_notes.append(f"Outlook 캘린더 동기화 {synced_calendar}건")
+        if sync_notes:
+            reply += f" ({', '.join(sync_notes)})"
+
+        return (
+            reply,
+            [AssistantActionOut(type="approval_approved", detail={"approval_id": approval.id, "approval_type": approval.type})],
+            sorted(set(refresh_keys)),
+        )
 
     db.commit()
     return ("승인되었습니다.", [AssistantActionOut(type="approval_approved", detail={"approval_id": approval.id})], ["approvals"])

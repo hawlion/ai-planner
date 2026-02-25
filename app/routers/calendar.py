@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.models import CalendarBlock
 from app.schemas import CalendarBlockCreate, CalendarBlockOut, CalendarBlockPatch
+from app.services.core import add_audit
 from app.services.graph_service import GraphApiError, GraphAuthError, delete_blocks_from_outlook, is_graph_connected
 
 router = APIRouter(prefix="/calendar/blocks", tags=["calendar"])
@@ -45,6 +46,13 @@ def create_block(payload: CalendarBlockCreate, db: Session = Depends(get_db)) ->
 
     row = CalendarBlock(**payload.model_dump())
     db.add(row)
+    db.flush()
+    add_audit(
+        db,
+        action="calendar_block.created",
+        object_ref=row.id,
+        meta={"title": row.title, "start": row.start.isoformat(), "end": row.end.isoformat()},
+    )
     db.commit()
     db.refresh(row)
     return CalendarBlockOut.model_validate(row)
@@ -63,6 +71,17 @@ def patch_block(block_id: str, payload: CalendarBlockPatch, db: Session = Depend
     row = db.get(CalendarBlock, block_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Calendar block not found")
+    if payload.version is None:
+        raise HTTPException(status_code=409, detail="Calendar block version is required")
+    if payload.version != row.version:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Calendar block version conflict",
+                "expected_version": row.version,
+                "provided_version": payload.version,
+            },
+        )
 
     data = payload.model_dump(exclude_unset=True)
     new_start = data.get("start", row.start)
@@ -73,22 +92,39 @@ def patch_block(block_id: str, payload: CalendarBlockPatch, db: Session = Depend
     if new_start != row.start or new_end != row.end:
         _check_overlap(db, new_start, new_end, exclude_id=row.id)
 
+    changed_fields: list[str] = []
     for field, value in data.items():
         if field == "version":
             continue
         setattr(row, field, value)
+        changed_fields.append(field)
 
     row.version += 1
+    add_audit(
+        db,
+        action="calendar_block.updated",
+        object_ref=row.id,
+        meta={"changed_fields": changed_fields, "new_version": row.version},
+    )
     db.commit()
     db.refresh(row)
     return CalendarBlockOut.model_validate(row)
 
 
 @router.delete("/{block_id}")
-def delete_block(block_id: str, db: Session = Depends(get_db)) -> dict:
+def delete_block(block_id: str, version: int | None = None, db: Session = Depends(get_db)) -> dict:
     row = db.get(CalendarBlock, block_id)
     if row is None:
         return {"deleted": False, "block_id": block_id}
+    if version is not None and version != row.version:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Calendar block version conflict",
+                "expected_version": row.version,
+                "provided_version": version,
+            },
+        )
 
     outlook_deleted = 0
     outlook_event_id = (row.outlook_event_id or "").strip()
@@ -106,6 +142,12 @@ def delete_block(block_id: str, db: Session = Depends(get_db)) -> dict:
             raise HTTPException(status_code=502, detail="Outlook 일정 삭제에 실패했습니다. 잠시 후 다시 시도해 주세요.")
         outlook_deleted = int(result.get("deleted", 0))
 
+    add_audit(
+        db,
+        action="calendar_block.deleted",
+        object_ref=row.id,
+        meta={"title": row.title, "outlook_deleted": outlook_deleted},
+    )
     db.delete(row)
     db.commit()
     return {"deleted": True, "block_id": block_id, "outlook_deleted": outlook_deleted}

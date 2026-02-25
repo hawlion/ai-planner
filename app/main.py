@@ -11,6 +11,7 @@ from app.config import settings
 from app.db import Base, engine
 from app.routers import assistant, approvals, briefing, calendar, graph, health, meetings, nli, profile, projects, scheduling, sync, tasks
 from app.services.core import ensure_profile
+from app.services.sync_worker import start_sync_worker, stop_sync_worker
 from app.db import SessionLocal
 
 app = FastAPI(title=settings.app_name, version="0.1.0")
@@ -47,6 +48,12 @@ def on_startup() -> None:
     Base.metadata.create_all(bind=engine)
     with SessionLocal() as db:
         ensure_profile(db)
+    start_sync_worker()
+
+
+@app.on_event("shutdown")
+def on_shutdown() -> None:
+    stop_sync_worker()
 
 
 @app.get("/")

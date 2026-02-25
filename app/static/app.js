@@ -7,10 +7,18 @@ const MIN_EVENT_HEIGHT = 18;
 const state = {
   profile: null,
   graph: null,
+  graphAuthError: null,
+  graphAuthWarned: false,
+  liveBriefingTimer: null,
+  liveBriefingInFlight: false,
   syncStatus: null,
   dailyBriefing: null,
   tasks: [],
   approvals: [],
+  approvalPromptedIds: new Set(),
+  approvalPromptInFlight: false,
+  approvalPromptTimer: null,
+  previewedApprovals: new Set(),
   chatHistory: [],
   localBlocks: [],
   remoteEvents: [],
@@ -74,6 +82,21 @@ function toDateTimeInputValue(date) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+function isoToLocalDatetimeValue(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function localInputToIso(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString();
+}
+
 function notify(message, isError = false) {
   const el = $("status-message");
   if (!el) return;
@@ -110,6 +133,7 @@ async function saveProfile() {
     body: JSON.stringify({
       autonomy_level: $("autonomy").value,
       timezone: $("timezone").value.trim(),
+      version: state.profile?.version ?? null,
     }),
   });
   await loadProfile();
@@ -141,6 +165,12 @@ async function loadDailyBriefing() {
 function renderGraphStatus() {
   const label = $("graph-status-label");
   if (!label || !state.graph) return;
+
+  if (state.graphAuthError) {
+    label.className = "status-pill warn";
+    label.textContent = "Graph 재연결 필요";
+    return;
+  }
 
   if (state.graph.connected) {
     label.className = "status-pill connected";
@@ -240,6 +270,7 @@ function normalizeLocalBlocks(blocks) {
     kind: block.source === "external" ? "outlook" : block.outlook_event_id ? "mixed" : "local",
     source: block.source,
     outlookId: block.outlook_event_id || null,
+    version: typeof block.version === "number" ? block.version : null,
   }));
 }
 
@@ -270,9 +301,31 @@ async function loadCalendarData() {
   const end = addDays(state.weekStart, 7);
   const query = `start=${encodeURIComponent(start.toISOString())}&end=${encodeURIComponent(end.toISOString())}`;
 
-  const localPromise = api(`/calendar/blocks?${query}`);
-  const remotePromise = state.graph?.connected ? api(`/graph/calendar/events?${query}`) : Promise.resolve([]);
-  const [local, remote] = await Promise.all([localPromise, remotePromise]);
+  const local = await api(`/calendar/blocks?${query}`);
+  let remote = [];
+  if (state.graph?.connected) {
+    try {
+      remote = await api(`/graph/calendar/events?${query}`);
+      if (state.graphAuthError) {
+        state.graphAuthError = null;
+        state.graphAuthWarned = false;
+        renderGraphStatus();
+      }
+    } catch (error) {
+      const nextMessage = error.message || "Graph auth error";
+      const changed = state.graphAuthError !== nextMessage;
+      state.graphAuthError = nextMessage;
+      renderGraphStatus();
+      if (changed || !state.graphAuthWarned) {
+        notify("Outlook 일정 조회 실패: 재연결 후 다시 시도하세요. 로컬 일정만 표시합니다.", true);
+        state.graphAuthWarned = true;
+      }
+      remote = [];
+    }
+  } else {
+    state.graphAuthError = null;
+    state.graphAuthWarned = false;
+  }
   state.localBlocks = local;
   state.remoteEvents = remote;
 }
@@ -281,12 +334,17 @@ async function deleteCalendarBlock(id, isOutlook) {
   const rawId = String(id || "");
   const isLocal = rawId.startsWith("local-");
   const isRemoteOutlook = rawId.startsWith("outlook-");
+  const localBlock = isLocal
+    ? state.localBlocks.find((item) => String(item.id) === rawId.replace("local-", ""))
+    : null;
+  const localVersion = localBlock?.version;
 
   try {
     notify("일정 삭제 중...");
 
     if (isLocal) {
-      await api(`/calendar/blocks/${rawId.replace("local-", "")}`, { method: "DELETE" });
+      const qs = typeof localVersion === "number" ? `?version=${encodeURIComponent(localVersion)}` : "";
+      await api(`/calendar/blocks/${rawId.replace("local-", "")}${qs}`, { method: "DELETE" });
     } else if (isRemoteOutlook) {
       await api(`/graph/calendar/events/${encodeURIComponent(rawId.replace("outlook-", ""))}`, { method: "DELETE" });
     } else if (isOutlook) {
@@ -344,6 +402,7 @@ function openEventModal(eventId) {
     return;
   }
   document.getElementById('edit-event-id').value = ev.id;
+  document.getElementById('edit-event-version').value = typeof ev.version === "number" ? String(ev.version) : "";
   document.getElementById('edit-event-title').value = ev.title;
   document.getElementById('edit-event-start').value = toLocalDatetimeValue(ev.start);
   document.getElementById('edit-event-end').value = toLocalDatetimeValue(ev.end);
@@ -356,6 +415,8 @@ function closeEventModal() {
 
 async function saveEventChanges() {
   const rawId = document.getElementById('edit-event-id').value;
+  const versionRaw = document.getElementById('edit-event-version').value;
+  const version = Number.parseInt(versionRaw, 10);
   const title = document.getElementById('edit-event-title').value.trim();
   const start = document.getElementById('edit-event-start').value;
   const end = document.getElementById('edit-event-end').value;
@@ -368,7 +429,12 @@ async function saveEventChanges() {
     await api(`/calendar/blocks/${blockId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title, start: startDt.toISOString(), end: endDt.toISOString() }),
+      body: JSON.stringify({
+        title,
+        start: startDt.toISOString(),
+        end: endDt.toISOString(),
+        version: Number.isFinite(version) ? version : null,
+      }),
     });
     notify('일정이 수정되었습니다.');
     closeEventModal();
@@ -423,6 +489,7 @@ function renderWeekHeader() {
       renderWeekGrid();
       renderAgenda();
       renderMiniMonth();
+      ensureLiveBriefingTicker();
     });
   });
 }
@@ -553,6 +620,7 @@ function renderWeekGrid() {
       renderWeekHeader();
       renderAgenda();
       renderMiniMonth();
+      ensureLiveBriefingTicker();
     });
   });
 }
@@ -642,6 +710,7 @@ function renderMiniMonth() {
       renderWeekGrid();
       renderAgenda();
       renderMiniMonth();
+      ensureLiveBriefingTicker();
       const chatLog = document.getElementById("chat-log");
       const match = chatLog.innerHTML.match(/<div class="chat-msg assistant">([^<]*)<\/div>/g);
       if (match) {
@@ -658,11 +727,7 @@ function initChatToggle() {
   const closeBtn = document.getElementById("close-chat");
 
   if (fab && chatWindow && closeBtn) {
-    fab.addEventListener("click", () => {
-      chatWindow.classList.remove("hidden");
-      fab.style.display = "none";
-      chatWindow.classList.add("show");
-    });
+    fab.addEventListener("click", openChatWindow);
 
     closeBtn.addEventListener("click", () => {
       chatWindow.classList.add("hidden");
@@ -670,6 +735,15 @@ function initChatToggle() {
       fab.style.display = "flex";
     });
   }
+}
+
+function openChatWindow() {
+  const fab = document.getElementById("chat-fab");
+  const chatWindow = document.getElementById("floating-chat");
+  if (!fab || !chatWindow) return;
+  chatWindow.classList.remove("hidden");
+  chatWindow.classList.add("show");
+  fab.style.display = "none";
 }
 
 function renderTasks() {
@@ -696,8 +770,8 @@ function renderTasks() {
       <div class="todo-meta">${task.due ? fmtDateTime(task.due) : "마감 없음"} · ${escapeHtml(task.priority)}</div>
       <div class="meta-row">
         <span class="tag ${task.status === "done" ? "done" : ""}">${escapeHtml(task.status)}</span>
-        <button class="btn btn-ghost btn-mini" type="button" data-task-progress="${task.id}">진행중</button>
-        <button class="btn btn-ghost btn-mini" type="button" data-task-done="${task.id}">완료</button>
+        <button class="btn btn-ghost btn-mini" type="button" data-task-progress="${task.id}" data-task-version="${task.version}">진행중</button>
+        <button class="btn btn-ghost btn-mini" type="button" data-task-done="${task.id}" data-task-version="${task.version}">완료</button>
       </div>
     </div>
   `;
@@ -720,9 +794,10 @@ function renderTasks() {
   document.querySelectorAll("[data-task-progress]").forEach((button) => {
     button.addEventListener("click", async () => {
       try {
+        const version = Number.parseInt(button.dataset.taskVersion || "", 10);
         await api(`/tasks/${button.dataset.taskProgress}`, {
           method: "PATCH",
-          body: JSON.stringify({ status: "in_progress" }),
+          body: JSON.stringify({ status: "in_progress", version: Number.isFinite(version) ? version : null }),
         });
         await refreshTasksOnly();
         notify("할일 상태를 진행중으로 변경했습니다.");
@@ -735,9 +810,10 @@ function renderTasks() {
   document.querySelectorAll("[data-task-done]").forEach((button) => {
     button.addEventListener("click", async () => {
       try {
+        const version = Number.parseInt(button.dataset.taskVersion || "", 10);
         await api(`/tasks/${button.dataset.taskDone}`, {
           method: "PATCH",
-          body: JSON.stringify({ status: "done" }),
+          body: JSON.stringify({ status: "done", version: Number.isFinite(version) ? version : null }),
         });
         await refreshTasksOnly();
         notify("할일 상태를 완료로 변경했습니다.");
@@ -756,62 +832,179 @@ function approvalSummary(approval) {
   if (approval.type === "action_item") {
     return payload.reason ? `사유: ${payload.reason}` : "회의 액션아이템 승인 요청";
   }
+  if (approval.type === "email_intake") {
+    const classification = payload.classification || "unclear";
+    const subject = payload.subject || "메일 제목 없음";
+    const sender = payload.sender || "보낸사람 미상";
+    const reason = payload.reason || "메일 분류 결과";
+    const taskLabel = payload.task?.title ? `할일:${payload.task.title}` : "";
+    const eventLabel = payload.event?.title ? `일정:${payload.event.title}` : "";
+    const actionLabel = [taskLabel, eventLabel].filter(Boolean).join(" / ");
+    return `[${classification}] ${subject} · ${sender}${actionLabel ? ` · ${actionLabel}` : ""} · ${reason}`;
+  }
   return JSON.stringify(payload);
 }
 
-function renderApprovals() {
-  const list = $("approvals-list");
-  $("approval-count").textContent = `(${state.approvals.length}건)`;
+function approvalTypeLabel(type) {
+  if (type === "action_item") return "회의 액션아이템";
+  if (type === "reschedule") return "일정 재배치";
+  if (type === "email_intake") return "신규 메일 분류";
+  return type || "승인 요청";
+}
 
-  if (!state.approvals.length) {
-    list.innerHTML = `<div class="approval-item"><div class="approval-meta">대기 중인 승인 요청이 없습니다.</div></div>`;
-    return;
+function clipText(value, limit = 140) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  return text.length > limit ? `${text.slice(0, limit)}...` : text;
+}
+
+function approvalEvidenceText(approval) {
+  const payload = approval.payload || {};
+  if (approval.type === "email_intake") {
+    const reason = String(payload.reason || "").trim();
+    return reason || "메일 본문에서 일정/업무 요청 표현을 감지했습니다.";
+  }
+  if (approval.type === "action_item") {
+    const reason = String(payload.reason || "").toLowerCase();
+    if (reason.includes("low_confidence") || reason.includes("large_effort")) {
+      return "추출 신뢰도 또는 작업 규모 기준으로 수동 확인이 필요합니다.";
+    }
+    return "회의 내용에서 실행 가능한 액션 아이템이 추출되었습니다.";
+  }
+  if (approval.type === "reschedule") {
+    return "현재 일정/작업 제약을 만족하는 재배치 제안을 생성했습니다.";
+  }
+  if (approval.type === "chat_pending_action") {
+    return "대량 변경이 포함될 수 있어 실행 전 사용자 확인이 필요합니다.";
+  }
+  return "변경 작업 실행 전 확인이 필요합니다.";
+}
+
+function approvalPromptText(approval) {
+  const payload = approval.payload || {};
+  const evidence = clipText(approvalEvidenceText(approval), 160);
+  if (approval.type === "email_intake") {
+    const subject = payload.subject || "메일 제목 없음";
+    const sender = payload.sender || "보낸사람 미상";
+    const eventTitle = payload.event?.title ? `일정: ${payload.event.title}` : null;
+    const taskTitle = payload.task?.title ? `할일: ${payload.task.title}` : null;
+    const candidates = [eventTitle, taskTitle].filter(Boolean).join(" / ");
+    return candidates
+      ? `새 메일을 분석했습니다.\n[${subject}] (${sender})\n후보: ${candidates}\n근거: ${evidence}\n등록할까요?`
+      : `새 메일을 분석했습니다.\n[${subject}] (${sender})\n근거: ${evidence}\n일정/할일 후보를 등록할까요?`;
+  }
+  if (approval.type === "reschedule") {
+    return `재배치 제안이 있습니다.\n${approvalSummary(approval)}\n근거: ${evidence}\n적용할까요?`;
+  }
+  if (approval.type === "action_item") {
+    return `회의 액션아이템 반영 요청입니다.\n${approvalSummary(approval)}\n근거: ${evidence}\n반영할까요?`;
+  }
+  if (approval.type === "chat_pending_action") {
+    return `실행 전 확인이 필요한 작업입니다.\n${approvalSummary(approval)}\n근거: ${evidence}\n진행할까요?`;
+  }
+  return `${approvalTypeLabel(approval.type)} 요청이 있습니다.\n${approvalSummary(approval)}\n근거: ${evidence}\n승인할까요?`;
+}
+
+function buildPendingApprovalActions(approval) {
+  const payload = approval.payload || {};
+  return [
+    {
+      type: "approval_pending",
+      detail: {
+        approval_id: approval.id,
+        type: approval.type,
+        proposal_id: payload?.proposal_id || "",
+        summary: `${approvalSummary(approval)} · 근거: ${clipText(approvalEvidenceText(approval), 120)}`,
+        task_title: payload?.task?.title || "",
+        task_due: payload?.task?.due || "",
+        event_title: payload?.event?.title || "",
+        event_start: payload?.event?.start || "",
+        event_end: payload?.event?.end || "",
+      },
+    },
+  ];
+}
+
+function prunePromptedApprovalIds() {
+  const pendingIds = new Set((state.approvals || []).map((item) => item.id));
+  for (const id of state.approvalPromptedIds) {
+    if (!pendingIds.has(id)) state.approvalPromptedIds.delete(id);
+  }
+  for (const id of state.previewedApprovals) {
+    if (!pendingIds.has(id)) state.previewedApprovals.delete(id);
+  }
+}
+
+function promptNextPendingApprovalInChat({ preferType = null } = {}) {
+  prunePromptedApprovalIds();
+  if (!state.approvals.length) return false;
+
+  const ordered = [...state.approvals].sort((a, b) => {
+    const aTime = new Date(a.created_at || 0).getTime();
+    const bTime = new Date(b.created_at || 0).getTime();
+    return aTime - bTime;
+  });
+  const prioritized = preferType
+    ? [...ordered.filter((item) => item.type === preferType), ...ordered.filter((item) => item.type !== preferType)]
+    : ordered;
+
+  const next = prioritized.find((item) => !state.approvalPromptedIds.has(item.id));
+  if (!next) return false;
+
+  state.approvalPromptedIds.add(next.id);
+  openChatWindow();
+  addChatMessage("assistant", approvalPromptText(next), true, buildPendingApprovalActions(next));
+  return true;
+}
+
+async function pollPendingApprovals() {
+  if (state.approvalPromptInFlight || document.hidden) return;
+  state.approvalPromptInFlight = true;
+  try {
+    await loadApprovals();
+    promptNextPendingApprovalInChat();
+  } catch (error) {
+    console.warn("Approval polling skipped:", error);
+  } finally {
+    state.approvalPromptInFlight = false;
+  }
+}
+
+function startApprovalPromptPolling() {
+  if (state.approvalPromptTimer) return;
+  state.approvalPromptTimer = window.setInterval(() => {
+    void pollPendingApprovals();
+  }, 20000);
+}
+
+function buildReschedulePreviewText(proposal) {
+  const changes = (proposal?.changes || [])
+    .map((row) => row?.payload || {})
+    .filter((payload) => payload.kind === "create_block")
+    .map((payload) => payload.block || {})
+    .filter((block) => block.start && block.end);
+
+  if (!changes.length) {
+    return "재배치 미리보기를 생성하지 못했습니다.";
   }
 
-  list.innerHTML = state.approvals
-    .map(
-      (approval) => `
-        <div class="approval-item">
-          <div class="approval-title">${escapeHtml(approval.type)}</div>
-          <div class="approval-meta">${escapeHtml(approvalSummary(approval))}</div>
-          <div class="meta-row">
-            <button class="btn btn-primary btn-mini" type="button" data-approval-approve="${approval.id}">승인</button>
-            <button class="btn btn-danger btn-mini" type="button" data-approval-reject="${approval.id}">거절</button>
-          </div>
-        </div>
-      `,
-    )
-    .join("");
-
-  list.querySelectorAll("[data-approval-approve]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      try {
-        await api(`/approvals/${button.dataset.approvalApprove}/resolve`, {
-          method: "POST",
-          body: JSON.stringify({ decision: "approve" }),
-        });
-        await refreshAll();
-        notify("승인 요청을 승인했습니다.");
-      } catch (error) {
-        notify(error.message, true);
-      }
-    });
+  const lines = changes.slice(0, 8).map((block) => {
+    const start = new Date(block.start);
+    const end = new Date(block.end);
+    const title = block.title || "일정";
+    return `- ${fmtDateTime(start)} ~ ${fmtTime(end)} · ${title}`;
   });
+  const more = changes.length > 8 ? `\n...외 ${changes.length - 8}건` : "";
+  return `재배치 미리보기 (${changes.length}건)\n${lines.join("\n")}${more}`;
+}
 
-  list.querySelectorAll("[data-approval-reject]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      try {
-        await api(`/approvals/${button.dataset.approvalReject}/resolve`, {
-          method: "POST",
-          body: JSON.stringify({ decision: "reject" }),
-        });
-        await refreshAll();
-        notify("승인 요청을 거절했습니다.");
-      } catch (error) {
-        notify(error.message, true);
-      }
-    });
-  });
+async function previewRescheduleApproval(approvalId, proposalId) {
+  if (!approvalId || !proposalId) {
+    throw new Error("재배치 미리보기 정보가 없습니다.");
+  }
+  const proposal = await api(`/scheduling/proposals/${proposalId}`);
+  state.previewedApprovals.add(approvalId);
+  addChatMessage("assistant", buildReschedulePreviewText(proposal));
 }
 
 async function refreshTasksOnly() {
@@ -865,11 +1058,55 @@ async function syncBidirectional(silent = false) {
   }
 
   const exportResult = await api("/graph/calendar/export", { method: "POST" });
-  const importResult = await api("/graph/calendar/import", { method: "POST" });
-  await refreshAll();
+  const importResult = await api("/sync/calendar/delta", { method: "POST" });
+  let todoExportResult = null;
+  let todoDeltaResult = null;
+  let mailDeltaResult = null;
+  let mailRecoveryUsed = false;
+  try {
+    todoExportResult = await api("/graph/todo/export", { method: "POST" });
+    todoDeltaResult = await api("/sync/todo/delta", { method: "POST" });
+  } catch (error) {
+    console.warn("To Do export skipped:", error);
+  }
+  try {
+    mailDeltaResult = await api("/sync/mail/delta", { method: "POST" });
+    if ((mailDeltaResult?.processed || 0) === 0 && (mailDeltaResult?.skipped_read || 0) > 0) {
+      try {
+        const recovery = await api("/sync/mail/delta?reset=true&unread_only=false", { method: "POST" });
+        mailRecoveryUsed = true;
+        mailDeltaResult = {
+          processed: Number(mailDeltaResult.processed || 0) + Number(recovery.processed || 0),
+          created_approvals: Number(mailDeltaResult.created_approvals || 0) + Number(recovery.created_approvals || 0),
+          ignored: Number(mailDeltaResult.ignored || 0) + Number(recovery.ignored || 0),
+          skipped_existing: Number(mailDeltaResult.skipped_existing || 0) + Number(recovery.skipped_existing || 0),
+          skipped_read: Number(mailDeltaResult.skipped_read || 0) + Number(recovery.skipped_read || 0),
+          processed_read_actionable:
+            Number(mailDeltaResult.processed_read_actionable || 0) + Number(recovery.processed_read_actionable || 0),
+        };
+      } catch (recoveryError) {
+        console.warn("Mail delta recovery skipped:", recoveryError);
+      }
+    }
+  } catch (error) {
+    console.warn("Mail delta skipped:", error);
+  }
+  const createdApprovalCount = Number(mailDeltaResult?.created_approvals || 0);
+  if (createdApprovalCount > 0) {
+    await refreshAll({ promptPendingApproval: false });
+    promptNextPendingApprovalInChat({ preferType: "email_intake" });
+  } else {
+    await refreshAll();
+  }
   if (!silent) {
+    const todoSummary = todoExportResult && todoDeltaResult
+      ? ` / To Do 내보내기 ${todoExportResult.created + todoExportResult.updated}건(생성 ${todoExportResult.created}, 업데이트 ${todoExportResult.updated}, 실패 ${todoExportResult.failed}) + delta ${todoDeltaResult.created + todoDeltaResult.updated}건(신규 ${todoDeltaResult.created}, 수정 ${todoDeltaResult.updated}, 삭제 ${todoDeltaResult.deleted})`
+      : " / To Do 내보내기 보류";
+    const mailSummary = mailDeltaResult
+      ? ` / 메일 분류 ${mailDeltaResult.processed}건(승인 요청 ${mailDeltaResult.created_approvals}, 무시 ${mailDeltaResult.ignored}, 기존건너뜀 ${mailDeltaResult.skipped_existing || 0}, 읽음건너뜀 ${mailDeltaResult.skipped_read || 0}, 읽음처리 ${mailDeltaResult.processed_read_actionable || 0}${mailRecoveryUsed ? ", 읽음메일 보강스캔 실행" : ""})`
+      : " / 메일 분류 보류";
     notify(
-      `동기화 완료 · 내보내기 ${exportResult.synced}건(생성 ${exportResult.created}, 업데이트 ${exportResult.updated}) / 가져오기 ${importResult.imported}건`,
+      `동기화 완료 · 일정 내보내기 ${exportResult.synced}건(생성 ${exportResult.created}, 업데이트 ${exportResult.updated}) / delta 반영 ${importResult.created + importResult.updated}건(신규 ${importResult.created}, 수정 ${importResult.updated}, 삭제 ${importResult.deleted})${todoSummary}${mailSummary}`,
     );
   }
 }
@@ -894,13 +1131,36 @@ function approvalCardMeta(action) {
   const detail = action?.detail || {};
   const approvalId = detail.approval_id;
   if (!approvalId) return null;
-  if (action.type !== "approval_requested" && action.type !== "reschedule_approval_requested") return null;
+  if (
+    action.type !== "approval_requested" &&
+    action.type !== "reschedule_approval_requested" &&
+    action.type !== "approval_pending"
+  ) {
+    return null;
+  }
+
+  if (detail.type === "email_intake") {
+    return {
+      approvalId,
+      title: "메일 일정/할일 등록 승인",
+      summary: detail.summary || "메일에서 추출한 일정/할일 후보를 반영합니다.",
+      supportsEdit: true,
+      editData: {
+        taskTitle: detail.task_title || "",
+        taskDue: detail.task_due || "",
+        eventTitle: detail.event_title || "",
+        eventStart: detail.event_start || "",
+        eventEnd: detail.event_end || "",
+      },
+    };
+  }
 
   if (detail.type === "action_item") {
     return {
       approvalId,
       title: "회의 액션아이템 승인",
       summary: detail.summary || "회의에서 추출한 할일을 반영합니다.",
+      supportsEdit: false,
     };
   }
   if (action.type === "reschedule_approval_requested" || detail.type === "reschedule") {
@@ -908,12 +1168,16 @@ function approvalCardMeta(action) {
       approvalId,
       title: "일정 재배치 승인",
       summary: detail.summary || "재배치 제안을 일정에 반영합니다.",
+      supportsEdit: false,
+      proposalId: detail.proposal_id || "",
+      previewRequired: true,
     };
   }
   return {
     approvalId,
     title: "AI 작업 승인",
     summary: detail.summary || "요청 작업을 실행하기 전에 확인이 필요합니다.",
+    supportsEdit: false,
   };
 }
 
@@ -922,15 +1186,42 @@ function buildAssistantActionCards(actions) {
     .map((action) => {
       const meta = approvalCardMeta(action);
       if (!meta) return "";
+      const edit = meta.editData || {};
+      const editForm = meta.supportsEdit
+        ? `
+          <div class="chat-approval-edit hidden" data-chat-edit-form="${meta.approvalId}">
+            <input type="text" class="chat-edit-input" data-chat-edit-task-title="${meta.approvalId}" placeholder="할일 제목(선택)" value="${escapeHtml(edit.taskTitle || "")}" />
+            <input type="text" class="chat-edit-input" data-chat-edit-event-title="${meta.approvalId}" placeholder="일정 제목(선택)" value="${escapeHtml(edit.eventTitle || "")}" />
+            <div class="chat-edit-grid">
+              <label class="chat-edit-label">일정 시작
+                <input type="datetime-local" class="chat-edit-input" data-chat-edit-event-start="${meta.approvalId}" value="${escapeHtml(isoToLocalDatetimeValue(edit.eventStart))}" />
+              </label>
+              <label class="chat-edit-label">일정 종료
+                <input type="datetime-local" class="chat-edit-input" data-chat-edit-event-end="${meta.approvalId}" value="${escapeHtml(isoToLocalDatetimeValue(edit.eventEnd))}" />
+              </label>
+            </div>
+            <label class="chat-edit-label">할일 마감
+              <input type="datetime-local" class="chat-edit-input" data-chat-edit-task-due="${meta.approvalId}" value="${escapeHtml(isoToLocalDatetimeValue(edit.taskDue))}" />
+            </label>
+            <div class="chat-approval-actions">
+              <button class="btn btn-primary btn-mini" type="button" data-chat-edit-save="${meta.approvalId}">수정 후 승인</button>
+              <button class="btn btn-ghost btn-mini" type="button" data-chat-edit-cancel="${meta.approvalId}">취소</button>
+            </div>
+          </div>
+        `
+        : "";
       return `
         <div class="chat-approval-card">
           <div class="chat-approval-title">${escapeHtml(meta.title)}</div>
           <div class="chat-approval-summary">${escapeHtml(meta.summary)}</div>
           <div class="chat-approval-id">ID: ${escapeHtml(meta.approvalId)}</div>
           <div class="chat-approval-actions">
-            <button class="btn btn-primary btn-mini" type="button" data-chat-approve="${meta.approvalId}">승인</button>
+            <button class="btn btn-primary btn-mini" type="button" data-chat-approve="${meta.approvalId}" data-chat-preview-required="${meta.previewRequired ? "1" : "0"}" data-chat-proposal-id="${escapeHtml(meta.proposalId || "")}">승인</button>
             <button class="btn btn-danger btn-mini" type="button" data-chat-reject="${meta.approvalId}">거절</button>
+            ${meta.previewRequired ? `<button class="btn btn-ghost btn-mini" type="button" data-chat-preview="${meta.approvalId}" data-chat-proposal-id="${escapeHtml(meta.proposalId || "")}">미리보기</button>` : ""}
+            ${meta.supportsEdit ? `<button class="btn btn-ghost btn-mini" type="button" data-chat-edit="${meta.approvalId}">수정 후 승인</button>` : ""}
           </div>
+          ${editForm}
         </div>
       `;
     })
@@ -947,7 +1238,16 @@ function bindAssistantActionCards(scope) {
       button.dataset.busy = "1";
       button.disabled = true;
       try {
-        await submitChatMessage(`승인 ${button.dataset.chatApprove}`);
+        const approvalId = button.dataset.chatApprove || "";
+        const previewRequired = (button.dataset.chatPreviewRequired || "0") === "1";
+        const proposalId = button.dataset.chatProposalId || "";
+        if (previewRequired && !state.previewedApprovals.has(approvalId)) {
+          await previewRescheduleApproval(approvalId, proposalId);
+          addChatMessage("assistant", "미리보기를 확인했습니다. 승인 버튼을 한 번 더 누르면 확정 반영됩니다.");
+          return;
+        }
+        await submitChatMessage(`승인 ${approvalId}`);
+        state.previewedApprovals.delete(approvalId);
       } finally {
         button.dataset.busy = "0";
         button.disabled = false;
@@ -963,7 +1263,92 @@ function bindAssistantActionCards(scope) {
       button.dataset.busy = "1";
       button.disabled = true;
       try {
-        await submitChatMessage(`취소 ${button.dataset.chatReject}`);
+        const approvalId = button.dataset.chatReject || "";
+        await submitChatMessage(`취소 ${approvalId}`);
+        state.previewedApprovals.delete(approvalId);
+      } finally {
+        button.dataset.busy = "0";
+        button.disabled = false;
+      }
+    });
+  });
+
+  scope.querySelectorAll("[data-chat-preview]").forEach((button) => {
+    if (button.dataset.bound === "1") return;
+    button.dataset.bound = "1";
+    button.addEventListener("click", async () => {
+      if (button.dataset.busy === "1") return;
+      button.dataset.busy = "1";
+      button.disabled = true;
+      try {
+        const approvalId = button.dataset.chatPreview || "";
+        const proposalId = button.dataset.chatProposalId || "";
+        await previewRescheduleApproval(approvalId, proposalId);
+      } catch (error) {
+        notify(error.message, true);
+      } finally {
+        button.dataset.busy = "0";
+        button.disabled = false;
+      }
+    });
+  });
+
+  scope.querySelectorAll("[data-chat-edit]").forEach((button) => {
+    if (button.dataset.bound === "1") return;
+    button.dataset.bound = "1";
+    button.addEventListener("click", () => {
+      const approvalId = button.dataset.chatEdit || "";
+      if (!approvalId) return;
+      const form = scope.querySelector(`[data-chat-edit-form="${approvalId}"]`);
+      if (!form) return;
+      form.classList.toggle("hidden");
+    });
+  });
+
+  scope.querySelectorAll("[data-chat-edit-cancel]").forEach((button) => {
+    if (button.dataset.bound === "1") return;
+    button.dataset.bound = "1";
+    button.addEventListener("click", () => {
+      const approvalId = button.dataset.chatEditCancel || "";
+      if (!approvalId) return;
+      const form = scope.querySelector(`[data-chat-edit-form="${approvalId}"]`);
+      if (!form) return;
+      form.classList.add("hidden");
+    });
+  });
+
+  scope.querySelectorAll("[data-chat-edit-save]").forEach((button) => {
+    if (button.dataset.bound === "1") return;
+    button.dataset.bound = "1";
+    button.addEventListener("click", async () => {
+      const approvalId = button.dataset.chatEditSave || "";
+      if (!approvalId) return;
+      if (button.dataset.busy === "1") return;
+      button.dataset.busy = "1";
+      button.disabled = true;
+      try {
+        const taskTitleInput = scope.querySelector(`[data-chat-edit-task-title="${approvalId}"]`);
+        const taskDueInput = scope.querySelector(`[data-chat-edit-task-due="${approvalId}"]`);
+        const eventTitleInput = scope.querySelector(`[data-chat-edit-event-title="${approvalId}"]`);
+        const eventStartInput = scope.querySelector(`[data-chat-edit-event-start="${approvalId}"]`);
+        const eventEndInput = scope.querySelector(`[data-chat-edit-event-end="${approvalId}"]`);
+
+        await api(`/approvals/${approvalId}/resolve`, {
+          method: "POST",
+          body: JSON.stringify({
+            decision: "approve",
+            reason: "approved_with_edits_via_chat",
+            task_title: (taskTitleInput?.value || "").trim() || null,
+            task_due: localInputToIso(taskDueInput?.value || ""),
+            event_title: (eventTitleInput?.value || "").trim() || null,
+            event_start: localInputToIso(eventStartInput?.value || ""),
+            event_end: localInputToIso(eventEndInput?.value || ""),
+          }),
+        });
+        addChatMessage("assistant", `승인 ${approvalId}를 수정 내용으로 반영했습니다.`);
+        await refreshAll();
+      } catch (error) {
+        notify(error.message, true);
       } finally {
         button.dataset.busy = "0";
         button.disabled = false;
@@ -1004,6 +1389,14 @@ function addChatMessage(role, text, remember = true, actions = []) {
 
 function composeAssistantReply(result) {
   const actions = result.actions || [];
+  const llmError = actions.find((item) => item.type === "llm_error");
+  if (llmError) {
+    const reason = String(llmError?.detail?.reason || "").trim();
+    if (reason) {
+      const brief = reason.length > 180 ? `${reason.slice(0, 180)}...` : reason;
+      return `${result.reply}\n\n원인: ${brief}\n\n작업: llm_error`;
+    }
+  }
   const actionSummary = actions.map((item) => item.type).join(", ");
   return actionSummary ? `${result.reply}\n\n작업: ${actionSummary}` : result.reply;
 }
@@ -1036,26 +1429,78 @@ async function sendChat(event) {
 }
 
 async function refreshCalendarOnly() {
-  await Promise.all([loadCalendarData(), loadDailyBriefing(), loadSyncStatus()]);
+  const results = await Promise.allSettled([loadCalendarData(), loadDailyBriefing(), loadSyncStatus()]);
+  const failedCount = results.filter((item) => item.status === "rejected").length;
+  if (failedCount > 0) {
+    notify(`일부 데이터 로드에 실패했습니다. (${failedCount}개)`, true);
+  }
   renderHeaderRange();
   renderWeekHeader();
   renderWeekGrid();
   renderAgenda();
   renderMiniMonth();
   renderDailyBriefing();
+  ensureLiveBriefingTicker();
 }
 
-async function refreshAll() {
-  await Promise.all([loadGraphStatus(), loadSyncStatus()]);
-  await Promise.all([loadTasks(), loadApprovals(), loadCalendarData(), loadDailyBriefing()]);
+async function refreshAll({ promptPendingApproval = true, preferApprovalType = null } = {}) {
+  const primaryResults = await Promise.allSettled([loadGraphStatus(), loadSyncStatus()]);
+  const primaryFailedCount = primaryResults.filter((item) => item.status === "rejected").length;
+  if (primaryFailedCount > 0) {
+    notify(`초기 상태 조회에 실패했습니다. (${primaryFailedCount}개)`, true);
+  }
+
+  const dataResults = await Promise.allSettled([loadTasks(), loadApprovals(), loadCalendarData(), loadDailyBriefing()]);
+  const dataFailedCount = dataResults.filter((item) => item.status === "rejected").length;
+  if (dataFailedCount > 0) {
+    notify(`일부 데이터 로드에 실패했습니다. (${dataFailedCount}개)`, true);
+  }
+
   renderHeaderRange();
   renderWeekHeader();
   renderWeekGrid();
   renderAgenda();
   renderMiniMonth();
   renderTasks();
-  renderApprovals();
   renderDailyBriefing();
+  ensureLiveBriefingTicker();
+  if (promptPendingApproval) {
+    promptNextPendingApprovalInChat({ preferType: preferApprovalType });
+  }
+}
+
+function isBriefingLiveTarget() {
+  return isSameDay(state.selectedDate, startOfDay(new Date()));
+}
+
+async function refreshBriefingLiveTick() {
+  if (!isBriefingLiveTarget()) return;
+  if (document.hidden) return;
+  if (state.liveBriefingInFlight) return;
+  state.liveBriefingInFlight = true;
+  try {
+    await Promise.allSettled([loadDailyBriefing(), loadSyncStatus()]);
+    renderDailyBriefing();
+  } finally {
+    state.liveBriefingInFlight = false;
+  }
+}
+
+function ensureLiveBriefingTicker() {
+  const shouldRun = isBriefingLiveTarget();
+  if (!shouldRun) {
+    if (state.liveBriefingTimer) {
+      window.clearInterval(state.liveBriefingTimer);
+      state.liveBriefingTimer = null;
+    }
+    return;
+  }
+
+  if (!state.liveBriefingTimer) {
+    state.liveBriefingTimer = window.setInterval(() => {
+      void refreshBriefingLiveTick();
+    }, 60 * 1000);
+  }
 }
 
 function scrollCalendarToNow() {
@@ -1111,16 +1556,6 @@ function bindEvents() {
   $("task-form").addEventListener("submit", async (event) => {
     try {
       await createTask(event);
-    } catch (error) {
-      notify(error.message, true);
-    }
-  });
-
-  $("refresh-approvals").addEventListener("click", async () => {
-    try {
-      await loadApprovals();
-      renderApprovals();
-      notify("승인 요청 목록을 갱신했습니다.");
     } catch (error) {
       notify(error.message, true);
     }
@@ -1182,6 +1617,13 @@ function bindEvents() {
       $("chat-input").focus();
     });
   });
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) {
+      void refreshBriefingLiveTick();
+      void pollPendingApprovals();
+    }
+  });
 }
 
 async function bootstrap() {
@@ -1205,7 +1647,7 @@ async function bootstrap() {
     }
 
     await loadProfile();
-    await refreshAll();
+    await refreshAll({ promptPendingApproval: false });
     scrollCalendarToNow();
 
     addChatMessage(
@@ -1213,6 +1655,8 @@ async function bootstrap() {
       "AI Assistant 준비 완료. 회의록 등록, 일정 재배치, 할일 조정을 자연어로 요청하세요.",
       false,
     );
+    promptNextPendingApprovalInChat();
+    startApprovalPromptPolling();
   } catch (error) {
     notify(error.message, true);
   }

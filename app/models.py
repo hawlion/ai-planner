@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
@@ -74,6 +74,23 @@ class Project(Base, TimestampedMixin):
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 
     tasks: Mapped[list[Task]] = relationship(back_populates="project")
+    milestones: Mapped[list[ProjectMilestone]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+    )
+
+
+class ProjectMilestone(Base, TimestampedMixin):
+    __tablename__ = "project_milestones"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    due: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    description: Mapped[str | None] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+
+    project: Mapped[Project] = relationship(back_populates="milestones")
 
 
 class Task(Base, TimestampedMixin):
@@ -216,3 +233,67 @@ class GraphConnection(Base, TimestampedMixin):
     token_cache: Mapped[str] = mapped_column(Text, default="", nullable=False)
     pending_state: Mapped[str | None] = mapped_column(String(120))
     scopes: Mapped[str | None] = mapped_column(Text)
+
+
+class EmailTriage(Base, TimestampedMixin):
+    __tablename__ = "email_triage"
+    __table_args__ = (UniqueConstraint("ms_message_id", name="uq_email_triage_message"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    ms_message_id: Mapped[str] = mapped_column(String(160), nullable=False, index=True)
+    internet_message_id: Mapped[str | None] = mapped_column(String(320), index=True)
+    subject: Mapped[str | None] = mapped_column(String(320))
+    sender: Mapped[str | None] = mapped_column(String(240))
+    preview: Mapped[str | None] = mapped_column(Text)
+    received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    classification: Mapped[str] = mapped_column(String(32), default="no_action", nullable=False, index=True)
+    reason: Mapped[str | None] = mapped_column(Text)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="ignored", nullable=False, index=True)
+    approval_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    created_task_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    created_block_id: Mapped[str | None] = mapped_column(String(36), index=True)
+
+
+class GraphDeltaState(Base, TimestampedMixin):
+    __tablename__ = "graph_delta_states"
+    __table_args__ = (UniqueConstraint("resource_type", "resource_key", name="uq_graph_delta_resource"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    resource_type: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    resource_key: Mapped[str] = mapped_column(String(160), default="default", nullable=False, index=True)
+    delta_link: Mapped[str | None] = mapped_column(Text)
+    window_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    window_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class GraphSubscription(Base, TimestampedMixin):
+    __tablename__ = "graph_subscriptions"
+    __table_args__ = (UniqueConstraint("subscription_id", name="uq_graph_subscription_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    resource: Mapped[str] = mapped_column(String(160), nullable=False, default="/me/events")
+    change_type: Mapped[str] = mapped_column(String(80), nullable=False, default="created,updated,deleted")
+    notification_url: Mapped[str | None] = mapped_column(String(600))
+    lifecycle_url: Mapped[str | None] = mapped_column(String(600))
+    subscription_id: Mapped[str | None] = mapped_column(String(160), index=True)
+    client_state: Mapped[str | None] = mapped_column(String(160))
+    expiration_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="inactive")
+    last_notification_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
+class IntegrationOutbox(Base, TimestampedMixin):
+    __tablename__ = "integration_outbox"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_type: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending", index=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    max_retries: Mapped[int] = mapped_column(Integer, default=12, nullable=False)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)

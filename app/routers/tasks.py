@@ -9,8 +9,19 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.models import Task
 from app.schemas import TaskCreate, TaskOut, TaskPatch
+from app.services.core import add_audit
+from app.services.graph_service import GraphApiError, GraphAuthError, delete_task_from_todo, is_graph_connected, sync_task_to_todo
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
+
+
+def _sync_task_best_effort(db: Session, row: Task) -> None:
+    if not is_graph_connected(db):
+        return
+    try:
+        sync_task_to_todo(db, row)
+    except (GraphAuthError, GraphApiError):
+        db.rollback()
 
 
 @router.get("", response_model=list[TaskOut])
@@ -38,7 +49,16 @@ def list_tasks(
 def create_task(payload: TaskCreate, db: Session = Depends(get_db)) -> TaskOut:
     row = Task(**payload.model_dump())
     db.add(row)
+    db.flush()
+    add_audit(
+        db,
+        action="task.created",
+        object_ref=row.id,
+        meta={"title": row.title, "priority": row.priority, "status": row.status},
+    )
     db.commit()
+    db.refresh(row)
+    _sync_task_best_effort(db, row)
     db.refresh(row)
     return TaskOut.model_validate(row)
 
@@ -56,27 +76,64 @@ def patch_task(task_id: str, payload: TaskPatch, db: Session = Depends(get_db)) 
     row = db.get(Task, task_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Task not found")
+    if payload.version is None:
+        raise HTTPException(status_code=409, detail="Task version is required")
+    if payload.version != row.version:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Task version conflict",
+                "expected_version": row.version,
+                "provided_version": payload.version,
+            },
+        )
 
     data = payload.model_dump(exclude_unset=True)
     if "project_id" in data and data["project_id"] == "":
         data["project_id"] = None
 
+    changed_fields: list[str] = []
     for field, value in data.items():
         if field == "version":
             continue
         setattr(row, field, value)
+        changed_fields.append(field)
 
     row.version += 1
+    add_audit(
+        db,
+        action="task.updated",
+        object_ref=row.id,
+        meta={"changed_fields": changed_fields, "new_version": row.version, "status": row.status},
+    )
     db.commit()
+    _sync_task_best_effort(db, row)
     db.refresh(row)
     return TaskOut.model_validate(row)
 
 
 @router.delete("/{task_id}")
-def delete_task(task_id: str, db: Session = Depends(get_db)) -> dict:
+def delete_task(task_id: str, version: int | None = None, db: Session = Depends(get_db)) -> dict:
     row = db.get(Task, task_id)
     if row is None:
         return {"deleted": False, "task_id": task_id}
+    if version is not None and version != row.version:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Task version conflict",
+                "expected_version": row.version,
+                "provided_version": version,
+            },
+        )
+
+    if is_graph_connected(db):
+        try:
+            delete_task_from_todo(db, row)
+        except (GraphAuthError, GraphApiError):
+            db.rollback()
+
+    add_audit(db, action="task.deleted", object_ref=row.id, meta={"title": row.title, "status": row.status})
     db.delete(row)
     db.commit()
     return {"deleted": True, "task_id": task_id}

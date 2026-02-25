@@ -5,16 +5,24 @@
 ## 포함된 핵심 기능
 - Outlook 스타일 단일 화면 UI: 주간 캘린더 뷰 + 일정 리스트 + To-do 패널 + AI 채팅창
 - 온보딩/프로필: 타임존, 자율성 레벨(L0~L4) 설정
+- Project 관리: KPI/우선순위 + 마일스톤(제목/마감/설명) 저장
 - Task 관리: 생성/조회/수정/삭제
 - Calendar block 관리: 생성/조회/수정/삭제 + 충돌 방지
 - Meeting ingest (비동기 202): 회의록 처리 후 Action item 후보 자동 추출
 - Action item 승인/거절: 승인 시 Task + Time-block 자동 생성
 - Approval queue: 범용 승인 리소스 처리(action_item, reschedule)
-- Scheduling proposal/apply 분리: 제약 기반 제안 생성 후 적용
+- Scheduling proposal/apply 분리: OR-Tools CP-SAT 기반 제약 최적화 + 휴리스틱 폴백
 - Daily briefing: Top tasks, 리스크, 가용 시간 스냅샷
+  - 알림 강화: D-2/D-1/D-day 마감 리마인드, 일정 시작 전 리마인드, 2시간 이상 미응답 승인 재알림
+  - 워크로드 헬스: 주간 회의 시간, 근무시간 외 일정(야근), 집중블록 파편화 지표 제공
 - NLI command: 자연어 기반 간단한 작업 생성/의도 파싱
 - Microsoft Graph OAuth: Outlook Calendar / Microsoft To Do 실연동
-- Outlook 캘린더 양방향 반영: 가져오기(import) + 로컬 블록 내보내기(export)
+- Outlook 캘린더 양방향 반영: Delta Query 기반 가져오기(sync) + 로컬 블록 내보내기(export)
+- Microsoft To Do 양방향 반영: 조회/생성/수정/삭제 + 로컬 Task 내보내기(export)
+- To Do Delta Query 인바운드 동기화: 리스트/태스크 증분 반영(sync)
+- 신규 메일 자동 동기화/분류: 불필요(no_action) 메일 자동 제외 + 필요한 항목만 승인 요청 생성
+  - 분류 결과가 `task/event/task_and_event`일 때만 승인 큐에 올리고, `no_action/unclear`는 자동 반영하지 않음
+- Graph Webhook(구독/갱신/해지/콜백) + Outbox worker(재시도 큐) 구현
 - AI Assistant Chat: 회의록 등록/할일 조정/일정 재배치를 대화로 실행
   - 예: `오후 6시 이후 일정들 모두 재배치해줘`, `현재 중복되는 태스크들 삭제해줘`
   - 일정 추가 요청(예: `이번주 목요일 3시에 미팅 일정 추가`)은 Task가 아니라 Calendar 일정으로 생성
@@ -44,7 +52,7 @@ uvicorn app.main:app --reload --port 8000
 ## Microsoft Graph 설정
 1. Azure Portal > App registrations > New registration
 2. Redirect URI(Web): `http://localhost:8000/api/graph/auth/callback`
-3. API permissions(Delegated): `User.Read`, `offline_access`, `Calendars.ReadWrite`, `Tasks.ReadWrite`
+3. API permissions(Delegated): `User.Read`, `offline_access`, `Calendars.ReadWrite`, `Tasks.ReadWrite`, `Mail.Read`
 4. Certificates & secrets에서 Client secret 생성
 5. `.env`에 `MS_CLIENT_ID`, `MS_CLIENT_SECRET`, `MS_TENANT_ID` 입력
 
@@ -90,6 +98,8 @@ uvicorn app.main:app --reload --port 8000
 
 ## 주요 API
 - `GET/PATCH /api/profile`
+- `GET/POST /api/projects`
+- `GET/PATCH/DELETE /api/projects/{project_id}`
 - `POST /api/assistant/chat`
 - `GET/POST /api/tasks`
 - `GET/POST /api/calendar/blocks`
@@ -108,7 +118,22 @@ uvicorn app.main:app --reload --port 8000
 - `GET /api/graph/calendar/events`
 - `POST /api/graph/calendar/import`
 - `POST /api/graph/calendar/export`
+- `POST /api/sync/calendar/delta`
+- `POST /api/sync/todo/delta`
+- `POST /api/sync/mail/delta`
+- `GET /api/sync/webhook/status`
+- `POST /api/sync/webhook/subscribe`
+- `POST /api/sync/webhook/renew`
+- `POST /api/sync/webhook/unsubscribe`
+- `POST /api/sync/webhook/notifications`
+- `GET /api/sync/webhook/notifications?validationToken=...`
+- `POST /api/sync/webhook/lifecycle`
+- `GET /api/sync/webhook/lifecycle?validationToken=...`
+- `POST /api/sync/outbox/process`
 - `GET /api/graph/todo/lists`
+- `PATCH /api/graph/todo/lists/{list_id}/tasks/{task_id}`
+- `DELETE /api/graph/todo/lists/{list_id}/tasks/{task_id}`
+- `POST /api/graph/todo/export`
 - `POST /api/graph/todo/lists/{list_id}/import`
 
 ## 참고
@@ -116,5 +141,15 @@ uvicorn app.main:app --reload --port 8000
 - `OPENAI_API_KEY`가 설정되면 회의 Action Item 추출과 Assistant/NLI 의도 파싱에 OpenAI API를 사용합니다.
 - Assistant Chat은 최근 대화 히스토리를 함께 전달해 문맥 기반 후속 명령(예: "그거 내일로 옮겨줘") 해석 정확도를 높였습니다.
 - `ASSISTANT_LLM_ONLY=true` 상태에서는 키가 없거나 OpenAI 호출 실패 시 Assistant Chat 실행을 중단하고 오류를 반환합니다.
+- `PATCH /api/profile|/api/tasks/{id}|/api/calendar/blocks/{id}|/api/projects/{id}` 요청은 `version` 필드를 포함해야 하며, 버전 불일치 시 `409`를 반환합니다.
+- `DELETE /api/tasks/{id}|/api/calendar/blocks/{id}|/api/projects/{id}` 요청은 필요 시 `?version=` 쿼리로 충돌 방지 삭제를 할 수 있습니다.
 - Microsoft OAuth Redirect URI는 `http://localhost:8000/api/graph/auth/callback`로 Azure App Registration에 등록해야 합니다.
-- 필요 권한(scope): `User.Read`, `offline_access`, `Calendars.ReadWrite`, `Tasks.ReadWrite`
+- 필요 권한(scope): `User.Read`, `offline_access`, `Calendars.ReadWrite`, `Tasks.ReadWrite`, `Mail.Read`
+- To Do Delta Query는 Graph `beta` 엔드포인트를 사용하며, 일반 To Do CRUD는 `v1.0` 엔드포인트를 사용합니다.
+- Webhook 구독을 쓰려면 `.env`에 `MS_WEBHOOK_NOTIFICATION_URL`(공개 HTTPS URL)을 설정해야 합니다.
+- Webhook 콜백 경로: `/api/sync/webhook/notifications`
+- Lifecycle 콜백 경로: `/api/sync/webhook/lifecycle` (미설정 시 notification URL을 재사용)
+- 백그라운드 워커(`SYNC_WORKER_*`)는 outbox 처리와 webhook 만료 임박 시 자동 renew를 수행합니다.
+- 메일 자동 동기화 워커: `SYNC_WORKER_MAIL_DELTA_INTERVAL_SECONDS`, `SYNC_WORKER_MAIL_UNREAD_ONLY`
+- 스케줄러는 기본적으로 OR-Tools CP-SAT을 사용하며, 실패 시 휴리스틱으로 폴백합니다.
+- 스케줄러 파라미터: `SCHEDULER_CPSAT_ENABLED`, `SCHEDULER_CPSAT_TIMEOUT_SECONDS`, `SCHEDULER_CPSAT_MAX_CANDIDATES_PER_TASK`

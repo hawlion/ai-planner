@@ -71,10 +71,11 @@ def apply_schedule_proposal(
         }
 
     created_blocks, updated_blocks = apply_proposal(db, proposal)
+    changed_blocks = [*created_blocks, *updated_blocks]
     outlook_synced = False
-    if created_blocks and is_graph_connected(db):
+    if changed_blocks and is_graph_connected(db):
         try:
-            sync_result = sync_blocks_to_outlook(db, created_blocks)
+            sync_result = sync_blocks_to_outlook(db, changed_blocks)
             outlook_synced = sync_result["synced"] > 0
         except (GraphAuthError, GraphApiError):
             outlook_synced = False

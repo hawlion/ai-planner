@@ -51,6 +51,7 @@ class ProjectCreate(BaseModel):
     description: str | None = None
     kpi: str | None = None
     priority: Literal["low", "medium", "high", "critical"] = "medium"
+    milestones: list["MilestoneCreate"] = Field(default_factory=list)
 
 
 class ProjectPatch(BaseModel):
@@ -58,7 +59,26 @@ class ProjectPatch(BaseModel):
     description: str | None = None
     kpi: str | None = None
     priority: Literal["low", "medium", "high", "critical"] | None = None
+    milestones: list["MilestoneCreate"] | None = None
     version: int | None = None
+
+
+class MilestoneCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    due: datetime
+    description: str | None = None
+
+
+class MilestoneOut(BaseModel):
+    id: str
+    title: str
+    due: datetime
+    description: str | None
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
 
 
 class ProjectOut(BaseModel):
@@ -67,6 +87,7 @@ class ProjectOut(BaseModel):
     description: str | None
     kpi: str | None
     priority: str
+    milestones: list[MilestoneOut] = Field(default_factory=list)
     version: int
     created_at: datetime
     updated_at: datetime
@@ -228,6 +249,11 @@ class ApprovalOut(BaseModel):
 class ApprovalResolve(BaseModel):
     decision: Literal["approve", "reject"]
     reason: str | None = None
+    task_title: str | None = None
+    task_due: datetime | None = None
+    event_title: str | None = None
+    event_start: datetime | None = None
+    event_end: datetime | None = None
 
 
 class Horizon(BaseModel):
@@ -343,6 +369,14 @@ class GraphTodoTaskCreate(BaseModel):
     title: str = Field(min_length=1, max_length=250)
     due: datetime | None = None
     body: str | None = None
+
+
+class GraphTodoTaskPatch(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=250)
+    due: datetime | None = None
+    body: str | None = None
+    status: Literal["notStarted", "inProgress", "completed", "waitingOnOthers", "deferred"] | None = None
+    importance: Literal["low", "normal", "high"] | None = None
 
 
 class AssistantChatTurn(BaseModel):
