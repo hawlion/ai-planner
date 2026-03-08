@@ -43,6 +43,8 @@ const state = {
   calendarCache: Object.create(null),
   calendarLoadRequests: Object.create(null),
   calendarRenderScheduled: false,
+  mergedEventsCache: null,
+  taskTitleMap: new Map(),
 };
 
 const $ = (id) => document.getElementById(id);
@@ -163,6 +165,16 @@ function notify(message, isError = false) {
   state.systemNotice = String(message || "").trim();
   state.systemNoticeIsError = Boolean(isError);
   renderSystemStatus();
+}
+
+function invalidateCalendarDerivedState() {
+  state.mergedEventsCache = null;
+}
+
+function applyCalendarPayload(payload) {
+  state.localBlocks = payload?.localBlocks || [];
+  state.remoteEvents = payload?.remoteEvents || [];
+  invalidateCalendarDerivedState();
 }
 
 async function api(path, options = {}) {
@@ -304,6 +316,7 @@ function renderDailyBriefing() {
 
 async function loadTasks() {
   state.tasks = await api("/tasks");
+  state.taskTitleMap = new Map((state.tasks || []).map((item) => [item.id, item.title || ""]));
 }
 
 async function loadApprovals() {
@@ -363,16 +376,22 @@ function syncLocalBlockFromServer(payload) {
   } else {
     state.localBlocks.push(normalized);
   }
+  invalidateCalendarDerivedState();
 }
 
 function mergedEvents() {
+  if (Array.isArray(state.mergedEventsCache)) {
+    return state.mergedEventsCache;
+  }
+
   const local = normalizeLocalBlocks(state.localBlocks);
   const known = new Set(local.map((item) => item.outlookId).filter(Boolean));
   const remote = normalizeRemoteEvents(state.remoteEvents).filter((item) => !known.has(item.outlookId));
 
-  return [...local, ...remote]
+  state.mergedEventsCache = [...local, ...remote]
     .filter((item) => item.start instanceof Date && item.end instanceof Date)
     .sort((a, b) => a.start.getTime() - b.start.getTime());
+  return state.mergedEventsCache;
 }
 
 function findCalendarEvent(rawEventId) {
@@ -407,7 +426,8 @@ function minutesToDate(dayStartMs, minuteOffset) {
 }
 
 function hasCalendarConflict(start, end, rawEventId) {
-  return normalizeLocalBlocks(state.localBlocks)
+  return mergedEvents()
+    .filter((item) => item.id.startsWith("local-"))
     .filter((item) => item.id !== rawEventId)
     .some((item) => item.start < end && item.end > start);
 }
@@ -461,8 +481,7 @@ function countEventConflicts(events) {
 
 function taskTitleById(taskId) {
   if (!taskId) return "";
-  const row = (state.tasks || []).find((item) => item.id === taskId);
-  return row?.title || "";
+  return state.taskTitleMap.get(taskId) || "";
 }
 
 function linkedBlockCount(taskId) {
@@ -486,8 +505,7 @@ async function loadCalendarData({
   const applyIfCurrent = (payload, source = "network") => {
     const currentKey = getWeekCacheKey(state.weekStart);
     if (currentKey !== weekKey) return;
-    state.localBlocks = payload.localBlocks;
-    state.remoteEvents = payload.remoteEvents;
+    applyCalendarPayload(payload);
     if (typeof onUpdated === "function") {
       onUpdated(payload, source);
     }
@@ -497,8 +515,7 @@ async function loadCalendarData({
   const now = Date.now();
   const isFresh = cached && now - cached.loadedAt <= CALENDAR_WEEK_CACHE_TTL_MS;
   if (cached && useCache && (isFresh || staleWhileRevalidate)) {
-    state.localBlocks = cached.localBlocks;
-    state.remoteEvents = cached.remoteEvents;
+    applyCalendarPayload(cached);
     if (typeof onUpdated === "function") {
       onUpdated(cached, isFresh ? "cache-fresh" : "cache-stale");
     }
@@ -524,31 +541,46 @@ async function loadCalendarData({
   }
 
   const request = (async () => {
-    const local = await api(`/calendar/blocks?${localQuery}`);
-    let remote = [];
-    if (state.graph?.connected) {
-      try {
-        remote = await api(`/graph/calendar/events?${graphQuery}`);
-        if (state.graphAuthError) {
-          state.graphAuthError = null;
-          state.graphAuthWarned = false;
-          renderGraphStatus();
-        }
-      } catch (error) {
-        const nextMessage = error.message || "Graph auth error";
-        const changed = state.graphAuthError !== nextMessage;
-        state.graphAuthError = nextMessage;
-        renderGraphStatus();
-        if (changed || !state.graphAuthWarned) {
-          notify("Outlook 일정 조회 실패: 재연결 후 다시 시도하세요. 로컬 일정만 표시합니다.", true);
-          state.graphAuthWarned = true;
-        }
-        remote = [];
-      }
-    } else {
+    const localPromise = api(`/calendar/blocks?${localQuery}`);
+    const remotePromise = state.graph?.connected
+      ? api(`/graph/calendar/events?${graphQuery}`)
+          .then((remote) => {
+            if (state.graphAuthError) {
+              state.graphAuthError = null;
+              state.graphAuthWarned = false;
+              renderGraphStatus();
+            }
+            return remote;
+          })
+          .catch((error) => {
+            const nextMessage = error.message || "Graph auth error";
+            const changed = state.graphAuthError !== nextMessage;
+            state.graphAuthError = nextMessage;
+            renderGraphStatus();
+            if (changed || !state.graphAuthWarned) {
+              notify("Outlook 일정 조회 실패: 재연결 후 다시 시도하세요. 로컬 일정만 표시합니다.", true);
+              state.graphAuthWarned = true;
+            }
+            return [];
+          })
+      : Promise.resolve([]);
+
+    if (!state.graph?.connected) {
       state.graphAuthError = null;
       state.graphAuthWarned = false;
     }
+
+    const local = await localPromise;
+    applyIfCurrent(
+      {
+        localBlocks: local,
+        remoteEvents: [],
+        loadedAt: Date.now(),
+        key: weekKey,
+      },
+      "local-first",
+    );
+    const remote = await remotePromise;
 
     return {
       localBlocks: local,
@@ -1042,7 +1074,6 @@ function renderWeekHeader() {
       state.selectedDate = startOfDay(new Date(el.dataset.selectDay));
       state.miniMonth = new Date(state.selectedDate.getFullYear(), state.selectedDate.getMonth(), 1);
       renderWeekHeader();
-      renderWeekGrid();
       renderAgenda();
       renderMiniMonth();
       ensureLiveBriefingTicker();
@@ -2209,13 +2240,21 @@ async function submitChatMessage(message, { echoUser = true } = {}) {
     });
     addChatMessage("assistant", composeAssistantReply(result), true, result.actions || []);
     const refreshKeys = Array.isArray(result.refresh) ? result.refresh : [];
-    if (refreshKeys.length > 0) {
+    void runPostChatRefresh(refreshKeys);
+  } catch (error) {
+    addChatMessage("assistant", `오류: ${error.message}`);
+    notify(error.message, true);
+  }
+}
+
+async function runPostChatRefresh(refreshKeys = []) {
+  try {
+    if (Array.isArray(refreshKeys) && refreshKeys.length > 0) {
       await refreshForChatKeys(refreshKeys);
     } else {
       await refreshAll();
     }
   } catch (error) {
-    addChatMessage("assistant", `오류: ${error.message}`);
     notify(error.message, true);
   }
 }
@@ -2235,7 +2274,7 @@ async function refreshForChatKeys(refreshKeys = []) {
   const needsSync = keys.has("sync");
 
   const loads = [];
-  if (needsCalendar) loads.push(loadCalendarData({ force: true, useCache: false, staleWhileRevalidate: false, onUpdated: renderCalendarViewport }));
+  if (needsCalendar) loads.push(loadCalendarData({ force: true, useCache: false, staleWhileRevalidate: false, onUpdated: scheduleCalendarViewportRender }));
   if (needsTasks) loads.push(loadTasks());
   if (needsApprovals) loads.push(loadApprovals());
   if (needsBriefing || needsCalendar) loads.push(loadDailyBriefing());
@@ -2252,7 +2291,7 @@ async function refreshForChatKeys(refreshKeys = []) {
     renderTasks();
   }
   if (needsCalendar) {
-    renderCalendarViewport();
+    scheduleCalendarViewportRender();
   }
   if (needsBriefing) {
     renderDailyBriefing();
@@ -2276,7 +2315,7 @@ async function sendChat(event) {
 
 async function refreshCalendarOnly() {
   const results = await Promise.allSettled([
-    loadCalendarData({ force: true, useCache: false, staleWhileRevalidate: false, onUpdated: renderCalendarViewport }),
+    loadCalendarData({ force: true, useCache: false, staleWhileRevalidate: false, onUpdated: scheduleCalendarViewportRender }),
     loadDailyBriefing(),
     loadSyncStatus(),
   ]);
@@ -2284,7 +2323,7 @@ async function refreshCalendarOnly() {
   if (failedCount > 0) {
     notify(`일부 데이터 로드에 실패했습니다. (${failedCount}개)`, true);
   }
-  renderCalendarViewport();
+  scheduleCalendarViewportRender();
   renderDailyBriefing();
   renderPromptChips();
 }
@@ -2299,7 +2338,7 @@ async function refreshAll({ promptPendingApproval = true, preferApprovalType = n
   const dataResults = await Promise.allSettled([
     loadTasks(),
     loadApprovals(),
-    loadCalendarData({ force: true, useCache: false, staleWhileRevalidate: false, onUpdated: renderCalendarViewport }),
+    loadCalendarData({ force: true, useCache: false, staleWhileRevalidate: false, onUpdated: scheduleCalendarViewportRender }),
     loadDailyBriefing(),
   ]);
   const dataFailedCount = dataResults.filter((item) => item.status === "rejected").length;
@@ -2307,11 +2346,7 @@ async function refreshAll({ promptPendingApproval = true, preferApprovalType = n
     notify(`일부 데이터 로드에 실패했습니다. (${dataFailedCount}개)`, true);
   }
 
-  renderHeaderRange();
-  renderWeekHeader();
-  renderWeekGrid();
-  renderAgenda();
-  renderMiniMonth();
+  scheduleCalendarViewportRender();
   renderTasks();
   renderDailyBriefing();
   renderPromptChips();

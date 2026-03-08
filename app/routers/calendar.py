@@ -18,7 +18,6 @@ from app.services.graph_service import (
     delete_blocks_from_outlook,
     enqueue_outbox_event,
     is_graph_connected,
-    sync_blocks_to_outlook,
 )
 
 router = APIRouter(prefix="/calendar/blocks", tags=["calendar"])
@@ -56,13 +55,9 @@ def _sync_blocks_to_outlook_or_queue(db: Session, blocks: list[CalendarBlock]) -
         return
 
     if not is_graph_connected(db):
-        _enqueue_export_fallback(db, anchor=blocks[0])
         return
 
-    try:
-        sync_blocks_to_outlook(db, blocks)
-    except (GraphApiError, GraphAuthError):
-        _enqueue_export_fallback(db, anchor=blocks[0])
+    _enqueue_export_fallback(db, anchor=blocks[0])
 
 
 def _check_overlap(db: Session, start: datetime, end: datetime, exclude_id: str | None = None) -> None:

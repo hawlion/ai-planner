@@ -18,9 +18,11 @@ from app.services.actions import approve_candidate, reject_candidate
 from app.services.core import ensure_profile
 from app.services.learning import apply_learning_if_due, record_event_start_signal, record_task_due_signal
 from app.services.graph_service import (
+    OUTBOX_CALENDAR_EXPORT,
     GraphApiError,
     GraphAuthError,
     delete_blocks_from_outlook,
+    enqueue_outbox_event,
     is_graph_connected,
     sync_blocks_to_outlook,
     sync_task_to_todo,
@@ -220,6 +222,32 @@ WEEKDAY_KO = {
     "토": 5,
     "일": 6,
 }
+
+
+def _queue_calendar_export_if_connected(db: Session, blocks: list[CalendarBlock]) -> bool:
+    if not blocks or not is_graph_connected(db):
+        return False
+
+    start = min(block.start for block in blocks)
+    end = max(block.end for block in blocks)
+
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=UTC)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=UTC)
+
+    try:
+        enqueue_outbox_event(
+            db,
+            OUTBOX_CALENDAR_EXPORT,
+            {
+                "start": (start.astimezone(UTC) - timedelta(hours=2)).isoformat(),
+                "end": (end.astimezone(UTC) + timedelta(hours=2)).isoformat(),
+            },
+        )
+    except GraphApiError:
+        return False
+    return True
 
 
 def _has_reference_phrase(text: str) -> bool:
@@ -588,7 +616,7 @@ def _find_task(
 
 
 def _task_context(db: Session) -> list[dict]:
-    rows = db.execute(select(Task).order_by(Task.updated_at.desc()).limit(40)).scalars().all()
+    rows = db.execute(select(Task).order_by(Task.updated_at.desc()).limit(25)).scalars().all()
     return [
         {
             "id": row.id,
@@ -607,7 +635,7 @@ def _calendar_context(db: Session) -> list[dict]:
         select(CalendarBlock)
         .where(CalendarBlock.end >= now)
         .order_by(CalendarBlock.start.asc())
-        .limit(60)
+        .limit(40)
     ).scalars().all()
     return [
         {
@@ -627,7 +655,7 @@ def _pending_approval_context(db: Session) -> list[dict]:
         select(ApprovalRequest)
         .where(ApprovalRequest.status == "pending")
         .order_by(ApprovalRequest.created_at.desc())
-        .limit(20)
+        .limit(12)
     ).scalars().all()
     items: list[dict] = []
     for row in rows:
@@ -1386,20 +1414,13 @@ def _create_event_from_message(
         apply_learning_if_due(profile)
     db.flush()
 
-    synced = 0
-    if is_graph_connected(db):
-        try:
-            result = sync_blocks_to_outlook(db, [block])
-            synced = int(result.get("synced", 0))
-        except (GraphAuthError, GraphApiError):
-            synced = 0
-
     db.commit()
     db.refresh(block)
+    sync_queued = _queue_calendar_export_if_connected(db, [block])
 
     reply = f"일정을 생성했습니다: {block.title} ({start.strftime('%Y-%m-%d %H:%M')} - {end.strftime('%H:%M')})"
-    if synced:
-        reply += f" · Outlook 동기화 {synced}건"
+    if sync_queued:
+        reply += " · Outlook 동기화 예약"
 
     return (
         reply,
@@ -1411,7 +1432,8 @@ def _create_event_from_message(
                     "title": block.title,
                     "start": block.start.isoformat(),
                     "end": block.end.isoformat(),
-                    "outlook_synced": bool(synced),
+                    "outlook_synced": False,
+                    "outlook_sync_queued": sync_queued,
                 },
             )
         ],
@@ -1840,18 +1862,11 @@ def _move_event_from_message(
     target.version += 1
     db.commit()
     db.refresh(target)
-
-    synced = 0
-    if is_graph_connected(db):
-        try:
-            result = sync_blocks_to_outlook(db, [target])
-            synced = int(result.get("synced", 0))
-        except (GraphAuthError, GraphApiError):
-            synced = 0
+    sync_queued = _queue_calendar_export_if_connected(db, [target])
 
     reply = f"일정을 이동했습니다: {target.title} ({new_start.strftime('%m-%d %H:%M')} - {end.strftime('%H:%M')})"
-    if synced:
-        reply += f" · Outlook 동기화 {synced}건"
+    if sync_queued:
+        reply += " · Outlook 동기화 예약"
     return (
         reply,
         [AssistantActionOut(type="event_moved", detail={"block_id": target.id, "title": target.title})],
@@ -2797,6 +2812,10 @@ def _plan_actions_with_fallback(
     history_context: list[dict],
 ) -> tuple[list[dict], str | None]:
     if settings.assistant_llm_only:
+        if not _is_multi_intent_message(message) and not _has_reference_phrase(message):
+            nli_actions = _nli_plan_actions(message)
+            if nli_actions:
+                return nli_actions, None
         # In LLM-first mode, use the planner directly and avoid heuristic pre-parsing
         # to reduce branch drift and keep behavior anchored to the current state prompt.
         try:
