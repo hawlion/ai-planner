@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
-from datetime import datetime
+from collections import defaultdict, deque
+from datetime import datetime, timedelta
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 import dateparser
 from pydantic import BaseModel, Field, ValidationError
@@ -52,6 +55,61 @@ def _is_retryable_openai_error(exc: Exception) -> bool:
     return any(token in text for token in retry_tokens)
 
 
+_OPENAI_TIMEOUT_WINDOW_SECONDS = 60.0
+_OPENAI_TIMEOUT_FAIL_THRESHOLD = 2
+_OPENAI_TIMEOUT_COOLDOWN_SECONDS = 30.0
+_OPENAI_TIMEOUT_MAX_LOG_ENTRIES = 12
+
+_openai_timeout_events: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=_OPENAI_TIMEOUT_MAX_LOG_ENTRIES))
+_openai_timeout_blocked_until: dict[str, float] = {}
+
+
+def _is_openai_timeout_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(
+        token in text
+        for token in ["timeout", "timed out", "read timeout", "connection timed out", "operation timed out", "timed-out"]
+    )
+
+
+def _check_openai_timeout_gate(purpose: MODEL_PURPOSE) -> None:
+    now = time.monotonic()
+    blocked_until = _openai_timeout_blocked_until.get(purpose, 0.0)
+    if now < blocked_until:
+        remaining = max(0.0, blocked_until - now)
+        raise OpenAIIntegrationError(
+            f"OpenAI timeout protection active for purpose={purpose}. Retry after {remaining:.1f}s.",
+        )
+
+    events = _openai_timeout_events[purpose]
+    cutoff = now - _OPENAI_TIMEOUT_WINDOW_SECONDS
+    while events and events[0] < cutoff:
+        events.popleft()
+
+
+def _record_openai_timeout(purpose: MODEL_PURPOSE) -> None:
+    now = time.monotonic()
+    events = _openai_timeout_events[purpose]
+    cutoff = now - _OPENAI_TIMEOUT_WINDOW_SECONDS
+    while events and events[0] < cutoff:
+        events.popleft()
+    events.append(now)
+
+    if len(events) >= _OPENAI_TIMEOUT_FAIL_THRESHOLD:
+        _openai_timeout_blocked_until[purpose] = now + _OPENAI_TIMEOUT_COOLDOWN_SECONDS
+        logger.warning(
+            "OpenAI timeout breaker activated for purpose=%s after %s failures in %.1fs window",
+            purpose,
+            len(events),
+            _OPENAI_TIMEOUT_WINDOW_SECONDS,
+        )
+
+
+def _clear_openai_timeout_state(purpose: MODEL_PURPOSE) -> None:
+    _openai_timeout_events[purpose].clear()
+    _openai_timeout_blocked_until.pop(purpose, None)
+
+
 class ActionItemOutput(BaseModel):
     title: str = Field(min_length=3, max_length=180)
     assignee_name: str | None = None
@@ -71,20 +129,32 @@ class NLIOutput(BaseModel):
         "create_event",
         "update_task",
         "delete_task",
+        "update_due",
+        "update_priority",
         "move_event",
-        "reschedule_request",
-        "delete_event",
         "update_event",
+        "reschedule_request",
+        "reschedule_after_hour",
+        "delete_duplicate_tasks",
+        "delete_event",
         "list_tasks",
         "list_events",
         "find_free_time",
         "unknown",
     ]
     title: str | None = None
+    task_keyword: str | None = None
+    task_title: str | None = None
     due: str | None = None
+    start: str | None = None
+    end: str | None = None
     effort_minutes: int | None = Field(default=None, ge=15, le=8 * 60)
     priority: Literal["low", "medium", "high", "critical"] | None = None
+    cutoff_hour: int | None = Field(default=None, ge=0, le=23)
     time_hint: str | None = None
+    new_title: str | None = None
+    duration_minutes: int | None = Field(default=None, ge=15, le=8 * 60)
+    limit: int | None = Field(default=None, ge=1, le=20)
     note: str | None = ""
 
 
@@ -174,6 +244,227 @@ class EmailTriageOutput(BaseModel):
     event_location: str | None = None
 
 
+_TIME_HINT_RE = re.compile(
+    r"\b(?:오전|오후)\s*\d{1,2}(?:\s*시)?(?:\s*\d{1,2}\s*분)?|"
+    r"\b(?:am\.?|pm\.?|a\.m\.?|p\.m\.?)\b|"
+    r"\d{1,2}:\d{2}(?:\s*[ap]m)?|\d{1,2}\s*[시]\b|\d{1,2}\s*시\s*\d{1,2}\s*분|\d{1,2}\s*시\s*반",
+    re.IGNORECASE,
+)
+_DATETIME_CANDIDATE_SPLIT_RE = re.compile(r"[\n,;\|()]|\r?\n|\.")
+_ISO_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_ISO_MIDNIGHT_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T00:00(?::00)?(?:\.\d+)?(?:z|[+-]\d{2}:?\d{2})?$",
+    re.IGNORECASE,
+)
+_KOREAN_MONTH_DAY_RE = re.compile(
+    r"(?:(?P<year>\d{4})\s*년\s*)?(?P<month>\d{1,2})\s*월\s*(?P<day>\d{1,2})\s*일"
+)
+_TIME_KO_RE = re.compile(r"(?:오전|오후)\s*(?P<hour>\d{1,2})(?:\s*시)?(?:\s*(?P<minute>\d{1,2})\s*분|\s*반)?", re.IGNORECASE)
+_TIME_RE = re.compile(
+    r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?(?:\s*(?P<ampm>am|pm|a\.m\.?|p\.m\.?))?",
+    re.IGNORECASE,
+)
+_DATE_CONTEXT_KO = {
+    "오늘",
+    "내일",
+    "모레",
+    "다음주",
+    "다음 주",
+    "이번주",
+    "월요일",
+    "화요일",
+    "수요일",
+    "목요일",
+    "금요일",
+    "토요일",
+    "일요일",
+}
+
+
+def _parse_time_only(raw: str, base_dt: datetime) -> datetime | None:
+    text = (raw or "").strip()
+    if any(token in text for token in _DATE_CONTEXT_KO):
+        return None
+
+    m = _TIME_KO_RE.search(text)
+    if m:
+        hour = int(m.group("hour"))
+        minute = int(m.group("minute") or 0)
+        if "반" in m.group(0):
+            minute = 30
+        if "오후" in m.group(0) and hour < 12:
+            hour += 12
+        local = base_dt.astimezone(_timezone_local())
+        parsed = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if parsed <= local:
+            parsed = parsed + timedelta(days=1)
+        return parsed
+
+    m = _TIME_RE.search(text)
+    if not m:
+        return None
+    hour = int(m.group("hour"))
+    minute = int(m.group("minute") or 0)
+    ampm = (m.group("ampm") or "").lower()
+    if ampm in {"pm", "p.m", "p.m."} and hour < 12:
+        hour += 12
+    if ampm in {"am", "a.m", "a.m."} and hour == 12:
+        hour = 0
+    local = base_dt.astimezone(_timezone_local())
+    parsed = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if parsed <= local:
+        parsed = parsed + timedelta(days=1)
+    return parsed
+
+
+def _looks_time_missing(raw: str | None, parsed: datetime | None) -> bool:
+    if not raw or parsed is None:
+        return False
+    if parsed.hour != 0 or parsed.minute != 0 or parsed.second != 0 or parsed.microsecond != 0:
+        return False
+    lowered = raw.strip().lower()
+    if not _contains_explicit_time(lowered):
+        return True
+    if _ISO_DATE_ONLY_RE.match(lowered):
+        return True
+    if _ISO_MIDNIGHT_RE.match(lowered):
+        # date-only values are often transformed to 00:00 by LLMs.
+        return True
+    return False
+
+
+def _parse_month_day_with_time(raw: str, base_dt: datetime) -> datetime | None:
+    text = str(raw or "").strip()
+    md_match = _KOREAN_MONTH_DAY_RE.search(text)
+    if not md_match:
+        return None
+
+    year = md_match.group("year")
+    month = int(md_match.group("month"))
+    day = int(md_match.group("day"))
+
+    if month <= 0 or month > 12 or day <= 0 or day > 31:
+        return None
+
+    ko_match = _TIME_KO_RE.search(text)
+    tm_match = None
+    if ko_match:
+        tm_match = ko_match
+        hour = int(ko_match.group("hour"))
+        minute = int(ko_match.group("minute") or 0)
+        if "반" in ko_match.group(0):
+            minute = 30
+        if "오후" in ko_match.group(0) and hour < 12:
+            hour += 12
+    else:
+        tm_match = _TIME_RE.search(text)
+        if not tm_match:
+            return None
+        hour = int(tm_match.group("hour"))
+        minute = int(tm_match.group("minute") or 0)
+        ampm = (tm_match.group("ampm") or "").lower()
+        if ampm in {"pm", "p.m", "p.m."} and hour < 12:
+            hour += 12
+        if ampm in {"am", "a.m", "a.m."} and hour == 12:
+            hour = 0
+
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+
+    try:
+        parsed_year = int(year) if year else base_dt.year
+        local_base = base_dt.astimezone(_timezone_local())
+        target = datetime(parsed_year, month, day, hour, minute, 0, tzinfo=_timezone_local())
+    except ValueError:
+        return None
+
+    if not year and target.replace(tzinfo=_timezone_local()) < local_base:
+        try:
+            target = target.replace(year=target.year + 1)
+        except ValueError:
+            return None
+
+    return target
+
+
+def _timezone_local() -> ZoneInfo:
+    try:
+        return ZoneInfo(settings.timezone)
+    except Exception:
+        return ZoneInfo("UTC")
+
+
+def _contains_explicit_time(text: str | None) -> bool:
+    if not text:
+        return False
+    return bool(_TIME_HINT_RE.search(text))
+
+
+def _parse_datetime_value(
+    value: str | None,
+    base_dt: datetime,
+    *,
+    require_time: bool = False,
+) -> datetime | None:
+    if not value:
+        return None
+
+    text = str(value).strip()
+    parsed = None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        parsed = None
+
+    if parsed is None:
+        parsed = _parse_month_day_with_time(text, base_dt)
+
+    if parsed is None:
+        parsed = _parse_time_only(text, base_dt)
+
+    if parsed is None:
+        parsed = dateparser.parse(
+            text,
+            settings={
+                "PREFER_DATES_FROM": "future",
+                "RELATIVE_BASE": base_dt,
+                "TIMEZONE": settings.timezone,
+                "RETURN_AS_TIMEZONE_AWARE": True,
+            },
+            languages=["ko", "en"],
+        )
+
+    if parsed is None:
+        return None
+
+    if require_time and _looks_time_missing(text, parsed):
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_timezone_local())
+
+    if require_time and not _contains_explicit_time(text):
+        return None
+
+    return parsed
+
+
+def _extract_first_datetime_with_time_hint(text: str | None, base_dt: datetime) -> datetime | None:
+    if not text:
+        return None
+
+    for segment in _DATETIME_CANDIDATE_SPLIT_RE.split(text):
+        segment = (segment or "").strip()
+        if not segment or not _contains_explicit_time(segment):
+            continue
+
+        parsed = _parse_datetime_value(segment, base_dt, require_time=True)
+        if parsed:
+            return parsed
+
+    return None
+
+
 
 MODEL_PURPOSE = Literal["default", "assistant", "nli", "extraction"]
 
@@ -203,14 +494,36 @@ def _model_candidates(purpose: MODEL_PURPOSE) -> list[str]:
 def is_openai_available() -> bool:
     return bool(settings.openai_api_key and OpenAI is not None)
 
+def _purpose_timeout_seconds(purpose: MODEL_PURPOSE) -> float:
+    default = float(settings.openai_timeout_seconds)
+    assistant_timeout = float(getattr(settings, "openai_assistant_timeout_seconds", default) or default)
+    budgets = {
+        "assistant": max(6.0, min(assistant_timeout, 14.0)),
+        "nli": min(default, 6.0),
+        "extraction": min(default, 10.0),
+        "default": min(default, 12.0),
+    }
+    return budgets.get(purpose, default)
 
 
-def _client() -> OpenAI:
+def _client(timeout_seconds: float | None = None) -> OpenAI:
     if OpenAI is None:
         raise OpenAIIntegrationError("openai package not installed")
     if not settings.openai_api_key:
         raise OpenAIIntegrationError("OPENAI_API_KEY is not configured")
-    return OpenAI(api_key=settings.openai_api_key, timeout=settings.openai_timeout_seconds)
+    timeout = float(timeout_seconds) if timeout_seconds is not None else float(settings.openai_timeout_seconds)
+    timeout = max(6.0, min(timeout, 14.0))
+    return OpenAI(api_key=settings.openai_api_key, timeout=timeout)
+
+
+def _purpose_retry_limits(purpose: MODEL_PURPOSE) -> int:
+    retries = {
+        "assistant": 1,
+        "nli": 1,
+        "extraction": 1,
+        "default": 2,
+    }
+    return retries.get(purpose, 2)
 
 
 
@@ -221,20 +534,24 @@ def _chat_json(
     purpose: MODEL_PURPOSE = "default",
     temperature: float | None = None,
 ) -> dict:
-    client = _client()
+    _check_openai_timeout_gate(purpose)
+
     models = _model_candidates(purpose)
     if not models:
         raise OpenAIIntegrationError("No OpenAI model candidates configured")
 
+    request_timeout = _purpose_timeout_seconds(purpose)
     temp = settings.openai_temperature if temperature is None else float(temperature)
     last_error: Exception | None = None
     started_at = time.monotonic()
     # Cap total wait so model fallback/retries do not multiply user-facing latency.
-    max_total_wait = max(12.0, float(settings.openai_timeout_seconds) + 10.0)
-    max_retries = 2
+    max_total_wait = max(3.0, request_timeout + 0.4)
+    max_retries = _purpose_retry_limits(purpose)
 
     for model in models:
         for attempt in range(max_retries + 1):
+            attempt_timeout = request_timeout if attempt == 0 else max(5.0, request_timeout * 0.75)
+            client = _client(timeout_seconds=attempt_timeout)
             content = ""
             try:
                 request_args = {
@@ -253,6 +570,7 @@ def _chat_json(
                         part.get("text", "") if isinstance(part, dict) else str(part)
                         for part in content
                     )
+                _clear_openai_timeout_state(purpose)
                 return json.loads(content)
             except Exception as exc:  # noqa: BLE001
                 # Some models (e.g. gpt-5-mini) only allow default temperature.
@@ -274,10 +592,14 @@ def _chat_json(
                                 part.get("text", "") if isinstance(part, dict) else str(part)
                                 for part in content
                             )
+                        _clear_openai_timeout_state(purpose)
                         return json.loads(content)
                     except Exception as retry_exc:  # noqa: BLE001
                         exc = retry_exc
                 last_error = exc
+                is_timeout = _is_openai_timeout_error(exc)
+                if is_timeout:
+                    _record_openai_timeout(purpose)
                 logger.warning(
                     "OpenAI request failed for purpose=%s model=%s attempt=%s: %s",
                     purpose,
@@ -296,10 +618,16 @@ def _chat_json(
                         elapsed,
                     )
                     exhausted = True
+
+                if is_timeout:
+                    # Timeout on one attempt usually means the current model is slow,
+                    # so jump to next model quickly instead of long same-model retries.
+                    exhausted = True
+
                 if exhausted or not retryable:
                     break
 
-                backoff = min(1.5 * (attempt + 1), 3.0)
+                backoff = min(0.25 * (attempt + 1), 0.8)
                 time.sleep(backoff)
 
         if time.monotonic() - started_at >= max_total_wait:
@@ -326,28 +654,6 @@ def _parse_due(value: str | None, base_dt: datetime) -> datetime | None:
         languages=["ko", "en"],
     )
     return parsed
-
-
-def _parse_datetime_value(value: str | None, base_dt: datetime) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            return parsed.replace(tzinfo=base_dt.tzinfo)
-        return parsed
-    except ValueError:
-        pass
-    return dateparser.parse(
-        value,
-        settings={
-            "PREFER_DATES_FROM": "future",
-            "RELATIVE_BASE": base_dt,
-            "TIMEZONE": settings.timezone,
-            "RETURN_AS_TIMEZONE_AWARE": True,
-        },
-        languages=["ko", "en"],
-    )
 
 
 
@@ -417,15 +723,25 @@ def parse_nli_openai(text: str, base_dt: datetime) -> NLIOutput:
     system_prompt = (
         "You parse Korean/English planning commands into intent JSON."
         " Return strict JSON only with fields:"
-        " intent(create_task|create_event|update_task|delete_task|move_event|reschedule_request|"
-        "delete_event|update_event|list_tasks|list_events|find_free_time|unknown),"
-        " title, due, effort_minutes, priority, time_hint, note. "
+        " intent(create_task|create_event|update_task|delete_task|update_due|update_priority|"
+        "move_event|update_event|reschedule_request|reschedule_after_hour|delete_duplicate_tasks|"
+        "delete_event|list_tasks|list_events|find_free_time|unknown),"
+        " title, task_keyword, task_title, due, start, end, new_title, effort_minutes, priority, cutoff_hour,"
+        " time_hint, duration_minutes, limit, note. "
         " If user asks to add a schedule/meeting/calendar entry, use create_event."
         " Use create_task only for to-do/task requests."
         " For create_event/create_task, title must be a concise semantic subject"
         " (strip date/time words and command words like 추가/등록/생성)."
         " Example: '이번주 목요일 오후3시에 공인알림 미팅 일정 추가' -> title='공인알림 미팅'."
         " If only a generic title is available (e.g., 미팅/회의/일정/task), keep it generic and do not invent details."
+        " For move_event/update_event, extract task_keyword/title from event phrase and set start when available."
+        " For update_event include new_title (target title) when user asks to rename."
+        " For reschedule_request include reschedule hint in time_hint/title."
+        " For requests like '오후 6시 이후', 'after 6pm', parse intent=reschedule_after_hour and cutoff_hour=18/20 etc."
+        " For duplicate cleanup ('중복', '중복된 태스크', '중복 태스크 정리'), use delete_duplicate_tasks."
+        " For explicit deadline updates use update_due."
+        " For priority updates use update_priority."
+        " For update_task/update_due/update_priority, title/task_keyword should identify the target task."
         "Use null for unknown values."
         " due should be ISO-8601 datetime when possible."
     )
@@ -482,10 +798,26 @@ def parse_email_triage_openai(
     except ValidationError as exc:
         raise OpenAIIntegrationError(f"OpenAI email triage schema validation failed: {exc}") from exc
 
+    combined = f"{subject.strip()}\n{(body_preview or '').strip()}".strip()
+    explicit_time_in_body = _contains_explicit_time(combined)
+
+    event_start = _parse_datetime_value(parsed.event_start, received_at, require_time=True)
+    event_end = _parse_datetime_value(parsed.event_end, received_at, require_time=True)
+
+    if (
+        explicit_time_in_body
+        and parsed.classification in {"event", "task_and_event"}
+        and (event_start is None or _looks_time_missing(parsed.event_start, event_start))
+    ):
+        event_start = _extract_first_datetime_with_time_hint(combined, received_at)
+
+    if event_start and event_end is None:
+        event_end = event_start + timedelta(hours=1)
+    if event_end and event_start and event_end <= event_start:
+        event_end = event_start + timedelta(hours=1)
+
     # Normalize inferred datetimes if model returns natural language.
     task_due = _parse_datetime_value(parsed.task_due, received_at)
-    event_start = _parse_datetime_value(parsed.event_start, received_at)
-    event_end = _parse_datetime_value(parsed.event_end, received_at)
 
     return EmailTriageOutput(
         classification=parsed.classification,

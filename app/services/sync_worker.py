@@ -14,6 +14,7 @@ from app.services.graph_service import (
     create_or_renew_event_subscription,
     is_graph_connected,
     process_outbox,
+    sync_calendar_delta_to_local,
     sync_mail_delta_to_local,
     webhook_status_payload,
 )
@@ -61,10 +62,12 @@ def _ensure_subscription_if_needed() -> None:
 
 def _run_once() -> None:
     last_outbox = 0.0
+    last_calendar_delta = 0.0
     last_renew = 0.0
     last_mail = 0.0
     poll = max(1, int(settings.sync_worker_poll_seconds))
     outbox_interval = max(1, int(settings.sync_worker_outbox_interval_seconds))
+    calendar_delta_interval = max(15, int(settings.sync_worker_calendar_delta_interval_seconds))
     renew_interval = max(5, int(settings.sync_worker_renew_check_seconds))
     mail_interval = max(15, int(settings.sync_worker_mail_delta_interval_seconds))
     outbox_batch = max(1, min(int(settings.sync_worker_outbox_batch_size), 200))
@@ -79,6 +82,17 @@ def _run_once() -> None:
                     process_outbox(db, limit=outbox_batch)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("sync worker outbox processing failed: %s", exc)
+
+        if now_mono - last_calendar_delta >= calendar_delta_interval:
+            last_calendar_delta = now_mono
+            try:
+                with SessionLocal() as db:
+                    if is_graph_connected(db):
+                        sync_calendar_delta_to_local(db, reset=False)
+            except (GraphAuthError, GraphApiError, GraphConfigError) as exc:
+                logger.warning("sync worker calendar delta skipped: %s", exc)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("sync worker calendar delta failed: %s", exc)
 
         if now_mono - last_renew >= renew_interval:
             last_renew = now_mono

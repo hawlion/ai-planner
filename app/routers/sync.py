@@ -68,10 +68,11 @@ def sync_calendar_delta(
     start: datetime | None = Query(default=None),
     end: datetime | None = Query(default=None),
     reset: bool = Query(default=False),
+    reconcile: bool = Query(default=False),
     db: Session = Depends(get_db),
 ) -> dict:
     try:
-        return sync_calendar_delta_to_local(db, start=start, end=end, reset=reset)
+        return sync_calendar_delta_to_local(db, start=start, end=end, reset=reset, reconcile=reconcile)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except GraphAuthError as exc:

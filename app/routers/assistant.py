@@ -146,6 +146,64 @@ REFERENCE_TOKENS = {
     "it",
     "those",
 }
+CREATE_ADD_KEYWORDS = {
+    "추가",
+    "등록",
+    "생성",
+    "추가해줘",
+    "추가해",
+    "만들어",
+    "만들어줘",
+    "잡아",
+    "잡아줘",
+    "create",
+    "add",
+}
+CREATE_EVENT_KEYWORDS = {
+    "일정",
+    "스케줄",
+    "캘린더",
+    "meeting",
+    "calendar",
+    "미팅",
+    "회의",
+    "약속",
+    "call",
+}
+CREATE_TASK_KEYWORDS = {
+    "할일",
+    "할 일",
+    "태스크",
+    "task",
+    "todo",
+    "to-do",
+    "업무",
+    "작업",
+}
+TIME_HINT_KEYWORDS = {
+    "오전",
+    "오후",
+    "저녁",
+    "아침",
+    "밤",
+    "새벽",
+    "today",
+    "tomorrow",
+    "next week",
+    "this week",
+    "다음주",
+    "이번주",
+    "오늘",
+    "내일",
+    "모레",
+    "월요일",
+    "화요일",
+    "수요일",
+    "목요일",
+    "금요일",
+    "토요일",
+    "일요일",
+}
 WEEKDAY_KO = {
     "월요일": 0,
     "화요일": 1,
@@ -239,6 +297,91 @@ def _extract_cutoff_hour(value: int | None, text: str) -> int | None:
     if "저녁" in text:
         return 18
     return None
+
+
+def _extract_duration_minutes_from_message(text: str) -> int | None:
+    lowered = text.lower()
+    raw_match = re.search(r"(\d{1,2})\s*시간\s*(\d{1,2})?\s*(?:분|분이란|분짜리)?", lowered)
+    if raw_match:
+        hours = int(raw_match.group(1))
+        minutes = int(raw_match.group(2) or 0)
+        total = hours * 60 + minutes
+        if total > 0:
+            return max(15, min(8 * 60, total))
+
+    minute_match = re.search(r"(\d{1,4})\s*(?:분|min|mins|minutes)\b", lowered)
+    if minute_match:
+        return max(15, min(8 * 60, int(minute_match.group(1))))
+
+    if "반" in lowered and any(token in lowered for token in CREATE_ADD_KEYWORDS):
+        return 30
+
+    return None
+
+
+def _extract_priority_from_message(text: str) -> str | None:
+    lowered = text.lower()
+    if "긴급" in lowered or "critical" in lowered:
+        return "critical"
+    if "높음" in lowered or "high" in lowered:
+        return "high"
+    if "중간" in lowered or "medium" in lowered:
+        return "medium"
+    if "낮음" in lowered or "low" in lowered:
+        return "low"
+    return None
+
+
+def _infer_local_create_or_task_action(message: str) -> dict | None:
+    lowered = message.lower()
+    if not lowered.strip():
+        return None
+
+    has_add_verb = any(token in lowered for token in CREATE_ADD_KEYWORDS)
+    if not has_add_verb:
+        return None
+
+    is_event_hint = any(token in lowered for token in CREATE_EVENT_KEYWORDS)
+    is_task_hint = any(token in lowered for token in CREATE_TASK_KEYWORDS)
+    is_time_hint = any(token in lowered for token in TIME_HINT_KEYWORDS) or _contains_datetime_phrase(message)
+
+    # Time-stamped commands without explicit task marker are usually schedules.
+    if is_event_hint or (is_time_hint and not is_task_hint):
+        parsed = _parse_due(message, message)
+        return {
+            "intent": "create_event",
+            "title": message,
+            "due": parsed.isoformat() if parsed else message,
+            "duration_minutes": _extract_duration_minutes_from_message(message) or 60,
+        }
+
+    if is_task_hint:
+        parsed = _parse_due(message, message)
+        return {
+            "intent": "create_task",
+            "title": message,
+            "due": parsed.isoformat() if parsed else None,
+            "effort_minutes": _extract_duration_minutes_from_message(message) or 60,
+            "priority": _extract_priority_from_message(message) or "medium",
+        }
+
+    # Fallback: if the message only has verb + unknown subject, try to infer from intent wording first.
+    if any(token in lowered for token in TIME_HINT_KEYWORDS) or is_time_hint:
+        parsed = _parse_due(message, message)
+        return {
+            "intent": "create_event",
+            "title": message,
+            "due": parsed.isoformat() if parsed else message,
+            "duration_minutes": _extract_duration_minutes_from_message(message) or 60,
+        }
+
+    return {
+        "intent": "create_task",
+        "title": message,
+        "due": None,
+        "effort_minutes": _extract_duration_minutes_from_message(message) or 60,
+        "priority": _extract_priority_from_message(message) or "medium",
+    }
 
 
 def _parse_due(value: str | None, fallback_text: str) -> datetime | None:
@@ -537,9 +680,9 @@ def _parse_email_approval_datetime(value: str | None) -> datetime | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        return parsed
+        parsed = parsed.replace(tzinfo=ZoneInfo(settings.timezone))
     local = parsed.astimezone(ZoneInfo(settings.timezone))
-    return local.replace(tzinfo=None)
+    return local
 
 
 def _ensure_email_triage_table(db: Session) -> None:
@@ -2481,6 +2624,210 @@ def _fallback_classify(text: str, *, allow_openai_nli: bool = True) -> dict:
     return {"intent": "unknown"}
 
 
+def _fast_plan_actions(message: str) -> list[dict]:
+    """Fast rule-based plan extraction without LLM.
+
+    Handles deterministic commands quickly and only falls back to LLM for ambiguous cases.
+    """
+    raw = (message or "").strip()
+    if not raw:
+        return []
+
+    inferred = _infer_local_create_or_task_action(raw)
+    if inferred and inferred.get("intent") in {"create_task", "create_event"}:
+        return [inferred]
+
+    primary = _fallback_classify(raw, allow_openai_nli=False)
+    if str(primary.get("intent") or "unknown") != "unknown":
+        return [primary]
+
+    segments = [segment.strip() for segment in re.split(r"[;\n\r]+| 그리고 ", raw) if segment.strip()]
+    if len(segments) <= 1:
+        return []
+
+    actions: list[dict] = []
+    for segment in segments:
+        inferred_segment = _infer_local_create_or_task_action(segment)
+        if inferred_segment and inferred_segment.get("intent") in {"create_task", "create_event"}:
+            actions.append(inferred_segment)
+            continue
+
+        parsed = _fallback_classify(segment, allow_openai_nli=False)
+        if str(parsed.get("intent") or "unknown") != "unknown":
+            actions.append(parsed)
+    return actions
+
+
+def _is_multi_intent_message(message: str) -> bool:
+    lowered = message.lower()
+    markers = [";", "\n", ",", " 그리고 ", " 또한 ", " 그리고요 ", " 및 ", "&", " and ", " then ", " next ", " 또 "]
+    return any(marker in lowered for marker in markers)
+
+
+def _map_nli_to_plan_action(message: str, parsed) -> dict | None:
+    intent = str(getattr(parsed, "intent", "unknown") or "unknown")
+    if intent == "unknown":
+        return None
+
+    title = getattr(parsed, "title", None)
+    due = getattr(parsed, "due", None)
+    effort_minutes = getattr(parsed, "effort_minutes", None)
+    priority = getattr(parsed, "priority", None)
+    time_hint = getattr(parsed, "time_hint", None)
+    task_keyword = getattr(parsed, "task_keyword", None)
+    task_title = getattr(parsed, "task_title", None)
+    start = getattr(parsed, "start", None)
+    end = getattr(parsed, "end", None)
+    new_title = getattr(parsed, "new_title", None)
+    cutoff_hour = getattr(parsed, "cutoff_hour", None)
+    duration_minutes = getattr(parsed, "duration_minutes", None)
+
+    target_keyword = task_keyword or task_title or title
+
+    if intent == "create_task":
+        return {
+            "intent": "create_task",
+            "title": title,
+            "due": due,
+            "effort_minutes": effort_minutes,
+            "priority": priority,
+        }
+    if intent == "create_event":
+        return {
+            "intent": "create_event",
+            "title": title,
+            "due": due or start,
+            "duration_minutes": duration_minutes or effort_minutes,
+        }
+    if intent == "update_task":
+        return {
+            "intent": "update_task",
+            "task_keyword": target_keyword,
+            "title": title,
+            "due": due,
+            "priority": priority,
+        }
+    if intent == "update_due":
+        return {
+            "intent": "update_due",
+            "task_keyword": target_keyword,
+            "title": target_keyword,
+            "due": due,
+        }
+    if intent == "update_priority":
+        return {
+            "intent": "update_priority",
+            "task_keyword": target_keyword,
+            "title": target_keyword,
+            "priority": priority,
+        }
+    if intent == "move_event":
+        return {
+            "intent": "move_event",
+            "task_keyword": target_keyword,
+            "title": target_keyword,
+            "start": start or due,
+            "end": end,
+            "duration_minutes": duration_minutes,
+        }
+    if intent == "update_event":
+        return {
+            "intent": "update_event",
+            "task_keyword": target_keyword,
+            "title": target_keyword,
+            "new_title": new_title,
+        }
+    if intent == "reschedule_request":
+        hint = time_hint or due or message
+        return {"intent": "reschedule_request", "reschedule_hint": hint, "time_hint": time_hint}
+    if intent == "list_tasks":
+        return {"intent": "list_tasks", "limit": getattr(parsed, "limit", None)}
+    if intent == "list_events":
+        return {"intent": "list_events", "target_date": time_hint or due, "limit": getattr(parsed, "limit", None)}
+    if intent == "find_free_time":
+        return {
+            "intent": "find_free_time",
+            "target_date": time_hint or due,
+            "duration_minutes": effort_minutes,
+        }
+    if intent == "reschedule_after_hour":
+        resolved_cutoff = cutoff_hour
+        if resolved_cutoff is None:
+            resolved_cutoff = _extract_cutoff_hour(None, str(time_hint or due or message or ""))
+        return {
+            "intent": "reschedule_after_hour",
+            "cutoff_hour": resolved_cutoff,
+            "reschedule_hint": time_hint,
+            "title": title,
+        }
+    if intent == "delete_duplicate_tasks":
+        return {
+            "intent": "delete_duplicate_tasks",
+            "title": title,
+        }
+    if intent == "delete_event":
+        return {"intent": "delete_event", "task_keyword": target_keyword, "title": target_keyword}
+    if intent == "complete_task":
+        return {"intent": "complete_task", "task_keyword": target_keyword, "title": target_keyword}
+    if intent == "delete_task":
+        return {"intent": "delete_task", "task_keyword": target_keyword, "title": target_keyword}
+    return None
+
+
+def _nli_plan_actions(message: str) -> list[dict] | None:
+    # Avoid LLM-only NLI parser for context-dependent references.
+    if _has_reference_phrase(message):
+        return None
+
+    if not is_openai_available():
+        return None
+
+    try:
+        parsed = parse_nli_openai(message, base_dt=datetime.utcnow())
+    except OpenAIIntegrationError:
+        return None
+
+    mapped = _map_nli_to_plan_action(message, parsed)
+    return [mapped] if mapped else None
+
+
+def _plan_actions_with_fallback(
+    db: Session,
+    message: str,
+    history_context: list[dict],
+) -> tuple[list[dict], str | None]:
+    if settings.assistant_llm_only:
+        # In LLM-first mode, use the planner directly and avoid heuristic pre-parsing
+        # to reduce branch drift and keep behavior anchored to the current state prompt.
+        try:
+            return _plan_actions_with_llm(db, message, history_context)
+        except Exception as exc:
+            # Temporary hardening: fallback to deterministic parsers on transient LLM failures
+            # (e.g., timeout) so the assistant remains usable.
+            fast_actions = _fast_plan_actions(message)
+            if fast_actions:
+                return fast_actions, None
+            if not _is_multi_intent_message(message):
+                nli_actions = _nli_plan_actions(message)
+                if nli_actions:
+                    return nli_actions, None
+
+            # rethrow for upstream llm_only failure response when no fallback can parse
+            raise
+
+    fast_actions = _fast_plan_actions(message)
+    if fast_actions:
+        return fast_actions, None
+
+    # Use NLI parser for single-intent commands to reduce latency and keep intent quality stable.
+    if not _is_multi_intent_message(message):
+        nli_actions = _nli_plan_actions(message)
+        if nli_actions:
+            return nli_actions, None
+
+    return _plan_actions_with_llm(db, message, history_context)
+
+
 @router.post("/chat", response_model=AssistantChatResponse)
 def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> AssistantChatResponse:
     message = payload.message.strip()
@@ -2503,7 +2850,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
         incoming_actions: list[dict] = []
         if llm_available:
             try:
-                incoming_actions, _ = _plan_actions_with_llm(db, message, history_context)
+                incoming_actions, _ = _plan_actions_with_fallback(db, message, history_context)
             except OpenAIIntegrationError:
                 incoming_actions = []
         else:
@@ -2563,7 +2910,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
 
     if llm_available:
         try:
-            planned_actions, plan_note = _plan_actions_with_llm(db, message, history_context)
+            planned_actions, plan_note = _plan_actions_with_fallback(db, message, history_context)
         except OpenAIIntegrationError as exc:
             if settings.assistant_llm_only:
                 return AssistantChatResponse(

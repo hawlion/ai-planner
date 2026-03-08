@@ -22,7 +22,8 @@ class Settings:
     openai_fallback_model: str = os.getenv("OPENAI_FALLBACK_MODEL", "gpt-5-mini")
     openai_temperature: float = float(os.getenv("OPENAI_TEMPERATURE", "0.1"))
     openai_assistant_temperature: float = float(os.getenv("OPENAI_ASSISTANT_TEMPERATURE", "0.05"))
-    openai_timeout_seconds: float = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "25"))
+    openai_assistant_timeout_seconds: float = float(os.getenv("OPENAI_ASSISTANT_TIMEOUT_SECONDS", "14"))
+    openai_timeout_seconds: float = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "12"))
     assistant_llm_only: bool = os.getenv("ASSISTANT_LLM_ONLY", "true").strip().lower() in {
         "1",
         "true",
@@ -52,6 +53,9 @@ class Settings:
     sync_worker_poll_seconds: int = int(os.getenv("SYNC_WORKER_POLL_SECONDS", "5"))
     sync_worker_outbox_interval_seconds: int = int(os.getenv("SYNC_WORKER_OUTBOX_INTERVAL_SECONDS", "15"))
     sync_worker_outbox_batch_size: int = int(os.getenv("SYNC_WORKER_OUTBOX_BATCH_SIZE", "20"))
+    sync_worker_calendar_delta_interval_seconds: int = int(
+        os.getenv("SYNC_WORKER_CALENDAR_DELTA_INTERVAL_SECONDS", "60")
+    )
     sync_worker_renew_check_seconds: int = int(os.getenv("SYNC_WORKER_RENEW_CHECK_SECONDS", "60"))
     sync_worker_renew_margin_minutes: int = int(os.getenv("SYNC_WORKER_RENEW_MARGIN_MINUTES", "20"))
     sync_worker_mail_delta_interval_seconds: int = int(os.getenv("SYNC_WORKER_MAIL_DELTA_INTERVAL_SECONDS", "90"))

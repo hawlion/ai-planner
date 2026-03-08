@@ -79,9 +79,9 @@ body {
   padding: 4px 12px;
   /* Super compact */
   display: flex;
-  align-items: center;
   justify-content: space-between;
   gap: 8px;
+  align-items: stretch;
 }
 
 .app-header:hover {
@@ -94,6 +94,25 @@ body {
   align-items: center;
   gap: 6px;
   min-width: 0;
+}
+
+.header-left {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.header-brand-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.calendar-nav-controls {
+  display: flex;
+  align-items: center;
 }
 
 .app-brand {
@@ -116,12 +135,13 @@ body {
 }
 
 .range-title {
-  margin: 0 0 0 8px;
+  margin: 0;
   font-size: 15px;
   font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  min-width: 0;
 }
 
 .compact-field {
@@ -630,10 +650,11 @@ select:focus {
   font-size: 11px;
   line-height: 1.2;
   overflow: hidden;
-  cursor: pointer;
+  cursor: default;
   transition: all 0.2s ease;
   z-index: 2;
   border-left: 3px solid transparent;
+  touch-action: none;
 }
 
 .calendar-event:hover {
@@ -663,6 +684,42 @@ select:focus {
 
 .event-delete:hover {
   background: rgba(0, 0, 0, 0.8);
+}
+
+.event-resize-handle {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 2px;
+  height: 10px;
+  border-top: 3px dashed rgba(255, 255, 255, 0.6);
+  cursor: ns-resize;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+  pointer-events: auto;
+}
+
+.calendar-event.editable .event-resize-handle {
+  opacity: 0.8;
+}
+
+.calendar-event:hover .event-resize-handle {
+  opacity: 1;
+}
+
+.calendar-event.editable {
+  cursor: grab;
+}
+
+.calendar-event.dragging {
+  cursor: grabbing;
+  z-index: 20;
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.25);
+  transition: none;
+}
+
+.calendar-event.conflict-preview {
+  box-shadow: inset 0 0 0 1px rgba(220, 38, 38, 0.45), 0 0 0 2px rgba(220, 38, 38, 0.15);
 }
 
 .calendar-event:hover .event-delete {
@@ -981,6 +1038,15 @@ select:focus {
   .header-left,
   .header-right {
     flex-wrap: wrap;
+    gap: 4px;
+  }
+
+  .header-left {
+    gap: 4px;
+  }
+
+  .header-brand-row {
+    flex-wrap: wrap;
   }
 
   .compact-field select,
@@ -1185,11 +1251,6 @@ select:focus {
 
 .btn-danger:hover {
   background: #FCA5A5;
-}
-
-/* Clickable events */
-.calendar-event {
-  cursor: pointer;
 }
 
 .agenda-item {

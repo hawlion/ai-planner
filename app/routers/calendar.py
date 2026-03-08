@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import and_, select
@@ -11,9 +11,58 @@ from app.models import CalendarBlock
 from app.schemas import CalendarBlockCreate, CalendarBlockOut, CalendarBlockPatch
 from app.services.core import add_audit, ensure_profile
 from app.services.learning import apply_learning_if_due, record_event_start_signal
-from app.services.graph_service import GraphApiError, GraphAuthError, delete_blocks_from_outlook, is_graph_connected
+from app.services.graph_service import (
+    GraphApiError,
+    GraphAuthError,
+    OUTBOX_CALENDAR_EXPORT,
+    delete_blocks_from_outlook,
+    enqueue_outbox_event,
+    is_graph_connected,
+    sync_blocks_to_outlook,
+)
 
 router = APIRouter(prefix="/calendar/blocks", tags=["calendar"])
+
+
+def _enqueue_export_fallback(db: Session, *, anchor: CalendarBlock | None = None) -> None:
+    start: datetime = datetime.now(UTC)
+    end: datetime = start + timedelta(days=14)
+
+    if anchor is not None:
+        start = anchor.start
+        end = anchor.end
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=UTC)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=UTC)
+        start = start.astimezone(UTC) - timedelta(hours=2)
+        end = end.astimezone(UTC) + timedelta(hours=2)
+
+    try:
+        enqueue_outbox_event(
+            db,
+            OUTBOX_CALENDAR_EXPORT,
+            {
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+            },
+        )
+    except GraphApiError:
+        pass
+
+
+def _sync_blocks_to_outlook_or_queue(db: Session, blocks: list[CalendarBlock]) -> None:
+    if not blocks:
+        return
+
+    if not is_graph_connected(db):
+        _enqueue_export_fallback(db, anchor=blocks[0])
+        return
+
+    try:
+        sync_blocks_to_outlook(db, blocks)
+    except (GraphApiError, GraphAuthError):
+        _enqueue_export_fallback(db, anchor=blocks[0])
 
 
 def _check_overlap(db: Session, start: datetime, end: datetime, exclude_id: str | None = None) -> None:
@@ -59,6 +108,9 @@ def create_block(payload: CalendarBlockCreate, db: Session = Depends(get_db)) ->
         object_ref=row.id,
         meta={"title": row.title, "start": row.start.isoformat(), "end": row.end.isoformat()},
     )
+    if row.source != "external":
+        _sync_blocks_to_outlook_or_queue(db, [row])
+
     db.commit()
     db.refresh(row)
     return CalendarBlockOut.model_validate(row)
@@ -117,6 +169,9 @@ def patch_block(block_id: str, payload: CalendarBlockPatch, db: Session = Depend
         object_ref=row.id,
         meta={"changed_fields": changed_fields, "new_version": row.version},
     )
+    if row.source != "external":
+        _sync_blocks_to_outlook_or_queue(db, [row])
+
     db.commit()
     db.refresh(row)
     return CalendarBlockOut.model_validate(row)
@@ -152,6 +207,8 @@ def delete_block(block_id: str, version: int | None = None, db: Session = Depend
         if int(result.get("failed", 0)) > 0:
             raise HTTPException(status_code=502, detail="Outlook 일정 삭제에 실패했습니다. 잠시 후 다시 시도해 주세요.")
         outlook_deleted = int(result.get("deleted", 0))
+    elif row.source != "external":
+        _enqueue_export_fallback(db, anchor=row)
 
     add_audit(
         db,

@@ -2,8 +2,11 @@ const API = "/api";
 const HOUR_START = 7;
 const HOUR_END = 22;
 const HOUR_HEIGHT = 60;
+const DRAG_STEP_MINUTES = 15;
+const MIN_EVENT_MINUTES = 15;
 const MIN_EVENT_HEIGHT = 18;
 const DEFAULT_BLOCK_MINUTES = 60;
+const CALENDAR_WEEK_CACHE_TTL_MS = 45_000;
 const STATIC_PROMPT_CHIPS = [
   { label: "회의록 등록", prompt: "회의록: PM: 금요일까지 제안서 초안 작성. 디자이너: 목요일 오전 시안 공유" },
   { label: "일정 재배치", prompt: "이번 주 일정 재배치해줘" },
@@ -33,9 +36,13 @@ const state = {
   chatHistory: [],
   localBlocks: [],
   remoteEvents: [],
+  calendarDragState: null,
   weekStart: startOfWeek(new Date()),
   selectedDate: startOfDay(new Date()),
   miniMonth: new Date(new Date().getFullYear(), new Date().getMonth(), 1),
+  calendarCache: Object.create(null),
+  calendarLoadRequests: Object.create(null),
+  calendarRenderScheduled: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -61,10 +68,22 @@ function startOfWeek(date) {
   return startOfDay(monday);
 }
 
+function toDateKey(date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
 function addDays(date, days) {
   const d = new Date(date);
   d.setDate(d.getDate() + days);
   return d;
+}
+
+function getWeekCacheKey(weekStart) {
+  const start = weekStart instanceof Date ? startOfWeek(weekStart) : startOfWeek(new Date());
+  return toDateKey(start);
 }
 
 function isSameDay(a, b) {
@@ -101,11 +120,20 @@ function isoToLocalDatetimeValue(value) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+function toLocalPayloadDatetime(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(date.getTime())) return null;
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(
+    date.getMinutes(),
+  )}:${pad(date.getSeconds())}`;
+}
+
 function localInputToIso(value) {
   if (!value) return null;
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return null;
-  return date.toISOString();
+  return toLocalPayloadDatetime(date);
 }
 
 function renderSystemStatus() {
@@ -299,6 +327,7 @@ function normalizeLocalBlocks(blocks) {
     source: block.source,
     taskId: block.task_id || null,
     outlookId: block.outlook_event_id || null,
+    locked: Boolean(block.locked),
     version: typeof block.version === "number" ? block.version : null,
   }));
 }
@@ -315,6 +344,27 @@ function normalizeRemoteEvents(events) {
   }));
 }
 
+function syncLocalBlockFromServer(payload) {
+  if (!payload?.id) return;
+  const blockId = String(payload.id);
+  const start = payload.start instanceof Date ? payload.start : new Date(payload.start);
+  const end = payload.end instanceof Date ? payload.end : new Date(payload.end);
+  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime())) return;
+
+  const normalized = {
+    ...payload,
+    id: blockId,
+    start,
+    end,
+  };
+  const idx = state.localBlocks.findIndex((item) => item.id === blockId);
+  if (idx >= 0) {
+    state.localBlocks[idx] = normalized;
+  } else {
+    state.localBlocks.push(normalized);
+  }
+}
+
 function mergedEvents() {
   const local = normalizeLocalBlocks(state.localBlocks);
   const known = new Set(local.map((item) => item.outlookId).filter(Boolean));
@@ -323,6 +373,48 @@ function mergedEvents() {
   return [...local, ...remote]
     .filter((item) => item.start instanceof Date && item.end instanceof Date)
     .sort((a, b) => a.start.getTime() - b.start.getTime());
+}
+
+function findCalendarEvent(rawEventId) {
+  if (!rawEventId) return null;
+  return mergedEvents().find((item) => item.id === rawEventId) || null;
+}
+
+function clampToRange(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function roundToDragStep(minutes) {
+  return Math.round(minutes / DRAG_STEP_MINUTES) * DRAG_STEP_MINUTES;
+}
+
+function getDragMinutesFromY(y, columnRect) {
+  if (!columnRect) return 0;
+  const minutesPerPixel = HOUR_HEIGHT / 60;
+  return (y - columnRect.top) / minutesPerPixel;
+}
+
+function startMinutesToY(minutes) {
+  return (minutes / 60) * HOUR_HEIGHT;
+}
+
+function minutesToDate(dayStartMs, minuteOffset) {
+  const base = new Date(dayStartMs);
+  const totalMinutes = HOUR_START * 60 + clampToRange(Math.round(minuteOffset), 0, (HOUR_END - HOUR_START) * 60);
+  base.setHours(0, 0, 0, 0);
+  base.setMinutes(totalMinutes);
+  return base;
+}
+
+function hasCalendarConflict(start, end, rawEventId) {
+  return normalizeLocalBlocks(state.localBlocks)
+    .filter((item) => item.id !== rawEventId)
+    .some((item) => item.start < end && item.end > start);
+}
+
+function setSuppressEventOpen(rawEventId) {
+  const target = document.querySelector(`.calendar-event[data-event-id="${CSS.escape(rawEventId)}"]`);
+  if (target) target.dataset.suppressOpen = "1";
 }
 
 function normalizedTaskKey(title) {
@@ -378,38 +470,132 @@ function linkedBlockCount(taskId) {
   return (state.localBlocks || []).filter((block) => block.task_id === taskId).length;
 }
 
-async function loadCalendarData() {
-  const start = state.weekStart;
-  const end = addDays(state.weekStart, 7);
-  const query = `start=${encodeURIComponent(start.toISOString())}&end=${encodeURIComponent(end.toISOString())}`;
-
-  const local = await api(`/calendar/blocks?${query}`);
-  let remote = [];
-  if (state.graph?.connected) {
-    try {
-      remote = await api(`/graph/calendar/events?${query}`);
-      if (state.graphAuthError) {
-        state.graphAuthError = null;
-        state.graphAuthWarned = false;
-        renderGraphStatus();
-      }
-    } catch (error) {
-      const nextMessage = error.message || "Graph auth error";
-      const changed = state.graphAuthError !== nextMessage;
-      state.graphAuthError = nextMessage;
-      renderGraphStatus();
-      if (changed || !state.graphAuthWarned) {
-        notify("Outlook 일정 조회 실패: 재연결 후 다시 시도하세요. 로컬 일정만 표시합니다.", true);
-        state.graphAuthWarned = true;
-      }
-      remote = [];
+async function loadCalendarData({
+  force = false,
+  useCache = true,
+  staleWhileRevalidate = true,
+  onUpdated,
+  weekStartDate = null,
+} = {}) {
+  const targetWeekStart = startOfWeek(weekStartDate || state.weekStart);
+  const start = addDays(targetWeekStart, -1);
+  const end = addDays(targetWeekStart, 8);
+  const localQuery = `start=${encodeURIComponent(toLocalPayloadDatetime(start))}&end=${encodeURIComponent(toLocalPayloadDatetime(end))}`;
+  const graphQuery = `start=${encodeURIComponent(start.toISOString())}&end=${encodeURIComponent(end.toISOString())}`;
+  const weekKey = getWeekCacheKey(targetWeekStart);
+  const applyIfCurrent = (payload, source = "network") => {
+    const currentKey = getWeekCacheKey(state.weekStart);
+    if (currentKey !== weekKey) return;
+    state.localBlocks = payload.localBlocks;
+    state.remoteEvents = payload.remoteEvents;
+    if (typeof onUpdated === "function") {
+      onUpdated(payload, source);
     }
-  } else {
-    state.graphAuthError = null;
-    state.graphAuthWarned = false;
+  };
+
+  const cached = useCache ? state.calendarCache[weekKey] : null;
+  const now = Date.now();
+  const isFresh = cached && now - cached.loadedAt <= CALENDAR_WEEK_CACHE_TTL_MS;
+  if (cached && useCache && (isFresh || staleWhileRevalidate)) {
+    state.localBlocks = cached.localBlocks;
+    state.remoteEvents = cached.remoteEvents;
+    if (typeof onUpdated === "function") {
+      onUpdated(cached, isFresh ? "cache-fresh" : "cache-stale");
+    }
+    if (!isFresh && staleWhileRevalidate) {
+      void loadCalendarData({
+        force: true,
+        useCache: false,
+        staleWhileRevalidate: false,
+        onUpdated: (payload, source) => applyIfCurrent(payload, source),
+        weekStartDate: targetWeekStart,
+      });
+    }
+    return { source: "cache", stale: !isFresh, key: weekKey };
   }
-  state.localBlocks = local;
-  state.remoteEvents = remote;
+
+  const existing = force ? null : state.calendarLoadRequests[weekKey];
+  if (existing) {
+    const payload = await existing;
+    if (payload && payload.localBlocks && payload.remoteEvents) {
+      applyIfCurrent(payload);
+    }
+    return { source: "inflight", stale: false, key: weekKey };
+  }
+
+  const request = (async () => {
+    const local = await api(`/calendar/blocks?${localQuery}`);
+    let remote = [];
+    if (state.graph?.connected) {
+      try {
+        remote = await api(`/graph/calendar/events?${graphQuery}`);
+        if (state.graphAuthError) {
+          state.graphAuthError = null;
+          state.graphAuthWarned = false;
+          renderGraphStatus();
+        }
+      } catch (error) {
+        const nextMessage = error.message || "Graph auth error";
+        const changed = state.graphAuthError !== nextMessage;
+        state.graphAuthError = nextMessage;
+        renderGraphStatus();
+        if (changed || !state.graphAuthWarned) {
+          notify("Outlook 일정 조회 실패: 재연결 후 다시 시도하세요. 로컬 일정만 표시합니다.", true);
+          state.graphAuthWarned = true;
+        }
+        remote = [];
+      }
+    } else {
+      state.graphAuthError = null;
+      state.graphAuthWarned = false;
+    }
+
+    return {
+      localBlocks: local,
+      remoteEvents: remote,
+      loadedAt: Date.now(),
+      key: weekKey,
+    };
+  })();
+  state.calendarLoadRequests[weekKey] = request;
+
+  try {
+    const payload = await request;
+    state.calendarCache[weekKey] = payload;
+    applyIfCurrent(payload, "network");
+    return { source: "network", stale: false, key: weekKey };
+  } finally {
+    if (state.calendarLoadRequests[weekKey] === request) {
+      delete state.calendarLoadRequests[weekKey];
+    }
+  }
+}
+
+function scheduleCalendarViewportRender() {
+  if (state.calendarRenderScheduled) return;
+  state.calendarRenderScheduled = true;
+  window.requestAnimationFrame(() => {
+    state.calendarRenderScheduled = false;
+    renderCalendarViewport();
+  });
+}
+
+function prefetchAdjacentWeeks() {
+  const currentWeek = startOfWeek(state.weekStart);
+  [ -7, 7 ].forEach((offset) => {
+    const target = addDays(currentWeek, offset);
+    const cached = state.calendarCache[getWeekCacheKey(target)];
+    const now = Date.now();
+    const isFresh = cached && now - cached.loadedAt <= CALENDAR_WEEK_CACHE_TTL_MS;
+    if (isFresh) return;
+    void loadCalendarData({
+      force: true,
+      useCache: false,
+      staleWhileRevalidate: false,
+      weekStartDate: target,
+      onUpdated: null,
+    });
+  });
 }
 
 async function deleteCalendarBlock(id, isOutlook) {
@@ -461,7 +647,13 @@ function bindEventDeleteButtons(container) {
 function bindEventOpenTargets(container) {
   if (!container) return;
   container.querySelectorAll("[data-open-event-id]").forEach((target) => {
-    target.addEventListener("click", () => {
+    target.addEventListener("click", (evt) => {
+      if (evt.target.closest(".event-resize-handle") || evt.target.closest(".event-delete")) return;
+      const eventEl = target.closest(".calendar-event");
+      if (eventEl?.dataset?.suppressOpen === "1") {
+        eventEl.dataset.suppressOpen = "0";
+        return;
+      }
       const encodedId = target.dataset.openEventId || "";
       if (!encodedId) return;
       openEventModal(decodeURIComponent(encodedId));
@@ -469,10 +661,34 @@ function bindEventOpenTargets(container) {
   });
 }
 
+function bindEventInteractions(container) {
+  if (!container) return;
+  container.querySelectorAll(".calendar-event").forEach((eventEl) => {
+    eventEl.addEventListener("pointerdown", (event) => {
+      if (event.target.closest(".event-delete")) return;
+      if (event.target.closest(".event-resize-handle")) return;
+      const rawId = eventEl.dataset.eventId ? decodeURIComponent(eventEl.dataset.eventId) : "";
+      if (!rawId.startsWith("local-")) return;
+      startDragFromPointer(event, eventEl, false);
+    });
+
+    const resizeHandle = eventEl.querySelector(".event-resize-handle");
+    if (!resizeHandle) return;
+    resizeHandle.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const rawId = eventEl.dataset.eventId ? decodeURIComponent(eventEl.dataset.eventId) : "";
+      if (!rawId.startsWith("local-")) return;
+      startDragFromPointer(event, eventEl, true);
+    });
+  });
+}
+
 function toLocalDatetimeValue(date) {
   const d = new Date(date);
-  d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
-  return d.toISOString().slice(0, 16);
+  if (Number.isNaN(d.getTime())) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 function openEventModal(eventId) {
@@ -513,8 +729,8 @@ async function saveEventChanges() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         title,
-        start: startDt.toISOString(),
-        end: endDt.toISOString(),
+        start: toLocalPayloadDatetime(startDt),
+        end: toLocalPayloadDatetime(endDt),
         version: Number.isFinite(version) ? version : null,
       }),
     });
@@ -524,6 +740,264 @@ async function saveEventChanges() {
   } catch (error) {
     notify(`수정 실패: ${error.message}`, true);
   }
+}
+
+function getCalendarColumns() {
+  const columns = Array.from(document.querySelectorAll("#week-columns .day-column"));
+  return columns
+    .map((column, index) => {
+      const rect = column.getBoundingClientRect();
+      const dayStartMs = Number(column.dataset.dayStart);
+      if (!Number.isFinite(dayStartMs)) return null;
+      return {
+        index,
+        element: column,
+        rect,
+        dayStartMs,
+      };
+    })
+    .filter(Boolean);
+}
+
+function getCalendarColumnFromPoint(columns, clientX, clientY) {
+  if (!columns.length) return null;
+
+  const weekColumns = document.querySelector("#week-columns");
+  const weekRect = weekColumns?.getBoundingClientRect?.();
+  if (Number.isFinite(weekRect?.left) && Number.isFinite(weekRect?.right) && Number.isFinite(weekRect?.width)) {
+    if (clientX < weekRect.left || clientX > weekRect.right) return null;
+  }
+
+  const inBounds = columns.find((column) => {
+    const rect = column.rect;
+    if (!rect) return false;
+    const horizontalMatch = clientX >= rect.left && clientX <= rect.right;
+    if (typeof clientY !== "number" || Number.isNaN(clientY)) return horizontalMatch;
+    const verticalMatch = clientY >= rect.top && clientY <= rect.bottom;
+    return horizontalMatch && verticalMatch;
+  });
+  if (inBounds) return inBounds;
+
+  const targetElement = document.elementFromPoint(clientX, clientY);
+  const targetColumn = targetElement?.closest?.(".day-column") || null;
+  if (targetColumn) {
+    const found = columns.find((column) => column.element === targetColumn);
+    if (found) return found;
+  }
+
+  const week = document.querySelector("#week-columns");
+  const weekRectFallback = week?.getBoundingClientRect?.();
+  const first = columns[0];
+  if (weekRectFallback && Number.isFinite(weekRectFallback.width) && Number.isFinite(weekRectFallback.left) && weekRectFallback.width > 0) {
+    const estimate = Math.floor((clientX - weekRectFallback.left) / (weekRectFallback.width / columns.length));
+    const index = clampToRange(estimate, 0, columns.length - 1);
+    return columns[index];
+  }
+  if (!first?.rect) return columns[0] || null;
+  const estimate = Math.floor((clientX - first.rect.left) / first.rect.width);
+  const index = clampToRange(estimate, 0, columns.length - 1);
+  return columns[index];
+}
+
+function isEventEditable(event) {
+  return event && event.kind !== "outlook" && !event.locked;
+}
+
+function startDragFromPointer(event, eventEl, isResize) {
+  if (event.button !== undefined && event.button !== 0 && event.pointerType === "mouse") return;
+  event.preventDefault();
+  event.stopPropagation();
+
+  const rawId = decodeURIComponent(eventEl.dataset.eventId || "");
+  const calendarEvent = findCalendarEvent(rawId);
+  if (!isEventEditable(calendarEvent)) return;
+
+  const columns = getCalendarColumns();
+  const startColumn = eventEl.closest(".day-column");
+  if (!startColumn) return;
+
+  const startEventRect = eventEl.getBoundingClientRect();
+  const startColumnData = columns.find((column) => column.element === startColumn);
+  if (!startColumnData) return;
+
+  const eventStart = calendarEvent.start instanceof Date ? calendarEvent.start : new Date(calendarEvent.start);
+  const eventEnd = calendarEvent.end instanceof Date ? calendarEvent.end : new Date(calendarEvent.end);
+  if (Number.isNaN(eventStart.getTime()) || Number.isNaN(eventEnd.getTime())) return;
+
+  const durationMinutes = Math.max(MIN_EVENT_MINUTES, (eventEnd.getTime() - eventStart.getTime()) / 60000);
+  const daySpanMinutes = (HOUR_END - HOUR_START) * 60;
+  const initialStartMinutes = clampToRange(
+    (eventStart.getHours() - HOUR_START) * 60 + eventStart.getMinutes() + eventStart.getSeconds() / 60,
+    0,
+    daySpanMinutes - durationMinutes,
+  );
+
+  const stateValue = {
+    mode: isResize ? "resize" : "move",
+    pointerId: event.pointerId,
+    eventEl,
+    eventId: rawId,
+    localId: rawId.replace("local-", ""),
+    version: calendarEvent.version,
+    columns,
+    dayStartMs: startColumnData.dayStartMs,
+    currentColumnIndex: startColumnData.index,
+    startColumnIndex: startColumnData.index,
+    columnWidth: startColumnData.rect.width || 0,
+    startColumnLeft: startColumnData.rect.left || 0,
+    daySpanMinutes,
+    durationMinutes,
+    previewStartMinutes: initialStartMinutes,
+    previewEndMinutes: initialStartMinutes + durationMinutes,
+    grabOffsetY: isResize ? startEventRect.bottom - event.clientY : event.clientY - startEventRect.top,
+    moved: false,
+    startClientX: event.clientX,
+    startClientY: event.clientY,
+    originalLeft: eventEl.style.left,
+    originalWidth: eventEl.style.width,
+    originalVersion: calendarEvent.version,
+  };
+
+  state.calendarDragState = stateValue;
+  eventEl.classList.add("dragging");
+  eventEl.setPointerCapture?.(event.pointerId);
+
+  const onPointerMove = (moveEvent) => {
+    const current = state.calendarDragState;
+    if (!current || moveEvent.pointerId !== current.pointerId) return;
+    moveEvent.preventDefault();
+    moveEvent.stopPropagation();
+
+    const dx = moveEvent.clientX - current.startClientX;
+    const dy = moveEvent.clientY - current.startClientY;
+    if (!current.moved && Math.abs(dx) + Math.abs(dy) > 4) {
+      current.moved = true;
+      current.eventEl.dataset.suppressOpen = "1";
+    }
+
+    let targetColumn = getCalendarColumnFromPoint(current.columns, moveEvent.clientX, moveEvent.clientY) || current.columns[current.currentColumnIndex];
+    if (!targetColumn) return;
+
+    if (current.mode !== "resize" && targetColumn.index !== current.currentColumnIndex) {
+      const dayShift = targetColumn.index - current.startColumnIndex;
+      current.dayStartMs = targetColumn.dayStartMs;
+      current.currentColumnIndex = targetColumn.index;
+      const deltaX = targetColumn.rect.left - current.startColumnLeft;
+      current.eventEl.style.transform = dayShift !== 0 ? `translateX(${deltaX}px)` : "none";
+    } else if (current.mode !== "resize") {
+      current.eventEl.style.transform = "none";
+    } else if (current.mode === "resize") {
+      current.eventEl.style.transform = "none";
+    }
+
+    const cursorMinute = getDragMinutesFromY(moveEvent.clientY, targetColumn.rect);
+    if (current.mode === "move") {
+      const nextStart = roundToDragStep(cursorMinute - current.grabOffsetY / (HOUR_HEIGHT / 60));
+      const clampedStart = clampToRange(nextStart, 0, Math.max(0, current.daySpanMinutes - current.durationMinutes));
+      const nextEnd = clampedStart + current.durationMinutes;
+      current.previewStartMinutes = clampedStart;
+      current.previewEndMinutes = nextEnd;
+    } else {
+      const nextEnd = roundToDragStep(cursorMinute + current.grabOffsetY / (HOUR_HEIGHT / 60));
+      const clampedEnd = clampToRange(nextEnd, current.previewStartMinutes + MIN_EVENT_MINUTES, current.daySpanMinutes);
+      current.previewEndMinutes = clampedEnd;
+      const baseMinutes = (eventStart.getHours() - HOUR_START) * 60 + eventStart.getMinutes() + eventStart.getSeconds() / 60;
+      current.previewStartMinutes = clampToRange(baseMinutes, 0, Math.max(0, current.daySpanMinutes - MIN_EVENT_MINUTES));
+    }
+
+    const nextStartDate = minutesToDate(current.dayStartMs, current.previewStartMinutes);
+    const nextEndDate = minutesToDate(current.dayStartMs, current.previewEndMinutes);
+    const hasConflict = hasCalendarConflict(nextStartDate, nextEndDate, current.eventId);
+    current.eventEl.style.top = `${startMinutesToY(current.previewStartMinutes)}px`;
+    current.eventEl.style.height = `${Math.max(MIN_EVENT_HEIGHT, ((current.previewEndMinutes - current.previewStartMinutes) / 60) * HOUR_HEIGHT)}px`;
+    current.eventEl.classList.toggle("conflict-preview", hasConflict);
+    const timeNode = current.eventEl.querySelector(".event-time");
+    if (timeNode) {
+      timeNode.textContent = `${fmtTime(nextStartDate)} - ${fmtTime(nextEndDate)}`;
+    }
+  };
+
+  const stopInteraction = async (upEvent) => {
+    const current = state.calendarDragState;
+    if (!current || upEvent.pointerId !== current.pointerId) return;
+    current.eventEl.releasePointerCapture?.(current.pointerId);
+
+    window.removeEventListener("pointermove", onPointerMove);
+    window.removeEventListener("pointerup", stopInteraction);
+    window.removeEventListener("pointercancel", stopInteraction);
+
+    current.eventEl.classList.remove("dragging");
+    current.eventEl.classList.remove("conflict-preview");
+    current.eventEl.style.left = current.originalLeft;
+    current.eventEl.style.width = current.originalWidth;
+    current.eventEl.style.transform = "none";
+
+    if (!current.moved) {
+      state.calendarDragState = null;
+      return;
+    }
+
+    const nextStartDate = minutesToDate(current.dayStartMs, current.previewStartMinutes);
+    const nextEndDate = minutesToDate(current.dayStartMs, current.previewEndMinutes);
+    const hasConflict = hasCalendarConflict(nextStartDate, nextEndDate, current.eventId);
+    if (hasConflict) {
+      notify("겹치는 시간대로는 이동/조정할 수 없습니다.", true);
+      state.calendarDragState = null;
+      await refreshCalendarOnly();
+      return;
+    }
+
+    const currentVersion = Number.isFinite(current.version) ? current.version : current.originalVersion;
+    if (!Number.isFinite(currentVersion)) {
+      notify("해당 일정은 버전 정보가 없어 수정할 수 없습니다.", true);
+      state.calendarDragState = null;
+      await refreshCalendarOnly();
+      return;
+    }
+
+    try {
+      const updated = await api(`/calendar/blocks/${current.localId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          start: toLocalPayloadDatetime(nextStartDate),
+          end: toLocalPayloadDatetime(nextEndDate),
+          version: currentVersion,
+        }),
+      });
+      syncLocalBlockFromServer(updated);
+      notify("일정이 수정되었습니다.");
+      setSuppressEventOpen(current.eventId);
+      await refreshCalendarOnly();
+
+      const shouldExist = state.localBlocks.some((item) => String(item.id) === String(current.localId));
+      if (!shouldExist) {
+        syncLocalBlockFromServer({
+          id: current.localId,
+          source: "aawo",
+          title: current.eventEl?.querySelector(".event-title")?.textContent || "일정",
+          start: nextStartDate,
+          end: nextEndDate,
+          task_id: null,
+          outlook_event_id: null,
+          version: updated.version || Number(current.version || 0) + 1,
+          locked: false,
+          type: "task_block",
+          kind: "local",
+        });
+        await refreshCalendarOnly();
+      }
+    } catch (error) {
+      notify(`일정 수정 실패: ${error.message}`, true);
+      await refreshCalendarOnly();
+    } finally {
+      state.calendarDragState = null;
+    }
+  };
+
+  window.addEventListener("pointermove", onPointerMove);
+  window.addEventListener("pointerup", stopInteraction);
+  window.addEventListener("pointercancel", stopInteraction);
 }
 
 function deleteFromModal() {
@@ -664,15 +1138,19 @@ function renderWeekGrid() {
         const linkedTaskTitle = taskTitleById(event.taskId);
         const linkedTaskHtml = linkedTaskTitle ? `<div class="event-link">🔗 ${escapeHtml(linkedTaskTitle)}</div>` : "";
 
+        const isEditable = event.kind !== "outlook" && !event.locked;
+        const resizeHandle = isEditable ? '<span class="event-resize-handle" title="시간 길이 조정">⋮⋮</span>' : "";
+
         const isOutlook = event.kind === "outlook" || event.kind === "mixed";
         const encodedId = encodeURIComponent(event.id);
         return `
-          <div class="calendar-event ${event.kind}${hasConflict ? " conflict" : ""}" data-open-event-id="${encodedId}" style="top:${top}px;height:${height}px;left:calc(${left}% + 2px);width:calc(${width}% - 4px);">
+          <div class="calendar-event ${event.kind}${hasConflict ? " conflict" : ""}${isEditable ? " editable" : ""}" data-event-id="${encodedId}" data-event-date="${event.start.toISOString()}" data-open-event-id="${encodedId}" data-day-start="${dayStart.getTime()}" style="top:${top}px;height:${height}px;left:calc(${left}% + 2px);width:calc(${width}% - 4px);">
             <button class="event-delete" data-event-id="${encodedId}" data-event-outlook="${isOutlook ? "1" : "0"}" title="일정 삭제">×</button>
             ${hasConflict ? `<span class="event-conflict-badge">중복</span>` : ""}
             <div class="event-time">${fmtTime(event.start)}</div>
             <div class="event-title">${escapeHtml(event.title)}</div>
             ${linkedTaskHtml}
+            ${resizeHandle}
           </div>
         `;
       })
@@ -692,13 +1170,14 @@ function renderWeekGrid() {
       }
     }
 
-    return `<div class="day-column" data-day-column="${dayStart.toISOString()}" style="height:${gridHeight}px">
+    return `<div class="day-column" data-day-column="${dayStart.toISOString()}" data-day-start="${dayStart.getTime()}" style="height:${gridHeight}px">
       ${eventsHtml}
       ${timeIndicatorHtml}
     </div>`;
   });
 
   container.innerHTML = dayColumns.join("");
+  bindEventInteractions(container);
   bindEventOpenTargets(container);
   bindEventDeleteButtons(container);
   container.querySelectorAll("[data-day-column]").forEach((el) => {
@@ -789,20 +1268,10 @@ function renderMiniMonth() {
     button.addEventListener("click", async () => {
       const day = startOfDay(new Date(button.dataset.miniDay));
       const nextWeek = startOfWeek(day);
-      const weekChanged = nextWeek.getTime() !== state.weekStart.getTime();
       state.selectedDate = day;
       state.weekStart = nextWeek;
       state.miniMonth = new Date(day.getFullYear(), day.getMonth(), 1);
-
-      if (weekChanged) {
-        await loadCalendarData();
-      }
-      renderHeaderRange();
-      renderWeekHeader();
-      renderWeekGrid();
-      renderAgenda();
-      renderMiniMonth();
-      ensureLiveBriefingTicker();
+      await refreshCalendarWeekQuick({ force: false });
       const chatLog = document.getElementById("chat-log");
       const match = chatLog.innerHTML.match(/<div class="chat-msg assistant">([^<]*)<\/div>/g);
       if (match) {
@@ -917,8 +1386,8 @@ async function createCalendarBlockForTask(taskId) {
         body: JSON.stringify({
           type: "task_block",
           title: task.title,
-          start: start.toISOString(),
-          end: end.toISOString(),
+          start: toLocalPayloadDatetime(start),
+          end: toLocalPayloadDatetime(end),
           task_id: task.id,
           locked: false,
         }),
@@ -1231,7 +1700,7 @@ async function createTask(event) {
       title,
       priority: $("task-priority").value,
       effort_minutes: Number($("task-effort").value || 60),
-      due: dueInput ? new Date(dueInput).toISOString() : null,
+      due: dueInput ? toLocalPayloadDatetime(new Date(dueInput)) : null,
       source: "manual",
     }),
   });
@@ -1268,7 +1737,7 @@ async function syncBidirectional(silent = false) {
   renderSystemStatus();
   try {
     const exportResult = await api("/graph/calendar/export", { method: "POST" });
-    const importResult = await api("/sync/calendar/delta", { method: "POST" });
+    const importResult = await api("/sync/calendar/delta?reset=true&reconcile=true", { method: "POST" });
     let todoExportResult = null;
     let todoDeltaResult = null;
     let mailDeltaResult = null;
@@ -1315,8 +1784,11 @@ async function syncBidirectional(silent = false) {
       const mailSummary = mailDeltaResult
         ? ` / 메일 분류 ${mailDeltaResult.processed}건(승인 요청 ${mailDeltaResult.created_approvals}, 무시 ${mailDeltaResult.ignored}, 기존건너뜀 ${mailDeltaResult.skipped_existing || 0}, 읽음건너뜀 ${mailDeltaResult.skipped_read || 0}, 읽음처리 ${mailDeltaResult.processed_read_actionable || 0}${mailRecoveryUsed ? ", 읽음메일 보강스캔 실행" : ""})`
         : " / 메일 분류 보류";
+      const reconcileSummary = importResult.reconciled
+        ? ` / 재조정 remote:${importResult.reconciled.remote_events || 0}, 삭제반영:${importResult.reconciled.reconciled_deleted || 0}`
+        : "";
       notify(
-        `동기화 완료 · 일정 내보내기 ${exportResult.synced}건(생성 ${exportResult.created}, 업데이트 ${exportResult.updated}) / delta 반영 ${importResult.created + importResult.updated}건(신규 ${importResult.created}, 수정 ${importResult.updated}, 삭제 ${importResult.deleted})${todoSummary}${mailSummary}`,
+        `동기화 완료 · 일정 내보내기 ${exportResult.synced}건(생성 ${exportResult.created}, 업데이트 ${exportResult.updated}) / delta 반영 ${importResult.created + importResult.updated}건(신규 ${importResult.created}, 수정 ${importResult.updated}, 삭제 ${importResult.deleted})${reconcileSummary}${todoSummary}${mailSummary}`,
       );
     }
   } finally {
@@ -1667,6 +2139,64 @@ function composeAssistantReply(result) {
   return actionSummary ? `${result.reply}\n\n작업: ${actionSummary}` : result.reply;
 }
 
+function renderCalendarViewport() {
+  renderHeaderRange();
+  renderWeekHeader();
+  renderWeekGrid();
+  renderAgenda();
+  renderMiniMonth();
+  ensureLiveBriefingTicker();
+}
+
+function isShortcutInputTarget(element) {
+  if (!(element instanceof Element)) return false;
+  const tag = element.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || tag === "BUTTON") return true;
+  return element.isContentEditable;
+}
+
+async function refreshCalendarWeekQuick({ force = false } = {}) {
+  const tasks = [
+    loadCalendarData({
+      force,
+      useCache: true,
+      staleWhileRevalidate: true,
+      onUpdated: scheduleCalendarViewportRender,
+    }),
+    loadDailyBriefing(),
+  ];
+
+  const results = await Promise.allSettled(tasks);
+  const failedCount = results.filter((item) => item.status === "rejected").length;
+  if (failedCount > 0) {
+    notify(`일부 데이터 로드에 실패했습니다. (${failedCount}개)`, true);
+  }
+
+  renderDailyBriefing();
+  scheduleCalendarViewportRender();
+  renderPromptChips();
+}
+
+async function applyWeekOffset(days) {
+  const nextWeekStart = addDays(state.weekStart, days);
+  const nextSelected = addDays(state.selectedDate, days);
+  state.weekStart = nextWeekStart;
+  state.selectedDate = nextSelected;
+  state.miniMonth = new Date(nextSelected.getFullYear(), nextSelected.getMonth(), 1);
+  await refreshCalendarWeekQuick({ force: false });
+  prefetchAdjacentWeeks();
+}
+
+async function goToTodayWeek() {
+  const today = startOfDay(new Date());
+  state.selectedDate = today;
+  state.weekStart = startOfWeek(today);
+  state.miniMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+  await refreshCalendarWeekQuick({ force: false });
+  prefetchAdjacentWeeks();
+  scrollCalendarToNow();
+}
+
 async function submitChatMessage(message, { echoUser = true } = {}) {
   if (!message) return;
   const history = state.chatHistory.slice(-12);
@@ -1678,10 +2208,60 @@ async function submitChatMessage(message, { echoUser = true } = {}) {
       body: JSON.stringify({ message, history }),
     });
     addChatMessage("assistant", composeAssistantReply(result), true, result.actions || []);
-    await refreshAll();
+    const refreshKeys = Array.isArray(result.refresh) ? result.refresh : [];
+    if (refreshKeys.length > 0) {
+      await refreshForChatKeys(refreshKeys);
+    } else {
+      await refreshAll();
+    }
   } catch (error) {
     addChatMessage("assistant", `오류: ${error.message}`);
     notify(error.message, true);
+  }
+}
+
+async function refreshForChatKeys(refreshKeys = []) {
+  const keys = new Set(Array.isArray(refreshKeys) ? refreshKeys : []);
+  if (!keys.size) {
+    await refreshAll();
+    return;
+  }
+
+  const needsTasks = keys.has("tasks");
+  const needsCalendar = keys.has("calendar");
+  const needsApprovals = keys.has("approvals");
+  const needsBriefing = keys.has("briefing");
+  const needsGraph = keys.has("graph");
+  const needsSync = keys.has("sync");
+
+  const loads = [];
+  if (needsCalendar) loads.push(loadCalendarData({ force: true, useCache: false, staleWhileRevalidate: false, onUpdated: renderCalendarViewport }));
+  if (needsTasks) loads.push(loadTasks());
+  if (needsApprovals) loads.push(loadApprovals());
+  if (needsBriefing || needsCalendar) loads.push(loadDailyBriefing());
+  if (needsSync) loads.push(loadSyncStatus());
+  if (needsGraph) loads.push(loadGraphStatus());
+
+  const results = await Promise.allSettled(loads);
+  const failedCount = results.filter((item) => item.status === "rejected").length;
+  if (failedCount > 0) {
+    notify(`일부 데이터 로드에 실패했습니다. (${failedCount}개)`, true);
+  }
+
+  if (needsTasks) {
+    renderTasks();
+  }
+  if (needsCalendar) {
+    renderCalendarViewport();
+  }
+  if (needsBriefing) {
+    renderDailyBriefing();
+  }
+  if (needsTasks || needsCalendar || needsApprovals || needsBriefing) {
+    renderPromptChips();
+  }
+  if (needsApprovals) {
+    promptNextPendingApprovalInChat();
   }
 }
 
@@ -1695,19 +2275,18 @@ async function sendChat(event) {
 }
 
 async function refreshCalendarOnly() {
-  const results = await Promise.allSettled([loadCalendarData(), loadDailyBriefing(), loadSyncStatus()]);
+  const results = await Promise.allSettled([
+    loadCalendarData({ force: true, useCache: false, staleWhileRevalidate: false, onUpdated: renderCalendarViewport }),
+    loadDailyBriefing(),
+    loadSyncStatus(),
+  ]);
   const failedCount = results.filter((item) => item.status === "rejected").length;
   if (failedCount > 0) {
     notify(`일부 데이터 로드에 실패했습니다. (${failedCount}개)`, true);
   }
-  renderHeaderRange();
-  renderWeekHeader();
-  renderWeekGrid();
-  renderAgenda();
-  renderMiniMonth();
+  renderCalendarViewport();
   renderDailyBriefing();
   renderPromptChips();
-  ensureLiveBriefingTicker();
 }
 
 async function refreshAll({ promptPendingApproval = true, preferApprovalType = null } = {}) {
@@ -1717,7 +2296,12 @@ async function refreshAll({ promptPendingApproval = true, preferApprovalType = n
     notify(`초기 상태 조회에 실패했습니다. (${primaryFailedCount}개)`, true);
   }
 
-  const dataResults = await Promise.allSettled([loadTasks(), loadApprovals(), loadCalendarData(), loadDailyBriefing()]);
+  const dataResults = await Promise.allSettled([
+    loadTasks(),
+    loadApprovals(),
+    loadCalendarData({ force: true, useCache: false, staleWhileRevalidate: false, onUpdated: renderCalendarViewport }),
+    loadDailyBriefing(),
+  ]);
   const dataFailedCount = dataResults.filter((item) => item.status === "rejected").length;
   if (dataFailedCount > 0) {
     notify(`일부 데이터 로드에 실패했습니다. (${dataFailedCount}개)`, true);
@@ -1840,25 +2424,15 @@ function bindEvents() {
   });
 
   $("nav-prev").addEventListener("click", async () => {
-    state.weekStart = addDays(state.weekStart, -7);
-    state.selectedDate = addDays(state.selectedDate, -7);
-    state.miniMonth = new Date(state.selectedDate.getFullYear(), state.selectedDate.getMonth(), 1);
-    await refreshCalendarOnly();
+    await applyWeekOffset(-7);
   });
 
   $("nav-next").addEventListener("click", async () => {
-    state.weekStart = addDays(state.weekStart, 7);
-    state.selectedDate = addDays(state.selectedDate, 7);
-    state.miniMonth = new Date(state.selectedDate.getFullYear(), state.selectedDate.getMonth(), 1);
-    await refreshCalendarOnly();
+    await applyWeekOffset(7);
   });
 
   $("nav-today").addEventListener("click", async () => {
-    state.selectedDate = startOfDay(new Date());
-    state.weekStart = startOfWeek(new Date());
-    state.miniMonth = new Date(state.selectedDate.getFullYear(), state.selectedDate.getMonth(), 1);
-    await refreshCalendarOnly();
-    scrollCalendarToNow();
+    await goToTodayWeek();
   });
 
   $("mini-prev").addEventListener("click", () => {
@@ -1876,6 +2450,22 @@ function bindEvents() {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       $("chat-form").requestSubmit();
+    }
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.isComposing) return;
+    if (event.repeat) return;
+    if (isShortcutInputTarget(event.target)) return;
+
+    if (event.key === "<" || (event.key === "," && event.shiftKey)) {
+      event.preventDefault();
+      void applyWeekOffset(-7);
+      return;
+    }
+    if (event.key === ">" || (event.key === "." && event.shiftKey)) {
+      event.preventDefault();
+      void applyWeekOffset(7);
     }
   });
 

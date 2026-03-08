@@ -8,18 +8,22 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=SUIT:wght@400;500;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=20260225-ux-upgrade-v3" />
+  <link rel="stylesheet" href="/static/styles.css?v=20260225-ux-upgrade-v4" />
 </head>
 
 <body>
   <main class="calendar-shell">
     <header class="app-header">
       <div class="header-left">
-        <div class="app-brand">AI Planner</div>
-        <div class="nav-group">
-          <button id="nav-prev" class="btn btn-ghost" type="button">◀</button>
-          <button id="nav-today" class="btn btn-ghost" type="button">오늘</button>
-          <button id="nav-next" class="btn btn-ghost" type="button">▶</button>
+        <div class="header-brand-row">
+          <div class="app-brand">AI Planner</div>
+        </div>
+        <div class="calendar-nav-controls">
+          <div class="nav-group">
+            <button id="nav-prev" class="btn btn-ghost" type="button">◀</button>
+            <button id="nav-today" class="btn btn-ghost" type="button">오늘</button>
+            <button id="nav-next" class="btn btn-ghost" type="button">▶</button>
+          </div>
         </div>
         <h1 id="range-title" class="range-title"></h1>
       </div>
@@ -206,7 +210,7 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=20260225-ux-upgrade-v7"></script>
+  <script src="/static/app.js?v=20260225-ux-upgrade-v8"></script>
 </body>
 
 </html>

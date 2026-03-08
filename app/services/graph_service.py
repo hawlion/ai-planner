@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import re
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -140,9 +141,9 @@ def _resolve_sync_window(
     state: GraphDeltaState,
 ) -> tuple[datetime, datetime]:
     if start is None:
-        start = state.window_start or datetime.now(UTC) - timedelta(days=2)
+        start = state.window_start or datetime.now(UTC) - timedelta(days=14)
     if end is None:
-        end = state.window_end or (start + timedelta(days=21))
+        end = state.window_end or (start + timedelta(days=30))
     if end <= start:
         raise ValueError("end must be later than start")
     return start, end
@@ -238,9 +239,188 @@ def _is_generic_email_title(value: str) -> bool:
     return lowered in generic
 
 
-def _parse_loose_datetime(value: str | None, base_dt: datetime) -> datetime | None:
+_TIME_HINT_RE = re.compile(
+    r"\b(?:오전|오후)\s*\d{1,2}(?:\s*시)?(?:\s*\d{1,2}\s*분)?|"
+    r"\b(?:am\.?|pm\.?|a\.m\.?|p\.m\.?)\b|"
+    r"\d{1,2}:\d{2}(?:\s*[ap]m)?|\d{1,2}\s*[시]\b|\d{1,2}\s*시\s*\d{1,2}\s*분|\d{1,2}\s*시\s*반",
+    re.IGNORECASE,
+)
+_ISO_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_ISO_MIDNIGHT_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T00:00(?::00)?(?:\.\d+)?(?:z|[+-]\d{2}:?\d{2})?$",
+    re.IGNORECASE,
+)
+_KOREAN_MONTH_DAY_RE = re.compile(
+    r"(?:(?P<year>\d{4})\s*년\s*)?(?P<month>\d{1,2})\s*월\s*(?P<day>\d{1,2})\s*일"
+)
+_TIME_KO_RE = re.compile(r"(?:오전|오후)\s*(?P<hour>\d{1,2})(?:\s*시)?(?:\s*(?P<minute>\d{1,2})\s*분|\s*반)?", re.IGNORECASE)
+_TIME_RE = re.compile(
+    r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?(?:\s*(?P<ampm>am|pm|a\.m\.?|p\.m\.?))?",
+    re.IGNORECASE,
+)
+_DATE_CONTEXT_KO = {
+    "오늘",
+    "내일",
+    "모레",
+    "다음주",
+    "다음 주",
+    "이번주",
+    "월요일",
+    "화요일",
+    "수요일",
+    "목요일",
+    "금요일",
+    "토요일",
+    "일요일",
+}
+
+
+def _contains_explicit_time(text: str | None) -> bool:
+    if not text:
+        return False
+    return bool(_TIME_HINT_RE.search(text))
+
+
+def _looks_time_missing(raw: str | None, parsed: datetime | None) -> bool:
+    if not raw or parsed is None:
+        return False
+    if parsed.hour != 0 or parsed.minute != 0 or parsed.second != 0 or parsed.microsecond != 0:
+        return False
+
+    lowered = raw.strip().lower()
+    if not _contains_explicit_time(lowered):
+        return True
+    if _ISO_DATE_ONLY_RE.match(lowered):
+        return True
+    if _ISO_MIDNIGHT_RE.match(lowered):
+        return True
+    return False
+
+
+def _parse_time_only(raw: str, base_dt: datetime) -> datetime | None:
+    text = (raw or "").strip()
+    if any(token in text for token in _DATE_CONTEXT_KO):
+        return None
+
+    m = _TIME_KO_RE.search(text)
+    if m:
+        hour = int(m.group("hour"))
+        minute = int(m.group("minute") or 0)
+        if "반" in m.group(0):
+            minute = 30
+        if "오후" in m.group(0) and hour < 12:
+            hour += 12
+        local = base_dt.astimezone(ZoneInfo(settings.timezone))
+        parsed = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if parsed <= local:
+            parsed = parsed + timedelta(days=1)
+        return parsed
+
+    m = _TIME_RE.search(text)
+    if not m:
+        return None
+    hour = int(m.group("hour"))
+    minute = int(m.group("minute") or 0)
+    ampm = (m.group("ampm") or "").lower()
+    if ampm in {"pm", "p.m", "p.m."} and hour < 12:
+        hour += 12
+    if ampm in {"am", "a.m", "a.m."} and hour == 12:
+        hour = 0
+
+    local = base_dt.astimezone(ZoneInfo(settings.timezone))
+    parsed = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if parsed <= local:
+        parsed = parsed + timedelta(days=1)
+    return parsed
+
+
+def _parse_month_day_with_time(raw: str, base_dt: datetime) -> datetime | None:
+    text = str(raw or "").strip()
+    md_match = _KOREAN_MONTH_DAY_RE.search(text)
+    if not md_match:
+        return None
+
+    year = md_match.group("year")
+    month = int(md_match.group("month"))
+    day = int(md_match.group("day"))
+
+    if month <= 0 or month > 12 or day <= 0 or day > 31:
+        return None
+
+    ko_match = _TIME_KO_RE.search(text)
+    tm_match = None
+    if ko_match:
+        tm_match = ko_match
+        hour = int(ko_match.group("hour"))
+        minute = int(ko_match.group("minute") or 0)
+        if "반" in ko_match.group(0):
+            minute = 30
+        if "오후" in ko_match.group(0) and hour < 12:
+            hour += 12
+    else:
+        tm_match = _TIME_RE.search(text)
+        if not tm_match:
+            return None
+        hour = int(tm_match.group("hour"))
+        minute = int(tm_match.group("minute") or 0)
+        ampm = (tm_match.group("ampm") or "").lower()
+        if ampm in {"pm", "p.m", "p.m."} and hour < 12:
+            hour += 12
+        if ampm in {"am", "a.m", "a.m."} and hour == 12:
+            hour = 0
+
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+
+    tz = ZoneInfo(settings.timezone)
+    local_base = base_dt.astimezone(tz)
+    try:
+        target = datetime(
+            int(year) if year else local_base.year,
+            month,
+            day,
+            hour,
+            minute,
+            0,
+            tzinfo=tz,
+        )
+    except ValueError:
+        return None
+
+    if not year and target < local_base:
+        try:
+            target = target.replace(year=target.year + 1)
+        except ValueError:
+            return None
+
+    return target
+
+
+def _extract_first_datetime_with_time_hint(text: str | None, base_dt: datetime) -> datetime | None:
+    if not text:
+        return None
+    for candidate in re.split(r"[\n,;\|()]|\r?\n|\.", text):
+        candidate = candidate.strip()
+        if not candidate or not _contains_explicit_time(candidate):
+            continue
+        parsed = _parse_loose_datetime(candidate, base_dt, require_time=True)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _parse_loose_datetime(
+    value: str | None,
+    base_dt: datetime,
+    *,
+    require_time: bool = False,
+) -> datetime | None:
     parsed = _parse_datetime(value)
     if parsed is not None:
+        if require_time and _looks_time_missing(value, parsed):
+            return None
+        if require_time and not _contains_explicit_time(value):
+            return None
         return parsed
     if not value:
         return None
@@ -254,8 +434,20 @@ def _parse_loose_datetime(value: str | None, base_dt: datetime) -> datetime | No
             "RETURN_AS_TIMEZONE_AWARE": True,
         },
     )
+
+    if guessed is None:
+        guessed = _parse_month_day_with_time(value, base_dt)
+
+    if guessed is None:
+        guessed = _parse_time_only(value, base_dt)
+
     if guessed is None:
         return None
+    if require_time and not _contains_explicit_time(value):
+        return None
+    if require_time and _looks_time_missing(value, guessed):
+        return None
+
     if guessed.tzinfo is None:
         return guessed.replace(tzinfo=ZoneInfo(settings.timezone)).astimezone(UTC)
     return guessed.astimezone(UTC)
@@ -322,7 +514,9 @@ def _fallback_email_triage(item: dict) -> dict:
     task_hit = any(token in lowered for token in task_tokens)
     event_hit = any(token in lowered for token in event_tokens)
 
-    inferred_dt = _parse_loose_datetime(combined, received_at)
+    inferred_dt = _parse_loose_datetime(combined, received_at, require_time=True)
+    if inferred_dt is None and _contains_explicit_time(combined):
+        inferred_dt = _extract_first_datetime_with_time_hint(combined, received_at)
     if inferred_dt is not None:
         event_hit = True
 
@@ -413,8 +607,14 @@ def _classify_email_message(item: dict) -> dict:
         }
 
     if classification in {"event", "task_and_event"}:
-        event_start = _parse_loose_datetime(parsed.event_start, received_at)
-        event_end = _parse_loose_datetime(parsed.event_end, received_at)
+        raw_event_start = f"{subject}\n{preview}".strip()
+        explicit_time = _contains_explicit_time(raw_event_start)
+        event_start = _parse_loose_datetime(parsed.event_start, received_at, require_time=True)
+        event_end = _parse_loose_datetime(parsed.event_end, received_at, require_time=True)
+        if explicit_time and (event_start is None or _looks_time_missing(parsed.event_start, event_start)):
+            event_start = _extract_first_datetime_with_time_hint(raw_event_start, received_at)
+            if event_start and event_end is not None and _looks_time_missing(parsed.event_end, event_end):
+                event_end = None
         if event_start and event_end is None:
             event_end = event_start + timedelta(hours=1)
         if event_start and event_end and event_end > event_start:
@@ -1148,20 +1348,41 @@ def ping_me(db: Session) -> dict:
 
 
 
-def list_calendar_events(db: Session, start: datetime, end: datetime) -> list[dict]:
-    data = graph_request(
-        db,
-        "GET",
-        "/me/calendar/calendarView",
-        params={
-            "startDateTime": start.astimezone(UTC).isoformat(),
-            "endDateTime": end.astimezone(UTC).isoformat(),
-            "$top": 80,
-            "$orderby": "start/dateTime",
-        },
-        headers={"Prefer": f'outlook.timezone="{settings.timezone}"'},
-    )
-    return data.get("value", [])
+def list_calendar_events(db: Session, start: datetime, end: datetime, *, max_pages: int = 80) -> list[dict]:
+    if end <= start:
+        raise GraphApiError(422, "end must be later than start")
+
+    params = {
+        "startDateTime": start.astimezone(UTC).isoformat(),
+        "endDateTime": end.astimezone(UTC).isoformat(),
+        "$top": 80,
+        "$orderby": "start/dateTime",
+    }
+    path = "/me/calendar/calendarView"
+    data: list[dict] = []
+    pages_left = max(1, int(max_pages))
+
+    for _ in range(pages_left):
+        payload = graph_request(
+            db,
+            "GET",
+            path,
+            params=params,
+            headers={"Prefer": f'outlook.timezone="{settings.timezone}"'},
+        )
+        data.extend(payload.get("value", []))
+
+        next_link = payload.get("@odata.nextLink")
+        if next_link:
+            path = next_link
+            params = None
+            continue
+        break
+
+    if pages_left and next_link:
+        raise GraphApiError(500, "Calendar view page limit exceeded")
+
+    return data
 
 
 
@@ -1458,6 +1679,13 @@ def _apply_calendar_event_to_local(db: Session, event: dict) -> str:
         db.delete(row)
         return "deleted"
 
+    is_cancelled = bool((event.get("isCancelled") or False))
+    if is_cancelled:
+        if row is None:
+            return "skipped"
+        db.delete(row)
+        return "deleted"
+
     start_raw = (event.get("start") or {}).get("dateTime")
     end_raw = (event.get("end") or {}).get("dateTime")
     start_dt = parse_graph_datetime(start_raw)
@@ -1488,12 +1716,67 @@ def _apply_calendar_event_to_local(db: Session, event: dict) -> str:
     return "updated"
 
 
+def _reconcile_calendar_events_with_remote(
+    db: Session,
+    window_start: datetime,
+    window_end: datetime,
+) -> dict[str, int]:
+    remote_events = list_calendar_events(db, window_start, window_end, max_pages=160)
+    remote_ids: set[str] = set()
+    created = 0
+    updated = 0
+    skipped = 0
+    deleted = 0
+
+    for event in remote_events:
+        event_id = (event.get("id") or "").strip()
+        if not event_id:
+            skipped += 1
+            continue
+        remote_ids.add(event_id)
+
+        outcome = _apply_calendar_event_to_local(db, event)
+        if outcome == "created":
+            created += 1
+        elif outcome == "updated":
+            updated += 1
+        elif outcome == "deleted":
+            deleted += 1
+        else:
+            skipped += 1
+
+    local_rows = db.execute(
+        select(CalendarBlock).where(
+            CalendarBlock.outlook_event_id.is_not(None),
+            CalendarBlock.start < window_end,
+            CalendarBlock.end > window_start,
+        )
+    ).scalars().all()
+
+    reconciled_deleted = 0
+    for row in local_rows:
+        local_event_id = (row.outlook_event_id or "").strip()
+        if local_event_id and local_event_id not in remote_ids:
+            db.delete(row)
+            reconciled_deleted += 1
+
+    return {
+        "remote_events": len(remote_events),
+        "remote_created": created,
+        "remote_updated": updated,
+        "remote_skipped": skipped,
+        "remote_deleted": deleted,
+        "reconciled_deleted": reconciled_deleted,
+    }
+
+
 def sync_calendar_delta_to_local(
     db: Session,
     *,
     start: datetime | None = None,
     end: datetime | None = None,
     reset: bool = False,
+    reconcile: bool = False,
 ) -> dict:
     state = _ensure_delta_state(db, CALENDAR_DELTA_RESOURCE)
     window_start, window_end = _resolve_sync_window(start, end, state)
@@ -1517,6 +1800,8 @@ def sync_calendar_delta_to_local(
     deleted = 0
     skipped = 0
 
+    delta_reconcile_summary: dict[str, int] | None = None
+
     for _ in range(40):
         try:
             payload = graph_request(
@@ -1532,7 +1817,13 @@ def sync_calendar_delta_to_local(
                 state.window_start = window_start
                 state.window_end = window_end
                 db.commit()
-                return sync_calendar_delta_to_local(db, start=window_start, end=window_end, reset=True)
+                return sync_calendar_delta_to_local(
+                    db,
+                    start=window_start,
+                    end=window_end,
+                    reset=True,
+                    reconcile=reconcile,
+                )
             raise
 
         for event in payload.get("value", []):
@@ -1553,6 +1844,9 @@ def sync_calendar_delta_to_local(
             params = None
             continue
 
+        if reconcile:
+            delta_reconcile_summary = _reconcile_calendar_events_with_remote(db, window_start, window_end)
+
         if delta_link:
             state.delta_link = delta_link
         state.window_start = window_start
@@ -1566,6 +1860,7 @@ def sync_calendar_delta_to_local(
             "updated": updated,
             "deleted": deleted,
             "skipped": skipped,
+            "reconciled": delta_reconcile_summary,
             "delta_link_saved": bool(state.delta_link),
             "reset": use_reset,
         }
