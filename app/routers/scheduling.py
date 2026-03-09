@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -9,10 +9,44 @@ from app.db import get_db
 from app.models import ApprovalRequest, SchedulingProposal
 from app.schemas import ApplyProposalRequest, ScheduleProposalOut, SchedulingProposalRequest
 from app.services.core import ensure_profile
-from app.services.graph_service import GraphApiError, GraphAuthError, is_graph_connected, sync_blocks_to_outlook
+from app.services.graph_service import OUTBOX_CALENDAR_EXPORT, GraphApiError, enqueue_outbox_event, is_graph_connected
 from app.services.scheduler import apply_proposal, generate_proposals
 
 router = APIRouter(prefix="/scheduling", tags=["scheduling"])
+
+
+def _queue_calendar_export_best_effort(db: Session, blocks: list) -> bool:
+    if not blocks or not is_graph_connected(db):
+        return False
+
+    starts: list[datetime] = []
+    ends: list[datetime] = []
+    for block in blocks:
+        start = block.start
+        end = block.end
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=UTC)
+        else:
+            start = start.astimezone(UTC)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=UTC)
+        else:
+            end = end.astimezone(UTC)
+        starts.append(start)
+        ends.append(end)
+
+    try:
+        enqueue_outbox_event(
+            db,
+            OUTBOX_CALENDAR_EXPORT,
+            {
+                "start": (min(starts) - timedelta(hours=2)).isoformat(),
+                "end": (max(ends) + timedelta(hours=2)).isoformat(),
+            },
+        )
+        return True
+    except GraphApiError:
+        return False
 
 
 @router.post("/proposals", response_model=list[ScheduleProposalOut])
@@ -72,13 +106,7 @@ def apply_schedule_proposal(
 
     created_blocks, updated_blocks = apply_proposal(db, proposal)
     changed_blocks = [*created_blocks, *updated_blocks]
-    outlook_synced = False
-    if changed_blocks and is_graph_connected(db):
-        try:
-            sync_result = sync_blocks_to_outlook(db, changed_blocks)
-            outlook_synced = sync_result["synced"] > 0
-        except (GraphAuthError, GraphApiError):
-            outlook_synced = False
+    outlook_synced = _queue_calendar_export_best_effort(db, changed_blocks)
 
     return {
         "proposal_id": proposal.id,

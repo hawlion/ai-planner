@@ -10,19 +10,26 @@ from app.db import get_db
 from app.models import Task
 from app.schemas import TaskCreate, TaskOut, TaskPatch
 from app.services.core import add_audit, ensure_profile
-from app.services.graph_service import GraphApiError, GraphAuthError, delete_task_from_todo, is_graph_connected, sync_task_to_todo
+from app.services.graph_service import (
+    OUTBOX_TODO_EXPORT,
+    GraphApiError,
+    GraphAuthError,
+    delete_task_from_todo,
+    enqueue_outbox_event,
+    is_graph_connected,
+)
 from app.services.learning import apply_learning_if_due, record_task_due_signal
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
 
-def _sync_task_best_effort(db: Session, row: Task) -> None:
+def _queue_task_export_best_effort(db: Session) -> None:
     if not is_graph_connected(db):
         return
     try:
-        sync_task_to_todo(db, row)
-    except (GraphAuthError, GraphApiError):
-        db.rollback()
+        enqueue_outbox_event(db, OUTBOX_TODO_EXPORT, {})
+    except GraphApiError:
+        pass
 
 
 @router.get("", response_model=list[TaskOut])
@@ -63,8 +70,7 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)) -> TaskOut:
     )
     db.commit()
     db.refresh(row)
-    _sync_task_best_effort(db, row)
-    db.refresh(row)
+    _queue_task_export_best_effort(db)
     return TaskOut.model_validate(row)
 
 
@@ -119,7 +125,7 @@ def patch_task(task_id: str, payload: TaskPatch, db: Session = Depends(get_db)) 
         meta={"changed_fields": changed_fields, "new_version": row.version, "status": row.status},
     )
     db.commit()
-    _sync_task_best_effort(db, row)
+    _queue_task_export_best_effort(db)
     db.refresh(row)
     return TaskOut.model_validate(row)
 

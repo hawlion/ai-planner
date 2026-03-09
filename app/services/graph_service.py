@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import re
+import threading
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -41,6 +42,8 @@ OUTBOX_CALENDAR_DELTA = "calendar.delta"
 OUTBOX_TODO_EXPORT = "todo.export"
 OUTBOX_TODO_DELTA = "todo.delta"
 OUTBOX_MAIL_DELTA = "mail.delta"
+_GRAPH_HTTP_CLIENT: httpx.Client | None = None
+_GRAPH_HTTP_CLIENT_LOCK = threading.Lock()
 
 
 class GraphConfigError(RuntimeError):
@@ -730,16 +733,48 @@ def _update_sync_status(
 ) -> None:
     row = _ensure_sync_status(db)
     now = datetime.now(UTC)
+    changed = False
 
     if connected is not None:
-        row.graph_connected = connected
+        if row.graph_connected != connected:
+            row.graph_connected = connected
+            changed = True
     if ping_success:
-        row.last_delta_sync_at = now
+        if row.last_delta_sync_at is None or (now - row.last_delta_sync_at).total_seconds() >= 15:
+            row.last_delta_sync_at = now
+            changed = True
     if throttled:
         row.last_429_at = now
         row.recent_429_count += 1
+        changed = True
 
-    db.commit()
+    if changed:
+        db.commit()
+
+
+def _graph_http_client() -> httpx.Client:
+    global _GRAPH_HTTP_CLIENT
+    if _GRAPH_HTTP_CLIENT is not None:
+        return _GRAPH_HTTP_CLIENT
+
+    with _GRAPH_HTTP_CLIENT_LOCK:
+        if _GRAPH_HTTP_CLIENT is None:
+            _GRAPH_HTTP_CLIENT = httpx.Client(
+                http2=True,
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+                timeout=httpx.Timeout(connect=5.0, read=10.0, write=12.0, pool=5.0),
+            )
+    return _GRAPH_HTTP_CLIENT
+
+
+def _graph_request_timeout(method: str, path: str) -> httpx.Timeout:
+    upper = method.upper()
+    target = (path or "").lower()
+    if upper == "GET" and ("calendarview" in target or "/calendar/" in target or "/me/events" in target):
+        return httpx.Timeout(connect=5.0, read=8.0, write=10.0, pool=5.0)
+    if upper == "GET":
+        return httpx.Timeout(connect=5.0, read=9.0, write=10.0, pool=5.0)
+    return httpx.Timeout(connect=5.0, read=12.0, write=12.0, pool=5.0)
 
 
 
@@ -926,15 +961,15 @@ def graph_request(
         if headers:
             request_headers.update(headers)
 
-        with httpx.Client(timeout=30.0) as client:
-            url = path if path.startswith("http://") or path.startswith("https://") else f"{GRAPH_BASE_URL}{path}"
-            response = client.request(
-                method=method,
-                url=url,
-                params=params,
-                json=json_body,
-                headers=request_headers,
-            )
+        url = path if path.startswith("http://") or path.startswith("https://") else f"{GRAPH_BASE_URL}{path}"
+        response = _graph_http_client().request(
+            method=method,
+            url=url,
+            params=params,
+            json=json_body,
+            headers=request_headers,
+            timeout=_graph_request_timeout(method, url),
+        )
 
         if response.status_code == 401 and attempts == 1:
             token = _acquire_access_token(db, force_refresh=True)
@@ -947,7 +982,7 @@ def graph_request(
                 retry_after = int(response.headers.get("Retry-After", "2"))
             except ValueError:
                 retry_after = 2
-            time.sleep(min(max(retry_after, 1), 10))
+            time.sleep(min(max(retry_after, 1), 4))
             continue
 
         if response.status_code >= 400:

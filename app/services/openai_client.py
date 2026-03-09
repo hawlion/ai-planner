@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
@@ -62,6 +63,8 @@ _OPENAI_TIMEOUT_MAX_LOG_ENTRIES = 12
 
 _openai_timeout_events: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=_OPENAI_TIMEOUT_MAX_LOG_ENTRIES))
 _openai_timeout_blocked_until: dict[str, float] = {}
+_openai_client_lock = threading.Lock()
+_openai_clients: dict[float, OpenAI] = {}
 
 
 def _is_openai_timeout_error(exc: Exception) -> bool:
@@ -513,7 +516,13 @@ def _client(timeout_seconds: float | None = None) -> OpenAI:
         raise OpenAIIntegrationError("OPENAI_API_KEY is not configured")
     timeout = float(timeout_seconds) if timeout_seconds is not None else float(settings.openai_timeout_seconds)
     timeout = max(6.0, min(timeout, 14.0))
-    return OpenAI(api_key=settings.openai_api_key, timeout=timeout)
+    timeout_key = round(timeout, 2)
+    with _openai_client_lock:
+        client = _openai_clients.get(timeout_key)
+        if client is None:
+            client = OpenAI(api_key=settings.openai_api_key, timeout=timeout)
+            _openai_clients[timeout_key] = client
+        return client
 
 
 def _purpose_retry_limits(purpose: MODEL_PURPOSE) -> int:
@@ -880,42 +889,42 @@ def parse_assistant_plan_openai(
     pending_approvals: list[dict] | None = None,
 ) -> AssistantPlanOutput:
     context_lines: list[str] = []
-    for item in task_context[:30]:
+    for item in task_context[:15]:
         context_lines.append(
             "- title={title} | status={status} | priority={priority} | due={due}".format(
-                title=_clip_text(str(item.get("title") or ""), 90),
+                title=_clip_text(str(item.get("title") or ""), 72),
                 status=_clip_text(str(item.get("status") or ""), 24),
                 priority=_clip_text(str(item.get("priority") or ""), 24),
-                due=_clip_text(str(item.get("due") or ""), 40),
+                due=_clip_text(str(item.get("due") or ""), 32),
             )
         )
 
     history_lines: list[str] = []
-    for turn in (history or [])[-6:]:
+    for turn in (history or [])[-4:]:
         role = str(turn.get("role") or "").strip().lower()
-        text_value = _clip_text(str(turn.get("text") or ""), 280)
+        text_value = _clip_text(str(turn.get("text") or ""), 160)
         if role not in {"user", "assistant"} or not text_value:
             continue
         history_lines.append(f"{role}: {text_value}")
 
     event_lines: list[str] = []
-    for item in (calendar_context or [])[:30]:
+    for item in (calendar_context or [])[:20]:
         event_lines.append(
             "- title={title} | start={start} | end={end} | source={source}".format(
-                title=_clip_text(str(item.get("title") or ""), 90),
-                start=_clip_text(str(item.get("start") or ""), 40),
-                end=_clip_text(str(item.get("end") or ""), 40),
-                source=_clip_text(str(item.get("source") or ""), 24),
+                title=_clip_text(str(item.get("title") or ""), 72),
+                start=_clip_text(str(item.get("start") or ""), 32),
+                end=_clip_text(str(item.get("end") or ""), 32),
+                source=_clip_text(str(item.get("source") or ""), 18),
             )
         )
 
     approval_lines: list[str] = []
-    for item in (pending_approvals or [])[:15]:
+    for item in (pending_approvals or [])[:8]:
         approval_lines.append(
             "- id={id} | type={type} | summary={summary}".format(
-                id=_clip_text(str(item.get("id") or ""), 48),
-                type=_clip_text(str(item.get("type") or ""), 24),
-                summary=_clip_text(str(item.get("summary") or ""), 120),
+                id=_clip_text(str(item.get("id") or ""), 36),
+                type=_clip_text(str(item.get("type") or ""), 18),
+                summary=_clip_text(str(item.get("summary") or ""), 80),
             )
         )
 

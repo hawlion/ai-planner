@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -15,7 +15,13 @@ from app.routers.assistant import _run_one_action
 from app.schemas import ApprovalOut, ApprovalResolve
 from app.services.actions import approve_candidate, reject_candidate
 from app.services.core import ensure_profile
-from app.services.graph_service import GraphApiError, GraphAuthError, is_graph_connected, sync_blocks_to_outlook, sync_task_to_todo
+from app.services.graph_service import (
+    OUTBOX_CALENDAR_EXPORT,
+    OUTBOX_TODO_EXPORT,
+    GraphApiError,
+    enqueue_outbox_event,
+    is_graph_connected,
+)
 from app.services.scheduler import apply_proposal
 
 router = APIRouter(prefix="/approvals", tags=["approvals"])
@@ -50,6 +56,50 @@ def _ensure_email_triage_table(db: Session) -> None:
         EmailTriage.__table__.create(bind=engine, checkfirst=True)
 
 
+def _queue_calendar_export_best_effort(db: Session, blocks: list[CalendarBlock]) -> bool:
+    if not blocks or not is_graph_connected(db):
+        return False
+
+    starts: list[datetime] = []
+    ends: list[datetime] = []
+    for block in blocks:
+        start = block.start
+        end = block.end
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=UTC)
+        else:
+            start = start.astimezone(UTC)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=UTC)
+        else:
+            end = end.astimezone(UTC)
+        starts.append(start)
+        ends.append(end)
+
+    try:
+        enqueue_outbox_event(
+            db,
+            OUTBOX_CALENDAR_EXPORT,
+            {
+                "start": (min(starts) - timedelta(hours=2)).isoformat(),
+                "end": (max(ends) + timedelta(hours=2)).isoformat(),
+            },
+        )
+        return True
+    except GraphApiError:
+        return False
+
+
+def _queue_todo_export_best_effort(db: Session) -> bool:
+    if not is_graph_connected(db):
+        return False
+    try:
+        enqueue_outbox_event(db, OUTBOX_TODO_EXPORT, {})
+        return True
+    except GraphApiError:
+        return False
+
+
 @router.get("", response_model=list[ApprovalOut])
 def list_approvals(status: str | None = None, db: Session = Depends(get_db)) -> list[ApprovalOut]:
     stmt = select(ApprovalRequest)
@@ -75,6 +125,8 @@ def resolve_approval(approval_id: str, payload: ApprovalResolve, db: Session = D
     approval.status = "approved" if decision == "approve" else "rejected"
     approval.reason = payload.reason
     approval.resolved_at = datetime.utcnow()
+    queued_calendar_blocks: list[CalendarBlock] = []
+    should_queue_todo_export = False
 
     has_edits = any(
         [
@@ -111,11 +163,7 @@ def resolve_approval(approval_id: str, payload: ApprovalResolve, db: Session = D
                     candidate.due = _to_local_naive(payload.task_due)
                 profile = ensure_profile(db)
                 _, blocks = approve_candidate(db, candidate, profile)
-                if blocks and is_graph_connected(db):
-                    try:
-                        sync_blocks_to_outlook(db, blocks)
-                    except (GraphAuthError, GraphApiError):
-                        pass
+                queued_calendar_blocks.extend(blocks)
             else:
                 reject_candidate(candidate)
 
@@ -124,12 +172,7 @@ def resolve_approval(approval_id: str, payload: ApprovalResolve, db: Session = D
         proposal = db.get(SchedulingProposal, proposal_id)
         if proposal and proposal.status == "draft":
             created_blocks, updated_blocks = apply_proposal(db, proposal)
-            changed_blocks = [*created_blocks, *updated_blocks]
-            if changed_blocks and is_graph_connected(db):
-                try:
-                    sync_blocks_to_outlook(db, changed_blocks)
-                except (GraphAuthError, GraphApiError):
-                    pass
+            queued_calendar_blocks.extend([*created_blocks, *updated_blocks])
 
     if approval.type == "email_intake":
         _ensure_email_triage_table(db)
@@ -178,11 +221,7 @@ def resolve_approval(approval_id: str, payload: ApprovalResolve, db: Session = D
                 )
                 db.add(created_task)
                 db.flush()
-                if is_graph_connected(db):
-                    try:
-                        sync_task_to_todo(db, created_task)
-                    except (GraphAuthError, GraphApiError):
-                        pass
+                should_queue_todo_export = True
 
             if event_data:
                 start = _parse_datetime(event_data.get("start"))
@@ -201,11 +240,7 @@ def resolve_approval(approval_id: str, payload: ApprovalResolve, db: Session = D
                     )
                     db.add(created_block)
                     db.flush()
-                    if is_graph_connected(db):
-                        try:
-                            sync_blocks_to_outlook(db, [created_block])
-                        except (GraphAuthError, GraphApiError):
-                            pass
+                    queued_calendar_blocks.append(created_block)
 
             if triage is not None:
                 triage.status = "approved"
@@ -219,5 +254,9 @@ def resolve_approval(approval_id: str, payload: ApprovalResolve, db: Session = D
         approval.reason = "approved_with_edits"
 
     db.commit()
+    if should_queue_todo_export:
+        _queue_todo_export_best_effort(db)
+    if queued_calendar_blocks:
+        _queue_calendar_export_best_effort(db, queued_calendar_blocks)
     db.refresh(approval)
     return ApprovalOut.model_validate(approval)

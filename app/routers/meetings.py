@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy import select
@@ -20,7 +20,13 @@ from app.schemas import (
 )
 from app.services.actions import approve_candidate, reject_candidate
 from app.services.core import ensure_profile
-from app.services.graph_service import GraphApiError, GraphAuthError, is_graph_connected, sync_blocks_to_outlook, sync_task_to_todo
+from app.services.graph_service import (
+    OUTBOX_CALENDAR_EXPORT,
+    OUTBOX_TODO_EXPORT,
+    GraphApiError,
+    enqueue_outbox_event,
+    is_graph_connected,
+)
 from app.services.meeting_extractor import extract_action_items
 from app.services.openai_client import OpenAIIntegrationError, extract_action_items_openai, is_openai_available
 
@@ -30,6 +36,50 @@ logger = logging.getLogger(__name__)
 
 CONFIDENCE_THRESHOLD = 0.75
 LARGE_EFFORT_MINUTES = 240
+
+
+def _queue_calendar_export_best_effort(db: Session, blocks: list) -> bool:
+    if not blocks or not is_graph_connected(db):
+        return False
+
+    starts: list[datetime] = []
+    ends: list[datetime] = []
+    for block in blocks:
+        start = block.start
+        end = block.end
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=UTC)
+        else:
+            start = start.astimezone(UTC)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=UTC)
+        else:
+            end = end.astimezone(UTC)
+        starts.append(start)
+        ends.append(end)
+
+    try:
+        enqueue_outbox_event(
+            db,
+            OUTBOX_CALENDAR_EXPORT,
+            {
+                "start": (min(starts) - timedelta(hours=2)).isoformat(),
+                "end": (max(ends) + timedelta(hours=2)).isoformat(),
+            },
+        )
+        return True
+    except GraphApiError:
+        return False
+
+
+def _queue_todo_export_best_effort(db: Session) -> bool:
+    if not is_graph_connected(db):
+        return False
+    try:
+        enqueue_outbox_event(db, OUTBOX_TODO_EXPORT, {})
+        return True
+    except GraphApiError:
+        return False
 
 
 def _process_meeting(meeting_db_id: str) -> None:
@@ -180,22 +230,8 @@ def approve_action_item(
     for block in blocks:
         db.refresh(block)
 
-    ms_todo_synced = False
-    if is_graph_connected(db):
-        try:
-            todo_result = sync_task_to_todo(db, task)
-            ms_todo_synced = bool(todo_result.get("todo_task_id"))
-            db.refresh(task)
-        except (GraphAuthError, GraphApiError):
-            ms_todo_synced = False
-
-    outlook_synced = False
-    if blocks and is_graph_connected(db):
-        try:
-            sync_result = sync_blocks_to_outlook(db, blocks)
-            outlook_synced = sync_result["synced"] > 0
-        except (GraphAuthError, GraphApiError):
-            outlook_synced = False
+    ms_todo_synced = _queue_todo_export_best_effort(db)
+    outlook_synced = _queue_calendar_export_best_effort(db, blocks)
 
     return ApproveActionItemResult(
         candidate_id=candidate.id,

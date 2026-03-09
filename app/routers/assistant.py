@@ -19,13 +19,12 @@ from app.services.core import ensure_profile
 from app.services.learning import apply_learning_if_due, record_event_start_signal, record_task_due_signal
 from app.services.graph_service import (
     OUTBOX_CALENDAR_EXPORT,
+    OUTBOX_TODO_EXPORT,
     GraphApiError,
     GraphAuthError,
     delete_blocks_from_outlook,
     enqueue_outbox_event,
     is_graph_connected,
-    sync_blocks_to_outlook,
-    sync_task_to_todo,
 )
 from app.services.meeting_extractor import extract_action_items
 from app.services.openai_client import (
@@ -245,6 +244,16 @@ def _queue_calendar_export_if_connected(db: Session, blocks: list[CalendarBlock]
                 "end": (end.astimezone(UTC) + timedelta(hours=2)).isoformat(),
             },
         )
+    except GraphApiError:
+        return False
+    return True
+
+
+def _queue_todo_export_if_connected(db: Session) -> bool:
+    if not is_graph_connected(db):
+        return False
+    try:
+        enqueue_outbox_event(db, OUTBOX_TODO_EXPORT, {})
     except GraphApiError:
         return False
     return True
@@ -616,7 +625,7 @@ def _find_task(
 
 
 def _task_context(db: Session) -> list[dict]:
-    rows = db.execute(select(Task).order_by(Task.updated_at.desc()).limit(25)).scalars().all()
+    rows = db.execute(select(Task).order_by(Task.updated_at.desc()).limit(15)).scalars().all()
     return [
         {
             "id": row.id,
@@ -635,7 +644,7 @@ def _calendar_context(db: Session) -> list[dict]:
         select(CalendarBlock)
         .where(CalendarBlock.end >= now)
         .order_by(CalendarBlock.start.asc())
-        .limit(40)
+        .limit(20)
     ).scalars().all()
     return [
         {
@@ -655,7 +664,7 @@ def _pending_approval_context(db: Session) -> list[dict]:
         select(ApprovalRequest)
         .where(ApprovalRequest.status == "pending")
         .order_by(ApprovalRequest.created_at.desc())
-        .limit(12)
+        .limit(8)
     ).scalars().all()
     items: list[dict] = []
     for row in rows:
@@ -1309,23 +1318,16 @@ def _register_meeting_and_apply(db: Session, note_text: str) -> tuple[str, list[
         auto_tasks += 1
         created_blocks.extend(blocks)
 
-    outlook_synced = 0
-    if created_blocks and is_graph_connected(db):
-        try:
-            sync_result = sync_blocks_to_outlook(db, created_blocks)
-            outlook_synced = int(sync_result["synced"])
-        except (GraphAuthError, GraphApiError):
-            outlook_synced = 0
-
     meeting.extraction_status = "completed"
     db.commit()
+    calendar_sync_queued = _queue_calendar_export_if_connected(db, created_blocks)
 
     reply = (
         f"회의록을 등록했고 액션아이템 {len(drafts)}건을 처리했습니다. "
         f"자동 반영 {auto_tasks}건, 승인 대기 {approvals}건"
     )
-    if outlook_synced:
-        reply += f", Outlook 동기화 {outlook_synced}건"
+    if calendar_sync_queued:
+        reply += ", Outlook 동기화 예약"
     reply += "."
 
     return (
@@ -1490,19 +1492,13 @@ def _reschedule_from_message(db: Session, hint: str) -> tuple[str, list[Assistan
                 record_event_start_signal(profile, block.start)
         apply_learning_if_due(profile)
 
-    synced = 0
-    if changed_blocks and is_graph_connected(db):
-        try:
-            sync_result = sync_blocks_to_outlook(db, changed_blocks)
-            synced = int(sync_result["synced"])
-        except (GraphAuthError, GraphApiError):
-            synced = 0
+    sync_queued = _queue_calendar_export_if_connected(db, changed_blocks)
 
     reply = f"재배치를 적용했습니다. 일정 이동 {len(updated_blocks)}건"
     if created_blocks:
         reply += f", 신규 {len(created_blocks)}건 생성"
-    if synced:
-        reply += f", Outlook 동기화 {synced}건"
+    if sync_queued:
+        reply += ", Outlook 동기화 예약"
     if hint.strip():
         reply += f" (요청: {hint.strip()})"
     reply += "."
@@ -1961,13 +1957,7 @@ def _reschedule_after_hour(
         removed_count += 1
     db.commit()
 
-    synced = 0
-    if changed_blocks and is_graph_connected(db):
-        try:
-            sync_result = sync_blocks_to_outlook(db, changed_blocks)
-            synced = int(sync_result["synced"])
-        except (GraphAuthError, GraphApiError):
-            synced = 0
+    sync_queued = _queue_calendar_export_if_connected(db, changed_blocks)
 
     reply = (
         f"{cutoff_hour:02d}:00 이후 일정 재배치를 적용했습니다. "
@@ -1977,8 +1967,8 @@ def _reschedule_after_hour(
         reply += f", 새 일정 {len(created_blocks)}건 생성"
     if skipped_unlinked:
         reply += f", 미연결 일정 {skipped_unlinked}건 제외"
-    if synced:
-        reply += f", Outlook 반영 {synced}건"
+    if sync_queued:
+        reply += ", Outlook 반영 예약"
     if deleted_outlook:
         reply += f", Outlook 기존일정 삭제 {deleted_outlook}건"
     reply += "."
@@ -2417,17 +2407,11 @@ def _resolve_pending_approval_by_chat(
         if candidate and candidate.status == "pending":
             profile = ensure_profile(db)
             _, blocks = approve_candidate(db, candidate, profile)
-            synced = 0
-            if blocks and is_graph_connected(db):
-                try:
-                    sync_result = sync_blocks_to_outlook(db, blocks)
-                    synced = int(sync_result["synced"])
-                except (GraphAuthError, GraphApiError):
-                    synced = 0
             db.commit()
+            sync_queued = _queue_calendar_export_if_connected(db, blocks)
             reply = f"승인되었습니다. 액션아이템을 할일로 반영했습니다: {candidate.title}"
-            if synced:
-                reply += f" (Outlook 동기화 {synced}건)"
+            if sync_queued:
+                reply += " (Outlook 동기화 예약)"
             return (
                 reply,
                 [AssistantActionOut(type="approval_approved", detail={"approval_id": approval.id, "approval_type": approval.type})],
@@ -2442,18 +2426,13 @@ def _resolve_pending_approval_by_chat(
         if proposal and proposal.status == "draft":
             created_blocks, updated_blocks = apply_proposal(db, proposal)
             changed_blocks = [*created_blocks, *updated_blocks]
-            synced = 0
-            if changed_blocks and is_graph_connected(db):
-                try:
-                    sync_result = sync_blocks_to_outlook(db, changed_blocks)
-                    synced = int(sync_result["synced"])
-                except (GraphAuthError, GraphApiError):
-                    synced = 0
+            db.commit()
+            sync_queued = _queue_calendar_export_if_connected(db, changed_blocks)
             reply = f"승인되었습니다. 재배치를 적용해 일정 {len(updated_blocks)}건을 이동했습니다."
             if created_blocks:
                 reply += f" (신규 {len(created_blocks)}건 생성)"
-            if synced:
-                reply += f" (Outlook 동기화 {synced}건)"
+            if sync_queued:
+                reply += " (Outlook 동기화 예약)"
             return (
                 reply,
                 [AssistantActionOut(type="approval_approved", detail={"approval_id": approval.id, "approval_type": approval.type})],
@@ -2472,8 +2451,8 @@ def _resolve_pending_approval_by_chat(
 
         created_task: Task | None = None
         created_block: CalendarBlock | None = None
-        synced_todo = False
-        synced_calendar = 0
+        todo_sync_queued = False
+        calendar_sync_queued = False
 
         if task_data and str(task_data.get("title") or "").strip():
             priority = str(task_data.get("priority") or "medium").strip().lower()
@@ -2490,12 +2469,6 @@ def _resolve_pending_approval_by_chat(
             )
             db.add(created_task)
             db.flush()
-            if is_graph_connected(db):
-                try:
-                    sync_task_to_todo(db, created_task)
-                    synced_todo = True
-                except (GraphAuthError, GraphApiError):
-                    synced_todo = False
 
         if event_data:
             start = _parse_email_approval_datetime(event_data.get("start"))
@@ -2514,12 +2487,6 @@ def _resolve_pending_approval_by_chat(
                 )
                 db.add(created_block)
                 db.flush()
-                if is_graph_connected(db):
-                    try:
-                        sync_result = sync_blocks_to_outlook(db, [created_block])
-                        synced_calendar = int(sync_result.get("synced", 0) or 0)
-                    except (GraphAuthError, GraphApiError):
-                        synced_calendar = 0
 
         if triage is not None:
             triage.status = "approved"
@@ -2527,6 +2494,10 @@ def _resolve_pending_approval_by_chat(
             triage.created_block_id = created_block.id if created_block else None
 
         db.commit()
+        if created_task:
+            todo_sync_queued = _queue_todo_export_if_connected(db)
+        if created_block:
+            calendar_sync_queued = _queue_calendar_export_if_connected(db, [created_block])
 
         created_labels: list[str] = []
         refresh_keys = ["approvals"]
@@ -2543,10 +2514,10 @@ def _resolve_pending_approval_by_chat(
             reply = "승인되었습니다. 다만 생성 가능한 일정/할일 정보가 부족해 변경 내역이 없습니다."
 
         sync_notes: list[str] = []
-        if synced_todo:
-            sync_notes.append("To Do 동기화")
-        if synced_calendar:
-            sync_notes.append(f"Outlook 캘린더 동기화 {synced_calendar}건")
+        if todo_sync_queued:
+            sync_notes.append("To Do 동기화 예약")
+        if calendar_sync_queued:
+            sync_notes.append("Outlook 캘린더 동기화 예약")
         if sync_notes:
             reply += f" ({', '.join(sync_notes)})"
 
@@ -2671,6 +2642,77 @@ def _fast_plan_actions(message: str) -> list[dict]:
         if str(parsed.get("intent") or "unknown") != "unknown":
             actions.append(parsed)
     return actions
+
+
+FAST_PATH_SAFE_INTENTS = {
+    "create_task",
+    "create_event",
+    "update_due",
+    "update_priority",
+    "list_tasks",
+    "list_events",
+    "find_free_time",
+    "reschedule_after_hour",
+    "delete_duplicate_tasks",
+    "register_meeting_note",
+}
+
+
+def _can_accept_fast_actions(actions: list[dict], message: str) -> bool:
+    if not actions:
+        return False
+    if _has_reference_phrase(message):
+        return False
+
+    for action in actions:
+        intent = str(action.get("intent") or "unknown")
+        if intent not in FAST_PATH_SAFE_INTENTS:
+            return False
+        if intent == "create_event":
+            title = _resolve_creation_title(action, message, intent="create_event")
+            if _is_ambiguous_creation_title(title, intent="create_event"):
+                return False
+        if intent == "create_task":
+            title = _resolve_creation_title(action, message, intent="create_task")
+            if _is_ambiguous_creation_title(title, intent="create_task"):
+                return False
+    return True
+
+
+def _quick_plan_actions(message: str) -> list[dict] | None:
+    raw = (message or "").strip()
+    if not raw:
+        return None
+
+    inferred = _infer_local_create_or_task_action(raw)
+    if inferred and _can_accept_fast_actions([inferred], raw):
+        return [inferred]
+
+    fast_actions = _fast_plan_actions(raw)
+    if _can_accept_fast_actions(fast_actions, raw):
+        return fast_actions
+    return None
+
+
+def _should_try_nli_first(message: str) -> bool:
+    if _is_multi_intent_message(message) or _has_reference_phrase(message):
+        return False
+    normalized_len = len(_normalize_text(message))
+    if normalized_len > 80:
+        return False
+    lowered = message.lower()
+    if any(token in lowered for token in ["회의록", "transcript", "summary"]):
+        return False
+    return True
+
+
+def _detect_new_command_while_clarifying(message: str, llm_available: bool) -> list[dict]:
+    quick_actions = _quick_plan_actions(message)
+    if quick_actions:
+        return quick_actions
+    if llm_available and _should_try_nli_first(message):
+        return _nli_plan_actions(message) or []
+    return []
 
 
 def _is_multi_intent_message(message: str) -> bool:
@@ -2811,8 +2853,12 @@ def _plan_actions_with_fallback(
     message: str,
     history_context: list[dict],
 ) -> tuple[list[dict], str | None]:
+    quick_actions = _quick_plan_actions(message)
+    if quick_actions:
+        return quick_actions, None
+
     if settings.assistant_llm_only:
-        if not _is_multi_intent_message(message) and not _has_reference_phrase(message):
+        if _should_try_nli_first(message):
             nli_actions = _nli_plan_actions(message)
             if nli_actions:
                 return nli_actions, None
@@ -2826,7 +2872,7 @@ def _plan_actions_with_fallback(
             fast_actions = _fast_plan_actions(message)
             if fast_actions:
                 return fast_actions, None
-            if not _is_multi_intent_message(message):
+            if _should_try_nli_first(message):
                 nli_actions = _nli_plan_actions(message)
                 if nli_actions:
                     return nli_actions, None
@@ -2839,7 +2885,7 @@ def _plan_actions_with_fallback(
         return fast_actions, None
 
     # Use NLI parser for single-intent commands to reduce latency and keep intent quality stable.
-    if not _is_multi_intent_message(message):
+    if _should_try_nli_first(message):
         nli_actions = _nli_plan_actions(message)
         if nli_actions:
             return nli_actions, None
@@ -2866,14 +2912,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
 
     pending_clarification = _latest_pending_approval(db, types=(CHAT_CLARIFICATION_TYPE,))
     if pending_clarification:
-        incoming_actions: list[dict] = []
-        if llm_available:
-            try:
-                incoming_actions, _ = _plan_actions_with_fallback(db, message, history_context)
-            except OpenAIIntegrationError:
-                incoming_actions = []
-        else:
-            incoming_actions = [_fallback_classify(message, allow_openai_nli=False)]
+        incoming_actions = _detect_new_command_while_clarifying(message, llm_available)
 
         has_new_command = any(str(item.get("intent") or "unknown") != "unknown" for item in incoming_actions)
         if has_new_command:

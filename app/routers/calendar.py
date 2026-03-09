@@ -103,11 +103,12 @@ def create_block(payload: CalendarBlockCreate, db: Session = Depends(get_db)) ->
         object_ref=row.id,
         meta={"title": row.title, "start": row.start.isoformat(), "end": row.end.isoformat()},
     )
-    if row.source != "external":
-        _sync_blocks_to_outlook_or_queue(db, [row])
+    should_queue_export = row.source != "external"
 
     db.commit()
     db.refresh(row)
+    if should_queue_export:
+        _sync_blocks_to_outlook_or_queue(db, [row])
     return CalendarBlockOut.model_validate(row)
 
 
@@ -164,11 +165,12 @@ def patch_block(block_id: str, payload: CalendarBlockPatch, db: Session = Depend
         object_ref=row.id,
         meta={"changed_fields": changed_fields, "new_version": row.version},
     )
-    if row.source != "external":
-        _sync_blocks_to_outlook_or_queue(db, [row])
+    should_queue_export = row.source != "external"
 
     db.commit()
     db.refresh(row)
+    if should_queue_export:
+        _sync_blocks_to_outlook_or_queue(db, [row])
     return CalendarBlockOut.model_validate(row)
 
 
@@ -202,15 +204,16 @@ def delete_block(block_id: str, version: int | None = None, db: Session = Depend
         if int(result.get("failed", 0)) > 0:
             raise HTTPException(status_code=502, detail="Outlook 일정 삭제에 실패했습니다. 잠시 후 다시 시도해 주세요.")
         outlook_deleted = int(result.get("deleted", 0))
-    elif row.source != "external":
-        _enqueue_export_fallback(db, anchor=row)
-
     add_audit(
         db,
         action="calendar_block.deleted",
         object_ref=row.id,
         meta={"title": row.title, "outlook_deleted": outlook_deleted},
     )
+    should_queue_export = not outlook_event_id and row.source != "external"
+    anchor = row if should_queue_export else None
     db.delete(row)
     db.commit()
+    if should_queue_export:
+        _enqueue_export_fallback(db, anchor=anchor)
     return {"deleted": True, "block_id": block_id, "outlook_deleted": outlook_deleted}

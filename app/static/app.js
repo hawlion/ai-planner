@@ -1423,7 +1423,7 @@ async function createCalendarBlockForTask(taskId) {
           locked: false,
         }),
       });
-      await refreshAll();
+      await refreshForChatKeys(["tasks", "calendar", "briefing"]);
       notify(`할일을 캘린더에 배치했습니다: ${task.title}`);
       return;
     } catch (error) {
@@ -1681,7 +1681,7 @@ function startApprovalPromptPolling() {
   if (state.approvalPromptTimer) return;
   state.approvalPromptTimer = window.setInterval(() => {
     void pollPendingApprovals();
-  }, 20000);
+  }, 30000);
 }
 
 function buildReschedulePreviewText(proposal) {
@@ -2108,7 +2108,7 @@ function bindAssistantActionCards(scope) {
           }),
         });
         addChatMessage("assistant", `승인 ${approvalId}를 수정 내용으로 반영했습니다.`);
-        await refreshAll();
+        await refreshForChatKeys(["approvals", "tasks", "calendar", "briefing"]);
       } catch (error) {
         notify(error.message, true);
       } finally {
@@ -2214,6 +2214,7 @@ async function applyWeekOffset(days) {
   state.weekStart = nextWeekStart;
   state.selectedDate = nextSelected;
   state.miniMonth = new Date(nextSelected.getFullYear(), nextSelected.getMonth(), 1);
+  scheduleCalendarViewportRender();
   await refreshCalendarWeekQuick({ force: false });
   prefetchAdjacentWeeks();
 }
@@ -2223,6 +2224,7 @@ async function goToTodayWeek() {
   state.selectedDate = today;
   state.weekStart = startOfWeek(today);
   state.miniMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+  scheduleCalendarViewportRender();
   await refreshCalendarWeekQuick({ force: false });
   prefetchAdjacentWeeks();
   scrollCalendarToNow();
@@ -2252,7 +2254,7 @@ async function runPostChatRefresh(refreshKeys = []) {
     if (Array.isArray(refreshKeys) && refreshKeys.length > 0) {
       await refreshForChatKeys(refreshKeys);
     } else {
-      await refreshAll();
+      await refreshAll({ includeSync: false });
     }
   } catch (error) {
     notify(error.message, true);
@@ -2262,7 +2264,7 @@ async function runPostChatRefresh(refreshKeys = []) {
 async function refreshForChatKeys(refreshKeys = []) {
   const keys = new Set(Array.isArray(refreshKeys) ? refreshKeys : []);
   if (!keys.size) {
-    await refreshAll();
+    await refreshAll({ includeSync: false });
     return;
   }
 
@@ -2313,23 +2315,32 @@ async function sendChat(event) {
   await submitChatMessage(message);
 }
 
-async function refreshCalendarOnly() {
-  const results = await Promise.allSettled([
+async function refreshCalendarOnly({ includeBriefing = true, includeSyncStatus = false, renderPrompts = false } = {}) {
+  const loads = [
     loadCalendarData({ force: true, useCache: false, staleWhileRevalidate: false, onUpdated: scheduleCalendarViewportRender }),
-    loadDailyBriefing(),
-    loadSyncStatus(),
-  ]);
+  ];
+  if (includeBriefing) loads.push(loadDailyBriefing());
+  if (includeSyncStatus) loads.push(loadSyncStatus());
+
+  const results = await Promise.allSettled(loads);
   const failedCount = results.filter((item) => item.status === "rejected").length;
   if (failedCount > 0) {
     notify(`일부 데이터 로드에 실패했습니다. (${failedCount}개)`, true);
   }
   scheduleCalendarViewportRender();
-  renderDailyBriefing();
-  renderPromptChips();
+  if (includeBriefing) {
+    renderDailyBriefing();
+  }
+  if (renderPrompts) {
+    renderPromptChips();
+  }
 }
 
-async function refreshAll({ promptPendingApproval = true, preferApprovalType = null } = {}) {
-  const primaryResults = await Promise.allSettled([loadGraphStatus(), loadSyncStatus()]);
+async function refreshAll({ promptPendingApproval = true, preferApprovalType = null, includeGraph = false, includeSync = true } = {}) {
+  const primaryLoads = [];
+  if (includeGraph) primaryLoads.push(loadGraphStatus());
+  if (includeSync) primaryLoads.push(loadSyncStatus());
+  const primaryResults = await Promise.allSettled(primaryLoads);
   const primaryFailedCount = primaryResults.filter((item) => item.status === "rejected").length;
   if (primaryFailedCount > 0) {
     notify(`초기 상태 조회에 실패했습니다. (${primaryFailedCount}개)`, true);
@@ -2541,7 +2552,7 @@ async function bootstrap() {
     }
 
     await loadProfile();
-    await refreshAll({ promptPendingApproval: false });
+    await refreshAll({ promptPendingApproval: false, includeGraph: true });
     scrollCalendarToNow();
     renderPromptChips();
 
