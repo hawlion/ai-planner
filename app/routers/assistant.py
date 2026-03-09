@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import json
+from queue import Empty, Queue
+import threading
 from datetime import UTC, datetime, timedelta
 import re
+from typing import Callable
 from zoneinfo import ZoneInfo
 
 import dateparser
 from fastapi import APIRouter, Depends
+from fastapi.responses import StreamingResponse
 from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.db import engine, get_db
+from app.db import SessionLocal, engine, get_db
 from app.models import ActionItemCandidate, ApprovalRequest, CalendarBlock, EmailTriage, Meeting, SchedulingProposal, Task
 from app.schemas import AssistantActionOut, AssistantChatRequest, AssistantChatResponse
 from app.services.actions import approve_candidate, reject_candidate
@@ -37,6 +42,8 @@ from app.services.openai_client import (
 from app.services.scheduler import apply_proposal, generate_proposals
 
 router = APIRouter(prefix="/assistant", tags=["assistant"])
+
+ChatProgressEmitter = Callable[[str, dict], None]
 
 CONFIDENCE_THRESHOLD = 0.75
 LARGE_EFFORT_MINUTES = 240
@@ -82,6 +89,9 @@ GENERIC_EVENT_TITLES = {
     "call",
     "sync",
 }
+GENERIC_EVENT_FILTERS = GENERIC_EVENT_TITLES | {"미팅", "회의", "일정", "약속", "event", "meeting", "calendar", "schedule"}
+GENERIC_EVENT_FILTER_KEYS = {re.sub(r"[^0-9a-zA-Z가-힣]+", "", item.lower()) for item in GENERIC_EVENT_FILTERS}
+EVENT_CONTAINER_TOKENS = {"일정", "스케줄", "캘린더", "event", "calendar"}
 GENERIC_TASK_TITLES = {
     "작업",
     "업무",
@@ -205,6 +215,47 @@ TIME_HINT_KEYWORDS = {
     "토요일",
     "일요일",
 }
+EVENT_QUERY_DROP_TOKENS = TITLE_DROP_TOKENS | EVENT_CONTAINER_TOKENS | {
+    "중복",
+    "중복된",
+    "중복으로",
+    "duplicate",
+    "제목",
+    "이름",
+    "변경",
+    "변경해줘",
+    "변경해주세요",
+    "수정",
+    "수정해줘",
+    "수정해주세요",
+    "이동",
+    "이동해줘",
+    "이동해주세요",
+    "옮겨",
+    "옮겨줘",
+    "옮겨주세요",
+    "조정",
+    "조정해줘",
+    "조정해주세요",
+    "바꿔",
+    "바꿔줘",
+    "바꿔주세요",
+    "바꾸어",
+    "move",
+    "change",
+    "update",
+    "reschedule",
+    "shift",
+    "삭제",
+    "지워",
+    "remove",
+    "delete",
+}
+EVENT_TIME_CHANGE_RE = re.compile(
+    r"^(?P<source>.+?)\s+(?P<dest>.+?)\s*(?:으로|로)\s*"
+    r"(?:변경(?:해줘|해주세요)?|수정(?:해줘|해주세요)?|이동(?:해줘|해주세요)?|옮겨(?:줘|주세요)?|조정(?:해줘|해주세요)?|바꿔(?:줘|주세요)?)\s*$",
+    re.IGNORECASE,
+)
 WEEKDAY_KO = {
     "월요일": 0,
     "화요일": 1,
@@ -356,6 +407,180 @@ def _extract_duration_minutes_from_message(text: str) -> int | None:
     return None
 
 
+def _extract_relative_shift_minutes(text: str) -> int | None:
+    lowered = text.lower()
+    minutes = _extract_duration_minutes_from_message(text)
+    if minutes is None:
+        return None
+
+    positive_tokens = [
+        "늦춰",
+        "늦춰줘",
+        "미뤄",
+        "미뤄줘",
+        "연기",
+        "연기해",
+        "뒤로",
+        "postpone",
+        "delay",
+        "push back",
+    ]
+    negative_tokens = [
+        "당겨",
+        "당겨줘",
+        "앞당겨",
+        "앞당겨줘",
+        "빨리",
+        "earlier",
+        "pull forward",
+        "move up",
+    ]
+
+    if any(token in lowered for token in positive_tokens):
+        return minutes
+    if any(token in lowered for token in negative_tokens):
+        return -minutes
+    return None
+
+
+def _extract_target_duration_minutes(text: str) -> int | None:
+    lowered = text.lower()
+    if not any(token in lowered for token in ["으로", "로", "duration", "길이", "시간", "분"]):
+        return None
+
+    minutes = _extract_duration_minutes_from_message(text)
+    if minutes is None:
+        return None
+
+    target_patterns = [
+        r"\d{1,2}\s*시간\s*(?:\d{1,2}\s*분)?\s*(?:으로|로)",
+        r"\d{1,4}\s*(?:분|min|mins|minutes)\s*(?:으로|로)",
+        r"\d{1,2}\s*시간\s*(?:짜리|동안)",
+        r"\d{1,4}\s*분\s*(?:짜리|동안)",
+    ]
+    if any(re.search(pattern, lowered) for pattern in target_patterns):
+        return minutes
+    return None
+
+
+def _extract_duration_delta_minutes(text: str) -> int | None:
+    lowered = text.lower()
+    minutes = _extract_duration_minutes_from_message(text)
+    if minutes is None:
+        return None
+
+    positive_tokens = ["연장", "늘려", "늘려줘", "길게", "extend", "longer"]
+    negative_tokens = ["줄여", "줄여줘", "단축", "짧게", "shorten", "reduce"]
+    if any(token in lowered for token in positive_tokens):
+        return minutes
+    if any(token in lowered for token in negative_tokens):
+        return -minutes
+    return None
+
+
+def _looks_like_schedule_question(text: str) -> bool:
+    lowered = text.lower()
+    question_tokens = [
+        "뭐야",
+        "뭐지",
+        "알려",
+        "보여",
+        "있어?",
+        "있나",
+        "언제",
+        "몇 개",
+        "what",
+        "show",
+        "list",
+        "when",
+        "free",
+        "available",
+    ]
+    return any(token in lowered for token in question_tokens)
+
+
+def _infer_schedule_fast_action(message: str) -> dict | None:
+    raw = str(message or "").strip()
+    if not raw:
+        return None
+    lowered = raw.lower()
+
+    if any(token in lowered for token in ["중복", "duplicate"]) and any(
+        token in lowered for token in ["삭제", "지워", "제거", "정리", "remove", "delete", "cleanup"]
+    ) and any(token in lowered for token in ["일정", "미팅", "회의", "약속", "스케줄", "캘린더", "event", "meeting"]):
+        return {
+            "intent": "delete_duplicate_events",
+            "task_keyword": _extract_duplicate_event_keyword(raw),
+            "title": raw,
+        }
+
+    source_segment, dest_segment = _split_event_time_change_message(raw)
+    if source_segment and dest_segment and _contains_datetime_phrase(dest_segment):
+        return {
+            "intent": "move_event",
+            "title": source_segment,
+            "task_keyword": source_segment,
+            "start": dest_segment,
+        }
+
+    is_event_like = any(token in lowered for token in ["일정", "스케줄", "캘린더", "미팅", "회의", "약속", "event", "meeting"])
+    if not is_event_like and not _extract_event_date_window(raw):
+        return None
+
+    if any(token in lowered for token in ["빈시간", "빈 시간", "비는 시간", "가용", "가능한 시간", "free time", "available"]) or (
+        _looks_like_schedule_question(raw) and any(token in lowered for token in ["비어", "비었", "가능", "시간 돼", "free", "available"])
+    ):
+        return {
+            "intent": "find_free_time",
+            "target_date": raw,
+            "duration_minutes": _extract_duration_minutes_from_message(raw) or 60,
+        }
+
+    if _looks_like_schedule_question(raw) and any(
+        token in lowered for token in ["일정", "스케줄", "캘린더", "미팅", "회의", "agenda", "calendar", "schedule"]
+    ):
+        return {"intent": "list_events", "target_date": raw, "limit": 12}
+
+    if any(token in lowered for token in ["삭제", "지워", "취소", "remove", "delete", "cancel"]) and is_event_like:
+        return {"intent": "delete_event", "title": raw, "task_keyword": raw}
+
+    duration_delta = _extract_duration_delta_minutes(raw)
+    if duration_delta is not None and is_event_like:
+        return {
+            "intent": "update_event",
+            "title": raw,
+            "task_keyword": raw,
+            "duration_delta_minutes": duration_delta,
+        }
+
+    target_duration = _extract_target_duration_minutes(raw)
+    if target_duration is not None and is_event_like and any(
+        token in lowered for token in ["변경", "수정", "조정", "바꿔", "으로", "로", "duration"]
+    ):
+        return {
+            "intent": "update_event",
+            "title": raw,
+            "task_keyword": raw,
+            "duration_minutes": target_duration,
+        }
+
+    relative_shift = _extract_relative_shift_minutes(raw)
+    if relative_shift is not None and is_event_like:
+        return {
+            "intent": "move_event",
+            "title": raw,
+            "task_keyword": raw,
+            "shift_minutes": relative_shift,
+        }
+
+    if any(token in lowered for token in ["제목", "이름", "rename", "title"]) and any(
+        token in lowered for token in ["변경", "수정", "바꿔", "rename", "update"]
+    ):
+        return {"intent": "update_event", "title": raw, "task_keyword": raw}
+
+    return None
+
+
 def _extract_priority_from_message(text: str) -> str | None:
     lowered = text.lower()
     if "긴급" in lowered or "critical" in lowered:
@@ -486,6 +711,10 @@ def _parse_due(value: str | None, fallback_text: str) -> datetime | None:
         return None
 
     if value and value.strip():
+        hinted_value = parse_korean_hint(value)
+        if hinted_value is not None and _contains_datetime_phrase(value):
+            return hinted_value
+
         parsed_value = parse_general(value)
         if parsed_value is not None:
             return parsed_value
@@ -638,6 +867,31 @@ def _task_context(db: Session) -> list[dict]:
     ]
 
 
+def _task_context_for_message(db: Session, message: str) -> list[dict]:
+    rows = db.execute(select(Task).order_by(Task.updated_at.desc()).limit(24)).scalars().all()
+    if not rows:
+        return []
+
+    keyword = _extract_task_keyword(message)
+    if not keyword or _is_generic_keyword(keyword):
+        rows = rows[:10]
+    else:
+        scored = sorted(((row, _task_match_score(row, keyword)) for row in rows), key=lambda item: item[1], reverse=True)
+        filtered = [row for row, score in scored if score >= 35.0][:8]
+        rows = filtered or rows[:8]
+
+    return [
+        {
+            "id": row.id,
+            "title": row.title,
+            "status": row.status,
+            "priority": row.priority,
+            "due": row.due.isoformat() if row.due else None,
+        }
+        for row in rows
+    ]
+
+
 def _calendar_context(db: Session) -> list[dict]:
     now = datetime.utcnow() - timedelta(days=1)
     rows = db.execute(
@@ -646,6 +900,50 @@ def _calendar_context(db: Session) -> list[dict]:
         .order_by(CalendarBlock.start.asc())
         .limit(20)
     ).scalars().all()
+    return [
+        {
+            "id": row.id,
+            "title": row.title,
+            "start": row.start.isoformat() if row.start else None,
+            "end": row.end.isoformat() if row.end else None,
+            "source": row.source,
+            "task_id": row.task_id,
+        }
+        for row in rows
+    ]
+
+
+def _calendar_context_for_message(db: Session, message: str) -> list[dict]:
+    now = datetime.utcnow() - timedelta(days=2)
+    horizon = datetime.utcnow() + timedelta(days=21)
+    rows = db.execute(
+        select(CalendarBlock)
+        .where(CalendarBlock.end >= now, CalendarBlock.start <= horizon)
+        .order_by(CalendarBlock.start.asc())
+        .limit(48)
+    ).scalars().all()
+    if not rows:
+        return []
+
+    keyword = _extract_event_keyword(message)
+    window = _extract_event_date_window(message)
+    source_minutes = _extract_clock_minutes(message)
+
+    if keyword or window is not None:
+        scored = sorted(
+            (
+                (row, _event_match_score(row, keyword, window=window, source_minutes=source_minutes))
+                for row in rows
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        threshold = 15.0 if window is not None and _is_generic_event_keyword(keyword) else 35.0
+        filtered = [row for row, score in scored if score >= threshold][:10]
+        rows = filtered or rows[:10]
+    else:
+        rows = rows[:10]
+
     return [
         {
             "id": row.id,
@@ -687,9 +985,9 @@ def _plan_actions_with_llm(
     plan = parse_assistant_plan_openai(
         message,
         base_dt=datetime.now(UTC),
-        task_context=_task_context(db),
+        task_context=_task_context_for_message(db, message),
         history=history_context,
-        calendar_context=_calendar_context(db),
+        calendar_context=_calendar_context_for_message(db, message),
         pending_approvals=_pending_approval_context(db),
     )
     return [item.model_dump() for item in plan.actions], plan.note
@@ -863,6 +1161,361 @@ def _extract_task_keyword(raw_text: str) -> str | None:
 
     keyword = " ".join(parts).strip()
     return keyword if len(keyword) >= 2 else None
+
+
+def _extract_clock_minutes(text: str | None) -> int | None:
+    if not text:
+        return None
+
+    colon_match = re.search(r"\b(\d{1,2})\s*:\s*(\d{2})\b", text)
+    if colon_match:
+        hour = int(colon_match.group(1))
+        minute = int(colon_match.group(2))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour * 60 + minute
+
+    hm = re.search(r"(\d{1,2})\s*시(?:\s*(\d{1,2})\s*분?)?", text)
+    if not hm:
+        return None
+
+    hour = int(hm.group(1))
+    minute = int(hm.group(2) or 0)
+    if "오후" in text and hour < 12:
+        hour += 12
+    if "오전" in text and hour == 12:
+        hour = 0
+    if any(token in text for token in ["저녁", "밤"]) and hour < 12:
+        hour += 12
+    if "새벽" in text and hour == 12:
+        hour = 0
+    if hour >= 24 or minute >= 60:
+        return None
+    return hour * 60 + minute
+
+
+def _split_event_time_change_message(message: str) -> tuple[str | None, str | None]:
+    cleaned = str(message or "").strip()
+    if not cleaned:
+        return (None, None)
+    body_match = re.match(
+        r"^(?P<body>.+?)\s*(?:으로|로)\s*"
+        r"(?:변경(?:해줘|해주세요)?|수정(?:해줘|해주세요)?|이동(?:해줘|해주세요)?|옮겨(?:줘|주세요)?|조정(?:해줘|해주세요)?|바꿔(?:줘|주세요)?)\s*$",
+        cleaned.rstrip(".?! "),
+        re.IGNORECASE,
+    )
+    if not body_match:
+        return (None, None)
+    body = str(body_match.group("body") or "").strip()
+    if not body:
+        return (None, None)
+
+    anchor_pattern = re.compile(
+        r"(오늘|내일|모레|이번주|다음주|금주|today|tomorrow|this week|next week|"
+        r"월요일|화요일|수요일|목요일|금요일|토요일|일요일|"
+        r"오전|오후|아침|저녁|밤|새벽|\b(?:am|pm)\b|\d{1,2}\s*:\s*\d{2}|\d{1,2}\s*시(?:\s*\d{1,2}\s*분)?)",
+        re.IGNORECASE,
+    )
+    for match in anchor_pattern.finditer(body):
+        start = match.start()
+        if start <= 0:
+            continue
+        source = body[:start].strip()
+        dest = body[start:].strip()
+        if not source or not dest:
+            continue
+        if _parse_due(dest, dest) is None:
+            continue
+        if not (_extract_event_keyword(source) or _extract_event_date_window(source) or any(token in source for token in ["일정", "미팅", "회의", "캘린더"])):
+            continue
+        return (source, dest)
+
+    match = EVENT_TIME_CHANGE_RE.match(cleaned.rstrip(".?! "))
+    if not match:
+        return (None, None)
+    source = str(match.group("source") or "").strip()
+    dest = str(match.group("dest") or "").strip()
+    return (source or None, dest or None)
+
+
+def _extract_event_keyword(raw_text: str | None) -> str | None:
+    text = _clean_candidate_title(raw_text)
+    if not text:
+        return None
+
+    quoted_match = re.search(r"[\"'“”‘’]([^\"'“”‘’]{2,120})[\"'“”‘’]", text)
+    if quoted_match:
+        quoted = _clean_candidate_title(quoted_match.group(1))
+        if quoted:
+            return quoted
+
+    tokens: list[str] = []
+    for raw_token in re.split(r"\s+", text):
+        trimmed = re.sub(r"^[^0-9A-Za-z가-힣]+|[^0-9A-Za-z가-힣]+$", "", raw_token)
+        if not trimmed:
+            continue
+        lowered = _strip_korean_particle(trimmed.lower())
+        if not lowered:
+            continue
+        if lowered in EVENT_QUERY_DROP_TOKENS:
+            continue
+        if lowered in {"am", "pm"} or _looks_like_datetime_token(lowered):
+            continue
+        tokens.append(trimmed)
+
+    candidate = _clean_candidate_title(" ".join(tokens))
+    if not candidate:
+        return None
+    return candidate if len(_normalize_text(candidate)) >= 2 else None
+
+
+def _extract_duplicate_event_keyword(raw_text: str | None) -> str | None:
+    text = str(raw_text or "").strip()
+    if not text:
+        return None
+    cleaned = text
+    for token in [
+        "중복된",
+        "중복으로",
+        "중복",
+        "duplicate",
+        "삭제",
+        "지워",
+        "제거",
+        "정리",
+        "취소",
+        "remove",
+        "delete",
+        "cleanup",
+    ]:
+        cleaned = re.sub(token, " ", cleaned, flags=re.IGNORECASE)
+    keyword = _extract_event_keyword(cleaned)
+    if not keyword:
+        return None
+    normalized = _normalize_text(keyword)
+    if normalized in GENERIC_EVENT_FILTER_KEYS:
+        return keyword
+    return keyword
+
+
+def _localize_dt(value: datetime) -> datetime:
+    tz = ZoneInfo(settings.timezone)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=tz)
+    return value.astimezone(tz)
+
+
+def _day_window(base: datetime) -> tuple[datetime, datetime]:
+    start = base.replace(hour=0, minute=0, second=0, microsecond=0)
+    return (start, start + timedelta(days=1))
+
+
+def _format_window_label(window: tuple[datetime, datetime]) -> str:
+    start, end = window
+    end_display = end - timedelta(seconds=1)
+    if (end - start) <= timedelta(days=1):
+        return start.strftime("%Y-%m-%d")
+    return f"{start.strftime('%Y-%m-%d')} ~ {end_display.strftime('%Y-%m-%d')}"
+
+
+def _extract_event_date_window(text: str | None) -> tuple[datetime, datetime] | None:
+    if not text:
+        return None
+
+    tz = ZoneInfo(settings.timezone)
+    now = datetime.now(tz=tz)
+    lowered = text.lower()
+
+    if "오늘" in text or "today" in lowered:
+        return _day_window(now)
+    if "내일" in text or "tomorrow" in lowered:
+        return _day_window(now + timedelta(days=1))
+    if "모레" in text:
+        return _day_window(now + timedelta(days=2))
+
+    week_offset = 1 if ("다음주" in text or "next week" in lowered) else 0
+    monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    weekday_match = None
+    for token in sorted(WEEKDAY_KO.keys(), key=len, reverse=True):
+        if token in text:
+            weekday_match = WEEKDAY_KO[token]
+            break
+
+    if weekday_match is not None:
+        target = monday + timedelta(days=weekday_match, weeks=week_offset)
+        if week_offset == 0 and not any(token in text for token in ["이번주", "금주"]) and "this week" not in lowered:
+            if target.date() < now.date():
+                target += timedelta(days=7)
+        return _day_window(target)
+
+    if any(token in text for token in ["이번주", "금주"]) or "this week" in lowered or week_offset:
+        start = monday + timedelta(weeks=week_offset)
+        return (start, start + timedelta(days=7))
+
+    if _contains_datetime_phrase(text):
+        parsed = _parse_due(text, text)
+        if parsed is not None:
+            return _day_window(_localize_dt(parsed))
+    return None
+
+
+def _is_generic_event_keyword(keyword: str | None) -> bool:
+    tokens = [token for token in re.split(r"\s+", str(keyword or "").lower()) if token]
+    if not tokens:
+        return True
+    if len(tokens) == 1:
+        token = tokens[0]
+        if token in GENERIC_EVENT_TITLES or len(_normalize_text(token)) <= 2:
+            return True
+    return False
+
+
+def _event_match_score(
+    block: CalendarBlock,
+    keyword: str | None,
+    *,
+    window: tuple[datetime, datetime] | None = None,
+    source_minutes: int | None = None,
+) -> float:
+    local_start = _localize_dt(block.start)
+    local_end = _localize_dt(block.end)
+    if window is not None:
+        window_start, window_end = window
+        if local_start >= window_end or local_end <= window_start:
+            return -1.0
+
+    score = 0.0
+    if window is not None:
+        score += 55.0
+
+    title = block.title or ""
+    title_raw = title.lower()
+    title_norm = _normalize_text(title)
+
+    if keyword:
+        keyword_raw = keyword.lower()
+        keyword_norm = _normalize_text(keyword)
+        if keyword_norm and keyword_norm == title_norm:
+            score += 180.0
+        if keyword_raw and keyword_raw in title_raw:
+            score += 100.0
+        if keyword_norm and keyword_norm in title_norm:
+            score += 120.0
+
+        key_tokens = [token for token in keyword_raw.split() if len(token) >= 2]
+        if key_tokens:
+            hit = sum(1 for token in key_tokens if token in title_raw)
+            ratio = hit / len(key_tokens)
+            score += ratio * 45.0
+            if len(key_tokens) >= 2 and ratio == 1.0:
+                score += 25.0
+    elif window is None:
+        return -1.0
+
+    if source_minutes is not None:
+        start_minutes = local_start.hour * 60 + local_start.minute
+        diff = abs(start_minutes - source_minutes)
+        if diff <= 10:
+            score += 45.0
+        elif diff <= 30:
+            score += 35.0
+        elif diff <= 90:
+            score += 20.0
+        elif diff <= 180:
+            score += 8.0
+        else:
+            score -= min(24.0, diff / 30.0)
+
+    return score
+
+
+def _search_events(
+    db: Session,
+    keyword: str | None,
+    *,
+    window: tuple[datetime, datetime] | None = None,
+    source_minutes: int | None = None,
+) -> list[tuple[CalendarBlock, float]]:
+    rows = db.execute(select(CalendarBlock).order_by(CalendarBlock.start.asc())).scalars().all()
+    if not rows:
+        return []
+
+    generic_keyword = _is_generic_event_keyword(keyword)
+    matches: list[tuple[CalendarBlock, float]] = []
+    for row in rows:
+        score = _event_match_score(row, keyword, window=window, source_minutes=source_minutes)
+        if score < 0:
+            continue
+        if keyword and not generic_keyword and score < 45.0:
+            continue
+        if keyword and generic_keyword and window is None and score < 70.0:
+            continue
+        matches.append((row, score))
+
+    matches.sort(
+        key=lambda item: (
+            item[1],
+            _localize_dt(item[0].start).timestamp() * -1,
+        ),
+        reverse=True,
+    )
+    return matches
+
+
+def _resolve_event_match(
+    db: Session,
+    keyword: str | None,
+    *,
+    window: tuple[datetime, datetime] | None = None,
+    source_minutes: int | None = None,
+) -> tuple[CalendarBlock | None, str | None]:
+    matches = _search_events(db, keyword, window=window, source_minutes=source_minutes)
+    if not matches:
+        return (None, "not_found")
+    if len(matches) == 1:
+        return (matches[0][0], None)
+
+    top_row, top_score = matches[0]
+    second_score = matches[1][1]
+    generic_keyword = _is_generic_event_keyword(keyword)
+    if not generic_keyword and (top_score >= 150.0 or top_score - second_score >= 12.0):
+        return (top_row, None)
+    if window is not None and source_minutes is not None and top_score - second_score >= 15.0:
+        return (top_row, None)
+    if window is not None and not generic_keyword and top_score - second_score >= 8.0:
+        return (top_row, None)
+    return (None, "ambiguous")
+
+
+def _resolve_event_lookup(
+    action: dict,
+    message: str,
+    *,
+    prefer_source_segment: bool = False,
+) -> tuple[str | None, tuple[datetime, datetime] | None, int | None]:
+    base_text = str(action.get("task_keyword") or action.get("title") or "").strip()
+    source_segment, _ = _split_event_time_change_message(message)
+
+    keyword_candidates: list[str] = []
+    if base_text:
+        keyword_candidates.append(base_text)
+    if source_segment:
+        keyword_candidates.append(source_segment)
+    if not prefer_source_segment and message.strip():
+        keyword_candidates.append(message)
+
+    window_candidates: list[str] = []
+    if source_segment:
+        window_candidates.append(source_segment)
+    if base_text:
+        window_candidates.append(base_text)
+    if not prefer_source_segment and message.strip():
+        window_candidates.append(message)
+
+    keyword = next((resolved for candidate in keyword_candidates if (resolved := _extract_event_keyword(candidate))), None)
+    window = next((resolved for candidate in window_candidates if (resolved := _extract_event_date_window(candidate))), None)
+    source_minutes = _extract_clock_minutes(source_segment or base_text)
+    return (keyword, window, source_minutes)
 
 
 def _strip_korean_particle(token: str) -> str:
@@ -1161,14 +1814,22 @@ def _needs_clarification_for_action(
     if intent in {"list_tasks", "list_events", "find_free_time"}:
         return None
 
+    if intent == "delete_duplicate_events":
+        return None
+
     if intent == "move_event":
-        base_keyword = action.get("task_keyword") or action.get("title")
-        keyword = _extract_task_keyword(str(base_keyword or "")) or _extract_task_keyword(message)
-        if not keyword:
-            return "이동할 일정 제목을 알려주세요."
+        keyword, window, source_minutes = _resolve_event_lookup(action, message, prefer_source_segment=True)
+        if not keyword and window is None:
+            return "이동할 일정 제목을 알려주세요. 예: '오늘 고객 미팅 내일 오후 4시로 변경'."
         new_start = _parse_due(action.get("start") or action.get("due"), message)
-        if new_start is None:
+        shift_minutes = action.get("shift_minutes")
+        if new_start is None and shift_minutes is None:
             return "어느 시간으로 이동할지 알려주세요. 예: '목요일 4시로 이동'."
+        target, reason = _resolve_event_match(db, keyword, window=window, source_minutes=source_minutes)
+        if target is None:
+            if reason == "ambiguous":
+                return "대상 일정이 여러 건입니다. 일정 제목이나 날짜를 더 구체적으로 알려주세요."
+            return f"'{keyword}' 일정을 찾지 못했습니다. 정확한 제목이나 날짜를 더 알려주세요."
 
     if intent == "reschedule_after_hour":
         cutoff = _extract_cutoff_hour(action.get("cutoff_hour"), message)
@@ -1208,19 +1869,32 @@ def _needs_clarification_for_action(
             return f"'{keyword}' 작업을 찾지 못했습니다. 정확한 제목으로 다시 알려주세요."
 
     if intent == "delete_event":
-        base_keyword = action.get("task_keyword") or action.get("title")
-        keyword = _extract_task_keyword(str(base_keyword or "")) or _extract_task_keyword(message)
-        if not keyword:
+        keyword, window, source_minutes = _resolve_event_lookup(action, message)
+        if not keyword and window is None:
             return "삭제할 일정을 지정해 주세요. 예: '주간회의 일정 삭제'."
+        target, reason = _resolve_event_match(db, keyword, window=window, source_minutes=source_minutes)
+        if target is None:
+            if reason == "ambiguous":
+                return "삭제할 일정이 여러 건입니다. 일정 제목이나 날짜를 더 구체적으로 알려주세요."
+            if keyword:
+                return f"'{keyword}' 일정을 찾지 못했습니다."
+            return "해당 조건의 일정을 찾지 못했습니다."
 
     if intent == "update_event":
-        base_keyword = action.get("task_keyword") or action.get("title")
-        keyword = _extract_task_keyword(str(base_keyword or "")) or _extract_task_keyword(message)
-        if not keyword:
+        keyword, window, source_minutes = _resolve_event_lookup(action, message)
+        if not keyword and window is None:
             return "수정할 일정 제목을 알려주세요. 예: '고객미팅 일정을 주간회의로 변경'."
+        target, reason = _resolve_event_match(db, keyword, window=window, source_minutes=source_minutes)
+        if target is None:
+            if reason == "ambiguous":
+                return "수정할 일정이 여러 건입니다. 일정 제목이나 날짜를 더 구체적으로 알려주세요."
+            if keyword:
+                return f"'{keyword}' 일정을 찾지 못했습니다."
+            return "해당 조건의 일정을 찾지 못했습니다."
         new_title = str(action.get("new_title") or "").strip()
-        if not new_title:
-            return "일정 이름을 무엇으로 바꿀지 알려주세요. 예: '주간회의로 변경'."
+        has_resize = action.get("duration_minutes") is not None or action.get("duration_delta_minutes") is not None or action.get("end")
+        if not new_title and not has_resize:
+            return "일정의 무엇을 바꿀지 알려주세요. 예: '주간회의로 변경' 또는 '30분 연장'."
 
     if intent == "reschedule_request":
         lowered = message.lower()
@@ -1732,10 +2406,13 @@ def _list_events_from_message(
     message: str,
     limit: int | None = None,
 ) -> tuple[str, list[AssistantActionOut], list[str]]:
-    base = _parse_due(target_date, message) if (target_date or message) else None
-    date_base = base or datetime.utcnow()
-    start = date_base.replace(hour=0, minute=0, second=0, microsecond=0)
-    end = start + timedelta(days=1)
+    window = _extract_event_date_window(target_date or message)
+    if window is None:
+        base = _parse_due(target_date, message) if (target_date or message) else None
+        date_base = _localize_dt(base or datetime.now(ZoneInfo(settings.timezone)))
+        start, end = _day_window(date_base)
+    else:
+        start, end = window
     size = max(1, min(20, int(limit or 10)))
 
     rows = db.execute(
@@ -1745,11 +2422,19 @@ def _list_events_from_message(
         .limit(size)
     ).scalars().all()
     if not rows:
-        return ("해당 날짜에 등록된 일정이 없습니다.", [], ["calendar"])
+        return ("해당 기간에 등록된 일정이 없습니다.", [], ["calendar"])
 
-    lines = [f"{start.strftime('%Y-%m-%d')} 일정입니다:"]
+    multi_day = (end - start) > timedelta(days=1)
+    lines = [f"{_format_window_label((start, end))} 일정입니다:"]
     for idx, row in enumerate(rows, start=1):
-        lines.append(f"{idx}. {row.title} ({row.start.strftime('%H:%M')}-{row.end.strftime('%H:%M')})")
+        row_start = _localize_dt(row.start)
+        row_end = _localize_dt(row.end)
+        time_label = (
+            f"{row_start.strftime('%m-%d %H:%M')} - {row_end.strftime('%m-%d %H:%M')}"
+            if multi_day
+            else f"{row_start.strftime('%H:%M')}-{row_end.strftime('%H:%M')}"
+        )
+        lines.append(f"{idx}. {row.title} ({time_label})")
 
     return (
         "\n".join(lines),
@@ -1764,55 +2449,83 @@ def _find_free_time_from_message(
     message: str,
     duration_minutes: int | None = None,
 ) -> tuple[str, list[AssistantActionOut], list[str]]:
-    base = _parse_due(target_date, message) if (target_date or message) else None
-    date_base = base or datetime.utcnow()
-    day_start = date_base.replace(hour=9, minute=0, second=0, microsecond=0)
-    day_end = date_base.replace(hour=18, minute=0, second=0, microsecond=0)
+    tz = ZoneInfo(settings.timezone)
+    window = _extract_event_date_window(target_date or message)
+    if window is None:
+        base = _parse_due(target_date, message) if (target_date or message) else None
+        date_base = _localize_dt(base or datetime.now(tz))
+        window = _day_window(date_base)
     need = timedelta(minutes=max(15, min(8 * 60, int(duration_minutes or 60))))
+    window_start, window_end = window
 
     rows = db.execute(
         select(CalendarBlock)
-        .where(CalendarBlock.start < day_end, CalendarBlock.end > day_start)
+        .where(CalendarBlock.start < window_end, CalendarBlock.end > window_start)
         .order_by(CalendarBlock.start.asc())
     ).scalars().all()
 
-    cursor = day_start
     slots: list[tuple[datetime, datetime]] = []
-    for row in rows:
-        if row.start - cursor >= need:
-            slots.append((cursor, row.start))
-        if row.end > cursor:
-            cursor = row.end
-    if day_end - cursor >= need:
-        slots.append((cursor, day_end))
+    current_day = window_start
+    while current_day < window_end and len(slots) < 12:
+        day_start = current_day.replace(hour=9, minute=0, second=0, microsecond=0)
+        day_end = current_day.replace(hour=18, minute=0, second=0, microsecond=0)
+        if day_end <= window_start:
+            current_day += timedelta(days=1)
+            continue
+        slot_start = max(day_start, window_start)
+        slot_end = min(day_end, window_end)
+        if slot_end <= slot_start:
+            current_day += timedelta(days=1)
+            continue
+
+        day_rows = [
+            row
+            for row in rows
+            if _localize_dt(row.start) < slot_end and _localize_dt(row.end) > slot_start
+        ]
+
+        cursor = slot_start
+        for row in day_rows:
+            row_start = max(_localize_dt(row.start), slot_start)
+            row_end = min(_localize_dt(row.end), slot_end)
+            if row_start - cursor >= need:
+                slots.append((cursor, row_start))
+            if row_end > cursor:
+                cursor = row_end
+        if slot_end - cursor >= need:
+            slots.append((cursor, slot_end))
+        current_day += timedelta(days=1)
 
     if not slots:
         return ("요청한 길이의 빈 시간이 없습니다.", [], ["calendar"])
 
-    top = slots[:3]
-    lines = [f"{day_start.strftime('%Y-%m-%d')} 기준 추천 빈 시간:"]
+    top = slots[:5]
+    multi_day = (window_end - window_start) > timedelta(days=1)
+    lines = [f"{_format_window_label(window)} 기준 추천 빈 시간:"]
     for idx, (s, e) in enumerate(top, start=1):
-        lines.append(f"{idx}. {s.strftime('%H:%M')} - {e.strftime('%H:%M')}")
+        label = (
+            f"{s.strftime('%m-%d %H:%M')} - {e.strftime('%m-%d %H:%M')}"
+            if multi_day
+            else f"{s.strftime('%H:%M')} - {e.strftime('%H:%M')}"
+        )
+        lines.append(f"{idx}. {label}")
 
     return (
         "\n".join(lines),
-        [AssistantActionOut(type="free_time_found", detail={"count": len(top), "date": day_start.date().isoformat()})],
+        [AssistantActionOut(type="free_time_found", detail={"count": len(top), "date": window_start.date().isoformat()})],
         ["calendar"],
     )
 
 
-def _find_event_by_keyword(db: Session, keyword: str | None) -> CalendarBlock | None:
-    if not keyword:
-        return None
-    kw = keyword.strip().lower()
-    blocks = db.execute(select(CalendarBlock).order_by(CalendarBlock.start.asc())).scalars().all()
-    for row in blocks:
-        if row.title and kw == row.title.lower():
-            return row
-    for row in blocks:
-        if row.title and kw in row.title.lower():
-            return row
-    return None
+def _find_event_by_keyword(
+    db: Session,
+    keyword: str | None,
+    *,
+    window: tuple[datetime, datetime] | None = None,
+    source_minutes: int | None = None,
+) -> CalendarBlock | None:
+    target, _ = _resolve_event_match(db, keyword, window=window, source_minutes=source_minutes)
+    return target
 
 
 def _move_event_from_message(
@@ -1821,15 +2534,27 @@ def _move_event_from_message(
     new_start: datetime | None,
     new_end: datetime | None = None,
     duration_minutes: int | None = None,
+    shift_minutes: int | None = None,
+    *,
+    window: tuple[datetime, datetime] | None = None,
+    source_minutes: int | None = None,
 ) -> tuple[str, list[AssistantActionOut], list[str]]:
-    if new_start is None:
-        return ("이동할 새 시간을 알려주세요. 예: '목요일 4시로 이동'.", [], [])
-
-    target = _find_event_by_keyword(db, keyword)
+    target, reason = _resolve_event_match(db, keyword, window=window, source_minutes=source_minutes)
     if not target:
+        if reason == "ambiguous":
+            return ("대상 일정이 여러 건입니다. 일정 제목이나 날짜를 더 구체적으로 알려주세요.", [], [])
         return ("이동할 일정을 찾지 못했습니다.", [], [])
     if target.source == "external":
         return ("Outlook 원본 일정은 앱에서 직접 이동할 수 없습니다.", [], [])
+
+    if new_start is None and shift_minutes is None:
+        return ("이동할 새 시간을 알려주세요. 예: '목요일 4시로 이동'.", [], [])
+
+    if new_start is None and shift_minutes is not None:
+        delta = timedelta(minutes=shift_minutes)
+        new_start = _localize_dt(target.start) + delta
+        if new_end is None:
+            new_end = _localize_dt(target.end) + delta
 
     duration = (
         (new_end - new_start)
@@ -2071,31 +2796,150 @@ def _delete_duplicate_tasks(db: Session) -> tuple[str, list[AssistantActionOut],
     )
 
 
-def _delete_event(db: Session, keyword: str | None) -> tuple[str, list[AssistantActionOut], list[str]]:
-    if not keyword:
+def _delete_duplicate_events(db: Session, keyword: str | None = None) -> tuple[str, list[AssistantActionOut], list[str]]:
+    rows = db.execute(select(CalendarBlock).order_by(CalendarBlock.updated_at.desc())).scalars().all()
+    if not rows:
+        return ("중복으로 판단되는 일정이 없습니다.", [], ["calendar"])
+
+    filter_keyword = _extract_duplicate_event_keyword(keyword)
+    filter_norm = _normalize_text(filter_keyword) if filter_keyword else ""
+
+    def include_row(row: CalendarBlock) -> bool:
+        if not filter_norm:
+            return True
+        title_norm = _normalize_text(row.title)
+        if not title_norm:
+            return False
+        if filter_norm in GENERIC_EVENT_FILTER_KEYS:
+            return filter_norm in title_norm
+        return filter_norm in title_norm
+
+    strict_grouped: dict[tuple[str, str, str, int], list[CalendarBlock]] = {}
+    task_linked_grouped: dict[tuple[str, str, int], list[CalendarBlock]] = {}
+    for row in rows:
+        if not include_row(row):
+            continue
+        title_key = _normalize_title_key(row.title)
+        if len(title_key) < 2:
+            continue
+        start = _localize_dt(row.start)
+        end = _localize_dt(row.end)
+        duration = max(1, int((end - start).total_seconds() // 60))
+        strict_key = (
+            title_key,
+            start.date().isoformat(),
+            start.strftime("%H:%M"),
+            duration,
+        )
+        strict_grouped.setdefault(strict_key, []).append(row)
+
+        # When the same task-linked meeting exists multiple times, it is usually a reschedule/copy bug.
+        # Treat those as duplicates even if the time/date changed.
+        if row.task_id and row.source != "external":
+            task_key = (
+                str(row.task_id),
+                title_key,
+                duration,
+            )
+            task_linked_grouped.setdefault(task_key, []).append(row)
+
+    duplicate_groups: list[list[CalendarBlock]] = [group for group in strict_grouped.values() if len(group) >= 2]
+    seen_ids = {row.id for group in duplicate_groups for row in group}
+    for group in task_linked_grouped.values():
+        remaining = [row for row in group if row.id not in seen_ids]
+        if len(remaining) >= 2:
+            duplicate_groups.append(remaining)
+            for row in remaining:
+                seen_ids.add(row.id)
+    if not duplicate_groups:
+        if filter_keyword:
+            return (f"'{filter_keyword}' 기준 중복 일정이 없습니다.", [], ["calendar"])
+        return ("중복으로 판단되는 일정이 없습니다.", [], ["calendar"])
+
+    deleted_outlook = 0
+    deleted_local = 0
+    group_count = 0
+    kept_titles: list[str] = []
+
+    now = datetime.now(ZoneInfo(settings.timezone))
+
+    def keeper_score(block: CalendarBlock) -> tuple[int, int, int, float, float]:
+        local_preferred = 1 if block.source != "external" else 0
+        task_linked = 1 if block.task_id else 0
+        synced = 1 if (block.outlook_event_id or "").strip() else 0
+        future_preferred = 1 if _localize_dt(block.end) >= now else 0
+        updated = block.updated_at.timestamp() if block.updated_at else 0.0
+        start_score = _localize_dt(block.start).timestamp()
+        return (local_preferred, task_linked, future_preferred, synced, updated + start_score * 1e-9)
+
+    for group in duplicate_groups:
+        keeper = max(group, key=keeper_score)
+        duplicates = [row for row in group if row.id != keeper.id]
+        remote_candidates = [row for row in duplicates if (row.outlook_event_id or "").strip()]
+        if remote_candidates and is_graph_connected(db):
+            try:
+                deleted = delete_blocks_from_outlook(db, remote_candidates)
+                deleted_outlook += int(deleted.get("deleted", 0))
+            except (GraphAuthError, GraphApiError):
+                pass
+
+        for row in duplicates:
+            db.delete(row)
+            deleted_local += 1
+        group_count += 1
+        if keeper.title:
+            kept_titles.append(keeper.title)
+
+    db.commit()
+
+    title_note = ""
+    if kept_titles:
+        sample = ", ".join(kept_titles[:2])
+        title_note = f" 유지: {sample}"
+        if len(kept_titles) > 2:
+            title_note += " 외"
+
+    reply = f"중복 일정을 정리했습니다. 그룹 {group_count}개, 로컬 삭제 {deleted_local}건"
+    if deleted_outlook:
+        reply += f", Outlook 삭제 {deleted_outlook}건"
+    reply += "."
+    if title_note:
+        reply += title_note
+
+    return (
+        reply,
+        [
+            AssistantActionOut(
+                type="duplicate_events_cleaned",
+                detail={
+                    "groups": group_count,
+                    "deleted_local": deleted_local,
+                    "deleted_outlook": deleted_outlook,
+                    "keyword": filter_keyword,
+                },
+            )
+        ],
+        ["calendar"],
+    )
+
+
+def _delete_event(
+    db: Session,
+    keyword: str | None,
+    *,
+    window: tuple[datetime, datetime] | None = None,
+    source_minutes: int | None = None,
+) -> tuple[str, list[AssistantActionOut], list[str]]:
+    if not keyword and window is None:
         return ("삭제할 일정을 지정해주세요.", [], [])
 
-    kw = keyword.strip().lower()
-    
-    # Very basic search for CalendarBlock by title matching
-    blocks = db.execute(select(CalendarBlock).order_by(CalendarBlock.start.asc())).scalars().all()
-    target = None
-    
-    # Try exact match first
-    for b in blocks:
-        if b.title and kw == b.title.lower():
-            target = b
-            break
-            
-    # Try partial match if no exact
+    target, reason = _resolve_event_match(db, keyword, window=window, source_minutes=source_minutes)
     if not target:
-        for b in blocks:
-            if b.title and kw in b.title.lower():
-                target = b
-                break
-
-    if not target:
-        return (f"'{keyword}'에 해당하는 일정을 찾지 못했습니다.", [], [])
+        if reason == "ambiguous":
+            return ("삭제할 일정이 여러 건입니다. 일정 제목이나 날짜를 더 구체적으로 알려주세요.", [], [])
+        if keyword:
+            return (f"'{keyword}'에 해당하는 일정을 찾지 못했습니다.", [], [])
+        return ("해당 조건의 일정을 찾지 못했습니다.", [], [])
 
     db.delete(target)
     db.commit()
@@ -2111,39 +2955,83 @@ def _delete_event(db: Session, keyword: str | None) -> tuple[str, list[Assistant
         ["calendar"],
     )
 
-def _update_event(db: Session, keyword: str | None, new_title: str | None) -> tuple[str, list[AssistantActionOut], list[str]]:
-    if not keyword:
+def _update_event(
+    db: Session,
+    keyword: str | None,
+    new_title: str | None,
+    *,
+    duration_minutes: int | None = None,
+    duration_delta_minutes: int | None = None,
+    new_end: datetime | None = None,
+    window: tuple[datetime, datetime] | None = None,
+    source_minutes: int | None = None,
+) -> tuple[str, list[AssistantActionOut], list[str]]:
+    if not keyword and window is None:
         return ("변경할 일정을 지정해주세요.", [], [])
-    
-    # We will just parse the 'new title' from the remainder of the sentence. 
-    # For now NLI isn't extracting a separate `new_title` field for events so we infer from text.
-    kw = keyword.strip().lower()
 
-    blocks = db.execute(select(CalendarBlock).order_by(CalendarBlock.start.asc())).scalars().all()
-    target = None
-
-    for b in blocks:
-        if b.title and kw in b.title.lower():
-            target = b
-            break
-
+    target, reason = _resolve_event_match(db, keyword, window=window, source_minutes=source_minutes)
     if not target:
-        return (f"'{keyword}'에 해당하는 일정을 찾지 못했습니다.", [], [])
+        if reason == "ambiguous":
+            return ("수정할 일정이 여러 건입니다. 일정 제목이나 날짜를 더 구체적으로 알려주세요.", [], [])
+        if keyword:
+            return (f"'{keyword}'에 해당하는 일정을 찾지 못했습니다.", [], [])
+        return ("해당 조건의 일정을 찾지 못했습니다.", [], [])
 
-    if not new_title:
-         return (f"일정 '{target.title}'을 어떻게 수정할지 알려주세요.", [], [])
-
+    changed: list[str] = []
     old_title = target.title
-    target.title = new_title.strip()
+
+    if new_title and new_title.strip() and new_title.strip() != target.title:
+        target.title = new_title.strip()
+        changed.append("제목")
+
+    current_start = _localize_dt(target.start)
+    current_end = _localize_dt(target.end)
+    desired_end = current_end
+    if new_end and new_end > current_start:
+        desired_end = new_end
+    elif duration_minutes is not None:
+        desired_end = current_start + timedelta(minutes=max(15, min(8 * 60, int(duration_minutes))))
+    elif duration_delta_minutes is not None:
+        current_minutes = max(15, int((current_end - current_start).total_seconds() // 60))
+        resized_minutes = max(15, min(8 * 60, current_minutes + int(duration_delta_minutes)))
+        desired_end = current_start + timedelta(minutes=resized_minutes)
+
+    if desired_end != current_end:
+        conflict = db.execute(
+            select(CalendarBlock)
+            .where(
+                CalendarBlock.id != target.id,
+                CalendarBlock.start < desired_end,
+                CalendarBlock.end > current_start,
+            )
+        ).scalars().first()
+        if conflict:
+            return (f"'{conflict.title}' 일정과 겹쳐 기간을 조정할 수 없습니다.", [], ["calendar"])
+        target.end = desired_end
+        changed.append("길이")
+
+    if not changed:
+        return (f"일정 '{target.title}'을 어떻게 수정할지 알려주세요.", [], [])
+
     target.version += 1
     db.commit()
+    db.refresh(target)
+    sync_queued = _queue_calendar_export_if_connected(db, [target])
+
+    reply = f"일정을 수정했습니다: {target.title} ({', '.join(changed)})"
+    if "제목" in changed and old_title != target.title:
+        reply = f"일정 이름을 '{old_title}'에서 '{target.title}'(으)로 변경했습니다."
+        if len(changed) > 1:
+            reply += f" 추가 변경: {', '.join([item for item in changed if item != '제목'])}"
+    if sync_queued:
+        reply += " · Outlook 동기화 예약"
 
     return (
-        f"일정 이름을 '{old_title}'에서 '{target.title}'(으)로 변경했습니다.",
+        reply,
         [
             AssistantActionOut(
                 type="event_updated",
-                detail={"updated_id": target.id, "new_title": target.title},
+                detail={"updated_id": target.id, "new_title": target.title, "changed": changed},
             )
         ],
         ["calendar"],
@@ -2219,8 +3107,7 @@ def _run_one_action(
         )
 
     if intent == "move_event":
-        base_keyword = parsed.get("task_keyword") or parsed.get("title")
-        keyword = _extract_task_keyword(str(base_keyword or "")) or _extract_task_keyword(message)
+        keyword, window, source_minutes = _resolve_event_lookup(parsed, message, prefer_source_segment=True)
         new_start = _parse_due(parsed.get("start") or parsed.get("due"), message)
         new_end = _parse_due(parsed.get("end"), message) if parsed.get("end") else None
         return _move_event_from_message(
@@ -2229,6 +3116,9 @@ def _run_one_action(
             new_start,
             new_end,
             duration_minutes=parsed.get("duration_minutes") or parsed.get("effort_minutes"),
+            shift_minutes=parsed.get("shift_minutes"),
+            window=window,
+            source_minutes=source_minutes,
         )
 
     if intent == "reschedule_after_hour":
@@ -2270,6 +3160,22 @@ def _run_one_action(
                 ["approvals"],
             )
         return _delete_duplicate_tasks(db)
+
+    if intent == "delete_duplicate_events":
+        keyword = parsed.get("task_keyword") or parsed.get("title")
+        if require_confirmation:
+            approval = _queue_chat_confirmation(
+                db,
+                {"intent": "delete_duplicate_events", "task_keyword": keyword},
+                summary=f"중복 일정 정리{f' ({keyword})' if keyword else ''}",
+                source_message=message,
+            )
+            return (
+                "중복 일정을 정리하려고 합니다. 채팅에 '승인' 또는 '취소'라고 답해 주세요.",
+                [AssistantActionOut(type="approval_requested", detail={"approval_id": approval.id, "type": "chat"})],
+                ["approvals"],
+            )
+        return _delete_duplicate_events(db, str(keyword or "").strip() or None)
 
     if intent == "complete_task":
         base_keyword = parsed.get("task_keyword") or parsed.get("title")
@@ -2320,18 +3226,22 @@ def _run_one_action(
         return _update_due(db, keyword, due)
 
     if intent == "delete_event":
-        base_keyword = parsed.get("task_keyword") or parsed.get("title")
-        keyword = _extract_task_keyword(str(base_keyword or "")) or _extract_task_keyword(message)
-        if not keyword:
+        keyword, window, source_minutes = _resolve_event_lookup(parsed, message)
+        if not keyword and window is None:
             return ("어떤 일정을 삭제할지 알려주세요.", [], [])
-        return _delete_event(db, keyword)
+        return _delete_event(db, keyword, window=window, source_minutes=source_minutes)
 
     if intent == "update_event":
         # we parse out the current title and the new title from the request.
         # Example prompt: "미팅 일정을 주간회의로 바꿔줘" -> target="미팅", new_title="주간회의"
         base_keyword = parsed.get("task_keyword") or parsed.get("title")
         new_title = str(parsed.get("new_title") or "").strip()
-        if not new_title:
+        has_duration_change = (
+            parsed.get("duration_minutes") is not None
+            or parsed.get("duration_delta_minutes") is not None
+            or parsed.get("end") is not None
+        )
+        if not new_title and not has_duration_change:
             new_title = (
                 message.replace(str(base_keyword or ""), "")
                 .replace("바꿔줘", "")
@@ -2345,10 +3255,19 @@ def _run_one_action(
                 .strip()
             )
 
-        keyword = _extract_task_keyword(str(base_keyword or "")) or _extract_task_keyword(message)
-        if not keyword:
+        keyword, window, source_minutes = _resolve_event_lookup(parsed, message)
+        if not keyword and window is None:
             return ("어떤 일정을 수정할지 알려주세요.", [], [])
-        return _update_event(db, keyword, new_title)
+        return _update_event(
+            db,
+            keyword,
+            new_title,
+            duration_minutes=parsed.get("duration_minutes"),
+            duration_delta_minutes=parsed.get("duration_delta_minutes"),
+            new_end=_parse_due(parsed.get("end"), message) if parsed.get("end") else None,
+            window=window,
+            source_minutes=source_minutes,
+        )
 
     return ("요청 의도를 처리하지 못했습니다.", [], [])
 
@@ -2533,8 +3452,23 @@ def _resolve_pending_approval_by_chat(
 
 def _fallback_classify(text: str, *, allow_openai_nli: bool = True) -> dict:
     lowered = text.lower()
+    source_segment, dest_segment = _split_event_time_change_message(text)
+    schedule_fast = _infer_schedule_fast_action(text)
+    if schedule_fast:
+        return schedule_fast
+    if (
+        source_segment
+        and dest_segment
+        and any(token in text for token in ["일정", "미팅", "회의", "캘린더"])
+        and _contains_datetime_phrase(dest_segment)
+    ):
+        return {"intent": "move_event", "title": source_segment, "task_keyword": source_segment, "start": dest_segment}
     if _looks_like_meeting_note(text):
         return {"intent": "register_meeting_note", "meeting_note": text}
+    if any(token in text for token in ["중복", "duplicate"]) and any(
+        token in text or token in lowered for token in ["삭제", "정리", "제거", "dedup", "cleanup", "merge"]
+    ) and any(token in text for token in ["일정", "미팅", "회의", "약속", "캘린더", "스케줄"]):
+        return {"intent": "delete_duplicate_events", "task_keyword": _extract_duplicate_event_keyword(text), "title": text}
     if any(token in text for token in ["중복", "duplicate"]) and any(
         token in text or token in lowered for token in ["삭제", "정리", "제거", "dedup", "merge"]
     ):
@@ -2567,6 +3501,12 @@ def _fallback_classify(text: str, *, allow_openai_nli: bool = True) -> dict:
         return {"intent": "update_task", "title": text}
     if any(token in text for token in ["삭제", "지워", "delete", "remove"]) and ("일정" in text or "미팅" in text or "회의" in text):
         return {"intent": "delete_event", "title": text}
+    if (
+        any(token in text for token in ["수정", "바꿔", "변경", "update", "modify"])
+        and ("일정" in text or "미팅" in text or "회의" in text)
+        and _contains_datetime_phrase(text)
+    ):
+        return {"intent": "move_event", "title": source_segment or text, "task_keyword": source_segment or text, "start": dest_segment or text}
     if any(token in text for token in ["수정", "바꿔", "변경", "update", "modify"]) and ("일정" in text or "미팅" in text or "회의" in text):
         return {"intent": "update_event", "title": text}
     if any(token in text for token in ["이동", "옮겨"]) and ("일정" in text or "미팅" in text or "회의" in text):
@@ -2619,6 +3559,10 @@ def _fast_plan_actions(message: str) -> list[dict]:
     if not raw:
         return []
 
+    schedule_action = _infer_schedule_fast_action(raw)
+    if schedule_action:
+        return [schedule_action]
+
     inferred = _infer_local_create_or_task_action(raw)
     if inferred and inferred.get("intent") in {"create_task", "create_event"}:
         return [inferred]
@@ -2633,6 +3577,11 @@ def _fast_plan_actions(message: str) -> list[dict]:
 
     actions: list[dict] = []
     for segment in segments:
+        schedule_segment = _infer_schedule_fast_action(segment)
+        if schedule_segment:
+            actions.append(schedule_segment)
+            continue
+
         inferred_segment = _infer_local_create_or_task_action(segment)
         if inferred_segment and inferred_segment.get("intent") in {"create_task", "create_event"}:
             actions.append(inferred_segment)
@@ -2649,11 +3598,15 @@ FAST_PATH_SAFE_INTENTS = {
     "create_event",
     "update_due",
     "update_priority",
+    "move_event",
+    "delete_event",
+    "update_event",
     "list_tasks",
     "list_events",
     "find_free_time",
     "reschedule_after_hour",
     "delete_duplicate_tasks",
+    "delete_duplicate_events",
     "register_meeting_note",
 }
 
@@ -2683,6 +3636,10 @@ def _quick_plan_actions(message: str) -> list[dict] | None:
     raw = (message or "").strip()
     if not raw:
         return None
+
+    schedule_action = _infer_schedule_fast_action(raw)
+    if schedule_action and _can_accept_fast_actions([schedule_action], raw):
+        return [schedule_action]
 
     inferred = _infer_local_create_or_task_action(raw)
     if inferred and _can_accept_fast_actions([inferred], raw):
@@ -2788,11 +3745,22 @@ def _map_nli_to_plan_action(message: str, parsed) -> dict | None:
             "duration_minutes": duration_minutes,
         }
     if intent == "update_event":
+        if start or due or end:
+            return {
+                "intent": "move_event",
+                "task_keyword": target_keyword,
+                "title": target_keyword,
+                "start": start or due,
+                "end": end,
+                "duration_minutes": duration_minutes,
+            }
         return {
             "intent": "update_event",
             "task_keyword": target_keyword,
             "title": target_keyword,
             "new_title": new_title,
+            "duration_minutes": duration_minutes,
+            "end": end,
         }
     if intent == "reschedule_request":
         hint = time_hint or due or message
@@ -2821,6 +3789,12 @@ def _map_nli_to_plan_action(message: str, parsed) -> dict | None:
         return {
             "intent": "delete_duplicate_tasks",
             "title": title,
+        }
+    if intent == "delete_duplicate_events":
+        return {
+            "intent": "delete_duplicate_events",
+            "task_keyword": target_keyword,
+            "title": target_keyword,
         }
     if intent == "delete_event":
         return {"intent": "delete_event", "task_keyword": target_keyword, "title": target_keyword}
@@ -2893,8 +3867,20 @@ def _plan_actions_with_fallback(
     return _plan_actions_with_llm(db, message, history_context)
 
 
-@router.post("/chat", response_model=AssistantChatResponse)
-def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> AssistantChatResponse:
+def _emit_chat_progress(emit: ChatProgressEmitter | None, event: str, payload: dict) -> None:
+    if emit is None:
+        return
+    try:
+        emit(event, payload)
+    except Exception:
+        return
+
+
+def _build_chat_response(
+    payload: AssistantChatRequest,
+    db: Session,
+    emit: ChatProgressEmitter | None = None,
+) -> AssistantChatResponse:
     message = payload.message.strip()
     history_context = [
         {"role": turn.role, "text": turn.text.strip()}
@@ -2902,6 +3888,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
         if turn.text.strip()
     ]
     llm_available = is_openai_available()
+    _emit_chat_progress(emit, "status", {"message": "요청 분석 중..."})
 
     if settings.assistant_llm_only and not llm_available:
         return AssistantChatResponse(
@@ -2911,6 +3898,32 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
         )
 
     pending_clarification = _latest_pending_approval(db, types=(CHAT_CLARIFICATION_TYPE,))
+    if pending_clarification:
+        clarification_id = pending_clarification.id
+        typed_approval_id = _extract_uuid(message)
+
+        if _is_negative(message) and (typed_approval_id in {None, clarification_id}):
+            pending_clarification.status = "rejected"
+            pending_clarification.resolved_at = datetime.utcnow()
+            pending_clarification.reason = "clarification_canceled_by_user"
+            db.commit()
+            return AssistantChatResponse(
+                reply="요청을 취소했습니다. 새로 요청해 주세요.",
+                actions=[AssistantActionOut(type="clarification_canceled", detail={"clarification_id": pending_clarification.id})],
+                refresh=["approvals"],
+            )
+
+        if _is_affirmative(message) and (typed_approval_id in {None, clarification_id}):
+            question = str(pending_clarification.payload.get("question") or "").strip() or "질문에 답해 주세요."
+            return AssistantChatResponse(
+                reply=f"이 항목은 승인 요청이 아니라 추가 정보가 필요합니다.\n{question}",
+                actions=[AssistantActionOut(type="clarification_requested", detail={"clarification_id": clarification_id})],
+                refresh=["approvals"],
+            )
+
+        if typed_approval_id and typed_approval_id != clarification_id and (_is_affirmative(message) or _is_negative(message)):
+            pending_clarification = None
+
     if pending_clarification:
         incoming_actions = _detect_new_command_while_clarifying(message, llm_available)
 
@@ -2923,17 +3936,6 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
             pending_clarification = None
 
     if pending_clarification:
-        if _is_negative(message):
-            pending_clarification.status = "rejected"
-            pending_clarification.resolved_at = datetime.utcnow()
-            pending_clarification.reason = "clarification_canceled_by_user"
-            db.commit()
-            return AssistantChatResponse(
-                reply="요청을 취소했습니다. 새로 요청해 주세요.",
-                actions=[AssistantActionOut(type="clarification_canceled", detail={"clarification_id": pending_clarification.id})],
-                refresh=["approvals"],
-            )
-
         original_message = str(pending_clarification.payload.get("original_message") or "").strip()
         pending_clarification.status = "approved"
         pending_clarification.resolved_at = datetime.utcnow()
@@ -2954,6 +3956,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
             approval_id=approval_id,
         )
         if pending_approval:
+            _emit_chat_progress(emit, "status", {"message": "승인 요청 처리 중..."})
             reply, actions, refresh = _resolve_pending_approval_by_chat(
                 db,
                 pending_approval,
@@ -2968,6 +3971,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
 
     if llm_available:
         try:
+            _emit_chat_progress(emit, "status", {"message": "의도 해석 중..."})
             planned_actions, plan_note = _plan_actions_with_fallback(db, message, history_context)
         except OpenAIIntegrationError as exc:
             if settings.assistant_llm_only:
@@ -3006,7 +4010,7 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
     if has_meeting_intent:
         planned_actions = [item for item in planned_actions if item.get("intent") == "register_meeting_note"][:1]
 
-    singleton_intents = {"register_meeting_note", "reschedule_after_hour", "delete_duplicate_tasks"}
+    singleton_intents = {"register_meeting_note", "reschedule_after_hour", "delete_duplicate_tasks", "delete_duplicate_events"}
     seen_singletons: set[str] = set()
     unique_actions: list[dict] = []
     for item in planned_actions:
@@ -3039,7 +4043,11 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
     reference_mode = _has_reference_phrase(message)
     reference_action_processed = False
 
-    for parsed in planned_actions[:5]:
+    executable_actions = planned_actions[:5]
+    if executable_actions:
+        _emit_chat_progress(emit, "status", {"message": "작업 실행 중..."})
+
+    for index, parsed in enumerate(executable_actions, start=1):
         intent = parsed.get("intent", "unknown")
         if intent == "unknown":
             continue
@@ -3065,6 +4073,15 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
         reply_parts.append(reply)
         merged_actions.extend(actions)
         refresh_set.update(refresh)
+        _emit_chat_progress(
+            emit,
+            "progress",
+            {
+                "message": f"작업 {index}/{len(executable_actions)} 처리 완료",
+                "reply": reply,
+                "index": index,
+            },
+        )
 
         if reference_mode and intent in {"complete_task", "update_priority", "update_due"}:
             reference_action_processed = True
@@ -3080,3 +4097,51 @@ def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> Assist
 
     merged_reply = "\n".join(f"{index + 1}. {part}" for index, part in enumerate(reply_parts))
     return AssistantChatResponse(reply=merged_reply, actions=merged_actions, refresh=sorted(refresh_set))
+
+
+def _sse_event(event: str, payload: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+@router.post("/chat", response_model=AssistantChatResponse)
+def chat(payload: AssistantChatRequest, db: Session = Depends(get_db)) -> AssistantChatResponse:
+    return _build_chat_response(payload, db)
+
+
+@router.post("/chat/stream")
+def chat_stream(payload: AssistantChatRequest) -> StreamingResponse:
+    queue: Queue[tuple[str, dict] | None] = Queue()
+
+    def emit(event: str, event_payload: dict) -> None:
+        queue.put((event, event_payload))
+
+    def worker() -> None:
+        with SessionLocal() as db:
+            try:
+                result = _build_chat_response(payload, db, emit=emit)
+                queue.put(("result", result.model_dump(mode="json")))
+            except Exception as exc:
+                queue.put(("error", {"message": str(exc) or "assistant stream failed"}))
+            finally:
+                queue.put(None)
+
+    threading.Thread(target=worker, name="assistant-chat-stream", daemon=True).start()
+
+    def event_stream():
+        while True:
+            try:
+                item = queue.get(timeout=15.0)
+            except Empty:
+                yield ": keepalive\n\n"
+                continue
+            if item is None:
+                yield _sse_event("done", {"ok": True})
+                break
+            event, event_payload = item
+            yield _sse_event(event, event_payload)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

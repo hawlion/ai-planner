@@ -645,7 +645,7 @@ select:focus {
   position: absolute;
   left: 4px;
   right: 4px;
-  padding: 4px 6px;
+  padding: 6px 34px 6px 8px;
   border-radius: var(--radius-sm);
   font-size: 11px;
   line-height: 1.2;
@@ -667,23 +667,41 @@ select:focus {
   position: absolute;
   top: 2px;
   right: 2px;
-  width: 16px;
-  height: 16px;
-  background: rgba(0, 0, 0, 0.4);
+  width: 28px;
+  height: 28px;
+  background: rgba(15, 23, 42, 0.72);
   color: white;
-  border-radius: 4px;
+  border-radius: 8px;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 10px;
+  font-size: 14px;
+  font-weight: 700;
   opacity: 0;
-  transition: opacity 0.2s ease;
+  transition: opacity 0.2s ease, background 0.2s ease, transform 0.2s ease;
   border: none;
   cursor: pointer;
+  z-index: 14;
+  touch-action: manipulation;
 }
 
 .event-delete:hover {
-  background: rgba(0, 0, 0, 0.8);
+  background: rgba(185, 28, 28, 0.92);
+  transform: scale(1.04);
+}
+
+.event-delete:focus-visible {
+  opacity: 1;
+  outline: 2px solid rgba(255, 255, 255, 0.9);
+  outline-offset: 1px;
+}
+
+.agenda-delete {
+  position: relative;
+  top: 0;
+  right: 0;
+  opacity: 0.88;
+  flex: 0 0 auto;
 }
 
 .event-resize-handle {
@@ -734,7 +752,7 @@ select:focus {
 .event-conflict-badge {
   position: absolute;
   top: 2px;
-  right: 20px;
+  right: 34px;
   background: #fee2e2;
   color: #991b1b;
   border: 1px solid #fca5a5;

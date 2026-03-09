@@ -139,6 +139,7 @@ class NLIOutput(BaseModel):
         "reschedule_request",
         "reschedule_after_hour",
         "delete_duplicate_tasks",
+        "delete_duplicate_events",
         "delete_event",
         "list_tasks",
         "list_events",
@@ -205,6 +206,7 @@ class AssistantPlanAction(BaseModel):
         "find_free_time",
         "move_event",
         "delete_duplicate_tasks",
+        "delete_duplicate_events",
         "register_meeting_note",
         "delete_event",
         "update_event",
@@ -733,7 +735,7 @@ def parse_nli_openai(text: str, base_dt: datetime) -> NLIOutput:
         "You parse Korean/English planning commands into intent JSON."
         " Return strict JSON only with fields:"
         " intent(create_task|create_event|update_task|delete_task|update_due|update_priority|"
-        "move_event|update_event|reschedule_request|reschedule_after_hour|delete_duplicate_tasks|"
+        "move_event|update_event|reschedule_request|reschedule_after_hour|delete_duplicate_tasks|delete_duplicate_events|"
         "delete_event|list_tasks|list_events|find_free_time|unknown),"
         " title, task_keyword, task_title, due, start, end, new_title, effort_minutes, priority, cutoff_hour,"
         " time_hint, duration_minutes, limit, note. "
@@ -744,10 +746,14 @@ def parse_nli_openai(text: str, base_dt: datetime) -> NLIOutput:
         " Example: '이번주 목요일 오후3시에 공인알림 미팅 일정 추가' -> title='공인알림 미팅'."
         " If only a generic title is available (e.g., 미팅/회의/일정/task), keep it generic and do not invent details."
         " For move_event/update_event, extract task_keyword/title from event phrase and set start when available."
+        " If user changes an existing event's date/time (e.g. '내일 오후 4시로 변경'), you MUST use move_event."
+        " Use update_event only for renaming/changing the event title or duration/details, not time moves."
         " For update_event include new_title (target title) when user asks to rename."
+        " If user asks to extend/shorten event duration, keep intent=update_event and set duration_minutes or end."
         " For reschedule_request include reschedule hint in time_hint/title."
         " For requests like '오후 6시 이후', 'after 6pm', parse intent=reschedule_after_hour and cutoff_hour=18/20 etc."
-        " For duplicate cleanup ('중복', '중복된 태스크', '중복 태스크 정리'), use delete_duplicate_tasks."
+        " For duplicate task cleanup ('중복', '중복된 태스크', '중복 태스크 정리'), use delete_duplicate_tasks."
+        " For duplicate event cleanup ('중복된 미팅 삭제', '중복 일정 정리'), use delete_duplicate_events."
         " For explicit deadline updates use update_due."
         " For priority updates use update_priority."
         " For update_task/update_due/update_priority, title/task_keyword should identify the target task."
@@ -940,7 +946,7 @@ def parse_assistant_plan_openai(
         " Supported intent values are:"
         " create_task, create_event, update_task, delete_task, start_task, reschedule_request, reschedule_after_hour,"
         " complete_task, update_priority, update_due, list_tasks, list_events, find_free_time, move_event,"
-        " delete_duplicate_tasks, register_meeting_note, delete_event, update_event, unknown."
+        " delete_duplicate_tasks, delete_duplicate_events, register_meeting_note, delete_event, update_event, unknown."
         " Parse multiple requests in one message into multiple actions in order."
         " CRITICAL: if user asks to add schedule/meeting/calendar event (일정/미팅/회의/캘린더 + 추가/등록/잡아줘),"
         " you MUST output create_event, not create_task."
@@ -951,6 +957,9 @@ def parse_assistant_plan_openai(
         " If you only know a generic title (미팅/회의/일정/task), keep it generic; do not invent details."
         " For update_task, put changed fields into priority/status/due/description/effort_minutes/new_title."
         " For move_event, set task_keyword to existing event title and set start (and optionally end or duration_minutes)."
+        " If the user changes an existing event's date/time, you MUST output move_event, not update_event."
+        " Use update_event only when the event title/details/duration are being edited."
+        " If user asks to extend/shorten an existing event, keep intent=update_event and set duration_minutes or end."
         " For list_events/list_tasks/find_free_time, use target_date/limit/duration_minutes when inferable."
         " If user asks to show/list tasks, MUST output list_tasks."
         " If user asks to show/list schedule/calendar/events, MUST output list_events."
@@ -962,7 +971,8 @@ def parse_assistant_plan_openai(
         " question in note only when target approval cannot be inferred."
         " Never use a generic one-word keyword like '작업', '고객', '미팅'."
         " For requests like 'after 6pm' or '오후 6시 이후', use reschedule_after_hour and set cutoff_hour."
-        " For duplicate cleanup requests, use delete_duplicate_tasks."
+        " For duplicate task cleanup requests, use delete_duplicate_tasks."
+        " For duplicate event cleanup requests, use delete_duplicate_events."
         " If matching is uncertain, keep intent as unknown and set note as one concise clarification question in Korean."
         " due should be ISO-8601 datetime when inferable, else null."
         " If message is meeting notes/transcript, use register_meeting_note with full note in meeting_note."

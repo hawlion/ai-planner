@@ -34,6 +34,7 @@ const state = {
   systemNotice: "",
   systemNoticeIsError: false,
   chatHistory: [],
+  chatStreamInFlight: false,
   localBlocks: [],
   remoteEvents: [],
   calendarDragState: null,
@@ -188,7 +189,10 @@ async function api(path, options = {}) {
 
   if (!response.ok) {
     const detail = typeof body === "object" ? body.detail || JSON.stringify(body) : body;
-    throw new Error(detail || `HTTP ${response.status}`);
+    const error = new Error(detail || `HTTP ${response.status}`);
+    error.status = response.status;
+    error.body = body;
+    throw error;
   }
 
   return body;
@@ -630,8 +634,45 @@ function prefetchAdjacentWeeks() {
   });
 }
 
-async function deleteCalendarBlock(id, isOutlook) {
+function deletePromptLabel(rawId) {
+  const event = findCalendarEvent(rawId);
+  if (!event) return "이 일정";
+  return event.title ? `일정 '${event.title}'` : "이 일정";
+}
+
+function confirmDeleteCalendarBlock(rawId, isOutlook) {
+  const event = findCalendarEvent(rawId);
+  const isRemote = Boolean(
+    isOutlook
+    || event?.kind === "outlook"
+    || event?.kind === "mixed"
+    || String(rawId || "").startsWith("outlook-"),
+  );
+  const label = deletePromptLabel(rawId);
+  const suffix = isRemote ? "\nOutlook에서도 함께 삭제됩니다." : "";
+  return window.confirm(`${label}을(를) 삭제할까요?${suffix}`);
+}
+
+async function deleteLocalBlockWithRetry(blockId, version) {
+  const initialQs = typeof version === "number" ? `?version=${encodeURIComponent(version)}` : "";
+  try {
+    await api(`/calendar/blocks/${blockId}${initialQs}`, { method: "DELETE" });
+    return;
+  } catch (error) {
+    if (error?.status !== 409) throw error;
+    const latest = await api(`/calendar/blocks/${blockId}`);
+    const latestVersion = typeof latest?.version === "number" ? latest.version : null;
+    const retryQs = typeof latestVersion === "number" ? `?version=${encodeURIComponent(latestVersion)}` : "";
+    await api(`/calendar/blocks/${blockId}${retryQs}`, { method: "DELETE" });
+  }
+}
+
+async function deleteCalendarBlock(id, isOutlook, { skipConfirm = false } = {}) {
   const rawId = String(id || "");
+  if (!rawId) return false;
+  if (!skipConfirm && !confirmDeleteCalendarBlock(rawId, isOutlook)) {
+    return false;
+  }
   const isLocal = rawId.startsWith("local-");
   const isRemoteOutlook = rawId.startsWith("outlook-");
   const localBlock = isLocal
@@ -643,27 +684,31 @@ async function deleteCalendarBlock(id, isOutlook) {
     notify("일정 삭제 중...");
 
     if (isLocal) {
-      const qs = typeof localVersion === "number" ? `?version=${encodeURIComponent(localVersion)}` : "";
-      await api(`/calendar/blocks/${rawId.replace("local-", "")}${qs}`, { method: "DELETE" });
+      await deleteLocalBlockWithRetry(rawId.replace("local-", ""), localVersion);
     } else if (isRemoteOutlook) {
       await api(`/graph/calendar/events/${encodeURIComponent(rawId.replace("outlook-", ""))}`, { method: "DELETE" });
     } else if (isOutlook) {
       await api(`/graph/calendar/events/${encodeURIComponent(rawId)}`, { method: "DELETE" });
     } else {
-      await api(`/calendar/blocks/${rawId}`, { method: "DELETE" });
+      await deleteLocalBlockWithRetry(rawId, null);
     }
 
     notify("일정이 삭제되었습니다.");
     closeEventModal();
     await refreshCalendarOnly();
+    return true;
   } catch (error) {
     notify(`삭제 실패: ${error.message}`, true);
+    return false;
   }
 }
 
 function bindEventDeleteButtons(container) {
   if (!container) return;
   container.querySelectorAll(".event-delete[data-event-id]").forEach((button) => {
+    button.addEventListener("pointerdown", (event) => {
+      event.stopPropagation();
+    });
     button.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -1176,7 +1221,7 @@ function renderWeekGrid() {
         const encodedId = encodeURIComponent(event.id);
         return `
           <div class="calendar-event ${event.kind}${hasConflict ? " conflict" : ""}${isEditable ? " editable" : ""}" data-event-id="${encodedId}" data-event-date="${event.start.toISOString()}" data-open-event-id="${encodedId}" data-day-start="${dayStart.getTime()}" style="top:${top}px;height:${height}px;left:calc(${left}% + 2px);width:calc(${width}% - 4px);">
-            <button class="event-delete" data-event-id="${encodedId}" data-event-outlook="${isOutlook ? "1" : "0"}" title="일정 삭제">×</button>
+            <button class="event-delete" type="button" data-event-id="${encodedId}" data-event-outlook="${isOutlook ? "1" : "0"}" title="일정 삭제" aria-label="일정 삭제">×</button>
             ${hasConflict ? `<span class="event-conflict-badge">중복</span>` : ""}
             <div class="event-time">${fmtTime(event.start)}</div>
             <div class="event-title">${escapeHtml(event.title)}</div>
@@ -1251,7 +1296,7 @@ function renderAgenda() {
         <div class="agenda-item" data-open-event-id="${encodedId}">
           <div style="display: flex; justify-content: space-between; align-items: flex-start;">
             <div class="agenda-title">${escapeHtml(event.title)}</div>
-            <button class="event-delete" style="position: relative; opacity: 1; opacity: 0.7;" data-event-id="${encodedId}" data-event-outlook="${isOutlook ? "1" : "0"}" title="일정 삭제">×</button>
+            <button class="event-delete agenda-delete" type="button" data-event-id="${encodedId}" data-event-outlook="${isOutlook ? "1" : "0"}" title="일정 삭제" aria-label="일정 삭제">×</button>
           </div>
           <div class="agenda-meta">${fmtDateTime(event.start)} - ${fmtTime(event.end)}</div>
           <div class="meta-row">${tags.join("")}</div>
@@ -2119,34 +2164,59 @@ function bindAssistantActionCards(scope) {
   });
 }
 
+function rememberChatTurn(role, text) {
+  state.chatHistory.push({ role, text });
+  if (state.chatHistory.length > 20) {
+    state.chatHistory = state.chatHistory.slice(-20);
+  }
+}
+
+function renderChatMessageActions(entry, actions = []) {
+  if (!entry?.box) return;
+  if (entry.actionsContainer) {
+    entry.actionsContainer.remove();
+    entry.actionsContainer = null;
+  }
+  if (entry.role !== "assistant" || !actions.length) return;
+
+  const cardsHtml = buildAssistantActionCards(actions);
+  if (!cardsHtml) return;
+  const cards = document.createElement("div");
+  cards.className = "chat-action-list";
+  cards.innerHTML = cardsHtml;
+  entry.box.appendChild(cards);
+  bindAssistantActionCards(cards);
+  entry.actionsContainer = cards;
+}
+
+function setChatMessage(entry, text, actions = []) {
+  if (!entry?.content) return;
+  entry.content.innerHTML = escapeHtml(text || "").replaceAll("\n", "<br />");
+  renderChatMessageActions(entry, actions);
+  const log = $("chat-log");
+  if (log) {
+    log.scrollTop = log.scrollHeight;
+  }
+}
+
 function addChatMessage(role, text, remember = true, actions = []) {
   const log = $("chat-log");
   const box = document.createElement("div");
   box.className = `chat-msg ${role}`;
   const content = document.createElement("div");
   content.className = "chat-text";
-  content.innerHTML = escapeHtml(text).replaceAll("\n", "<br />");
   box.appendChild(content);
 
-  if (role === "assistant" && actions.length) {
-    const cardsHtml = buildAssistantActionCards(actions);
-    if (cardsHtml) {
-      const cards = document.createElement("div");
-      cards.className = "chat-action-list";
-      cards.innerHTML = cardsHtml;
-      box.appendChild(cards);
-      bindAssistantActionCards(cards);
-    }
-  }
+  const entry = { role, box, content, actionsContainer: null };
+  setChatMessage(entry, text, actions);
 
   log.appendChild(box);
   log.scrollTop = log.scrollHeight;
 
-  if (!remember) return;
-  state.chatHistory.push({ role, text });
-  if (state.chatHistory.length > 20) {
-    state.chatHistory = state.chatHistory.slice(-20);
+  if (remember) {
+    rememberChatTurn(role, text);
   }
+  return entry;
 }
 
 function composeAssistantReply(result) {
@@ -2230,22 +2300,125 @@ async function goToTodayWeek() {
   scrollCalendarToNow();
 }
 
+function parseSsePayload(raw) {
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw);
+  } catch (_error) {
+    return { message: raw };
+  }
+}
+
+function consumeSseBuffer(buffer, onEvent) {
+  let remainder = buffer;
+  while (true) {
+    const boundary = remainder.indexOf("\n\n");
+    if (boundary < 0) break;
+    const chunk = remainder.slice(0, boundary);
+    remainder = remainder.slice(boundary + 2);
+
+    let event = "message";
+    const dataLines = [];
+    for (const line of chunk.split(/\r?\n/)) {
+      if (!line || line.startsWith(":")) continue;
+      if (line.startsWith("event:")) {
+        event = line.slice(6).trim() || "message";
+        continue;
+      }
+      if (line.startsWith("data:")) {
+        dataLines.push(line.slice(5).trim());
+      }
+    }
+
+    if (dataLines.length) {
+      onEvent(event, parseSsePayload(dataLines.join("\n")));
+    }
+  }
+  return remainder;
+}
+
+async function streamAssistantChat(message, history, onEvent) {
+  const response = await fetch(`${API}/assistant/chat/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message, history }),
+  });
+
+  if (!response.ok) {
+    const isJson = response.headers.get("content-type")?.includes("application/json");
+    const body = isJson ? await response.json() : await response.text();
+    const detail = typeof body === "object" ? body.detail || JSON.stringify(body) : body;
+    throw new Error(detail || `HTTP ${response.status}`);
+  }
+
+  if (!response.body) {
+    throw new Error("스트리밍 응답 본문이 비어 있습니다.");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    buffer = consumeSseBuffer(buffer, onEvent);
+    if (done) break;
+  }
+
+  if (buffer.trim()) {
+    consumeSseBuffer(`${buffer}\n\n`, onEvent);
+  }
+}
+
 async function submitChatMessage(message, { echoUser = true } = {}) {
-  if (!message) return;
+  if (!message || state.chatStreamInFlight) return;
   const history = state.chatHistory.slice(-12);
   if (echoUser) addChatMessage("user", message);
+  const pendingAssistant = addChatMessage("assistant", "요청 분석 중...", false);
+  const sendButton = $("chat-send");
+  state.chatStreamInFlight = true;
+  if (sendButton) sendButton.disabled = true;
 
   try {
-    const result = await api("/assistant/chat", {
-      method: "POST",
-      body: JSON.stringify({ message, history }),
+    let finalResult = null;
+
+    await streamAssistantChat(message, history, (event, payload) => {
+      if (event === "status") {
+        setChatMessage(pendingAssistant, String(payload?.message || "처리 중..."));
+        return;
+      }
+      if (event === "progress") {
+        const progressMessage = String(payload?.message || "처리 중...");
+        const replyPreview = String(payload?.reply || "").trim();
+        const content = replyPreview ? `${progressMessage}\n\n${replyPreview}` : progressMessage;
+        setChatMessage(pendingAssistant, content);
+        return;
+      }
+      if (event === "result") {
+        finalResult = payload;
+        return;
+      }
+      if (event === "error") {
+        throw new Error(String(payload?.message || "스트리밍 처리 중 오류가 발생했습니다."));
+      }
     });
-    addChatMessage("assistant", composeAssistantReply(result), true, result.actions || []);
-    const refreshKeys = Array.isArray(result.refresh) ? result.refresh : [];
+
+    if (!finalResult) {
+      throw new Error("최종 응답을 받지 못했습니다.");
+    }
+
+    const finalText = composeAssistantReply(finalResult);
+    setChatMessage(pendingAssistant, finalText, finalResult.actions || []);
+    rememberChatTurn("assistant", finalText);
+    const refreshKeys = Array.isArray(finalResult.refresh) ? finalResult.refresh : [];
     void runPostChatRefresh(refreshKeys);
   } catch (error) {
-    addChatMessage("assistant", `오류: ${error.message}`);
+    setChatMessage(pendingAssistant, `오류: ${error.message}`);
     notify(error.message, true);
+  } finally {
+    state.chatStreamInFlight = false;
+    if (sendButton) sendButton.disabled = false;
   }
 }
 

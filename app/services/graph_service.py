@@ -719,6 +719,14 @@ def _to_graph_utc(dt: datetime) -> str:
     return value.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _as_utc_aware(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
 def _next_retry_delay_seconds(retry_count: int) -> int:
     # Bounded exponential backoff for outbox retries.
     return min(3600, 2 ** min(10, max(1, retry_count)))
@@ -733,6 +741,7 @@ def _update_sync_status(
 ) -> None:
     row = _ensure_sync_status(db)
     now = datetime.now(UTC)
+    last_delta_sync_at = _as_utc_aware(row.last_delta_sync_at)
     changed = False
 
     if connected is not None:
@@ -740,7 +749,7 @@ def _update_sync_status(
             row.graph_connected = connected
             changed = True
     if ping_success:
-        if row.last_delta_sync_at is None or (now - row.last_delta_sync_at).total_seconds() >= 15:
+        if last_delta_sync_at is None or (now - last_delta_sync_at).total_seconds() >= 15:
             row.last_delta_sync_at = now
             changed = True
     if throttled:
@@ -1051,7 +1060,7 @@ def status_payload(db: Session) -> dict:
 def webhook_status_payload(db: Session) -> dict:
     row = _ensure_graph_subscription(db)
     now = datetime.now(UTC)
-    expires_at = row.expiration_at.astimezone(UTC) if row.expiration_at else None
+    expires_at = _as_utc_aware(row.expiration_at)
     active = row.status == "active" and bool(expires_at and expires_at > now)
     missing = _webhook_subscription_config_errors()
 

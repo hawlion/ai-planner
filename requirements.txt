@@ -4,7 +4,7 @@ sqlalchemy==2.0.43
 pydantic==2.11.7
 python-dateutil==2.9.0.post0
 dateparser==1.2.2
-httpx==0.28.1
+httpx[http2]==0.28.1
 openai>=1.0.0
 msal>=1.30.0
 ortools>=9.15.6755
